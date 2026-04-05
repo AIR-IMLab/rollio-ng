@@ -3,7 +3,6 @@
 ///
 /// The `JpegCompressor` struct reuses its internal compressor and resize buffer
 /// across frames to avoid per-frame allocation overhead.
-
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 

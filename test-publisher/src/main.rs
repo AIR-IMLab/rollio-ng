@@ -124,13 +124,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Publish robot states with sine-wave positions
         let elapsed_secs = start_time.elapsed().as_secs_f64();
         for (_name, publisher) in &robot_publishers {
-            let mut state = RobotState::default();
-            state.timestamp_ns = timestamp_ns;
-            state.num_joints = 6;
-            for j in 0..6 {
-                state.positions[j] = (elapsed_secs + j as f64 * 0.5).sin();
+            let mut positions = [0.0f64; 16];
+            for (j, pos) in positions.iter_mut().enumerate().take(6) {
+                *pos = (elapsed_secs + j as f64 * 0.5).sin();
             }
-            // velocities and efforts stay at 0.0
+            let state = RobotState {
+                timestamp_ns,
+                num_joints: 6,
+                positions,
+                ..RobotState::default()
+            };
             publisher.send_copy(state)?;
         }
 

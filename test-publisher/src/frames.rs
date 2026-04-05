@@ -2,7 +2,7 @@
 ///
 /// Generates SMPTE-style color bar patterns with a burned-in frame counter.
 /// Writes directly into a caller-provided buffer to avoid per-frame allocation.
-
+///
 /// Standard 8-bar color pattern: white, yellow, cyan, green, magenta, red, blue, black.
 const BAR_COLORS: [(u8, u8, u8); 8] = [
     (255, 255, 255), // white
@@ -105,9 +105,9 @@ fn burn_in_counter(buf: &mut [u8], width: u32, height: u32, frame_index: u64) {
             let px = ((by as usize) * (width as usize) + bx as usize) * 3;
             if px + 2 < buf.len() {
                 // Dark background (25% of original)
-                buf[px] = buf[px] / 4;
-                buf[px + 1] = buf[px + 1] / 4;
-                buf[px + 2] = buf[px + 2] / 4;
+                buf[px] /= 4;
+                buf[px + 1] /= 4;
+                buf[px + 2] /= 4;
             }
         }
     }

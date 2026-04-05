@@ -4,7 +4,6 @@
 /// then polls them in a non-blocking loop. Camera frame data is copied out
 /// of shared memory once (unavoidable since we release the sample), while
 /// robot state is a small fixed-size Copy type.
-
 use iceoryx2::prelude::*;
 use rollio_types::messages::{CameraFrameHeader, RobotState};
 
@@ -17,7 +16,7 @@ pub enum IpcMessage {
     },
     RobotStateMsg {
         name: String,
-        state: RobotState,
+        state: Box<RobotState>,
     },
 }
 
@@ -144,7 +143,7 @@ impl IpcPoller {
                         let state = *sample.payload();
                         latest = Some(IpcMessage::RobotStateMsg {
                             name: robot.name.clone(),
-                            state,
+                            state: Box::new(state),
                         });
                     }
                     Ok(None) => break,

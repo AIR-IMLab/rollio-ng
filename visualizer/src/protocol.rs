@@ -11,7 +11,6 @@
 /// Text/JSON messages (both directions):
 ///   Visualizer → UI: {"type":"robot_state","name":"...","timestamp_ns":...,...}
 ///   UI → Visualizer:  {"type":"command","action":"..."}
-
 use rollio_types::messages::RobotState;
 use serde::{Deserialize, Serialize};
 
@@ -70,7 +69,9 @@ pub fn encode_robot_state(name: &str, state: &RobotState) -> String {
 }
 
 /// A command received from the UI via WebSocket.
+/// Fields will be used when command handling is implemented in Sprint 3.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Command {
     #[serde(rename = "type")]
     pub msg_type: String,
