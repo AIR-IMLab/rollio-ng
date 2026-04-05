@@ -83,9 +83,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ipc_broadcast_tx = broadcast_tx.clone();
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) =
-            ipc_poll_loop(&camera_names, &robot_names, max_preview_width, jpeg_quality, ipc_broadcast_tx)
-        {
+        if let Err(e) = ipc_poll_loop(
+            &camera_names,
+            &robot_names,
+            max_preview_width,
+            jpeg_quality,
+            ipc_broadcast_tx,
+        ) {
             log::error!("IPC poll loop failed: {e}");
         }
     });

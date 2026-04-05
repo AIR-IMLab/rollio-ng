@@ -29,20 +29,12 @@ pub struct IpcPoller {
 
 struct CameraSubscriber {
     name: String,
-    subscriber: iceoryx2::port::subscriber::Subscriber<
-        ipc::Service,
-        [u8],
-        CameraFrameHeader,
-    >,
+    subscriber: iceoryx2::port::subscriber::Subscriber<ipc::Service, [u8], CameraFrameHeader>,
 }
 
 struct RobotSubscriber {
     name: String,
-    subscriber: iceoryx2::port::subscriber::Subscriber<
-        ipc::Service,
-        RobotState,
-        (),
-    >,
+    subscriber: iceoryx2::port::subscriber::Subscriber<ipc::Service, RobotState, ()>,
 }
 
 impl IpcPoller {

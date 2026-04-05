@@ -128,8 +128,7 @@ fn burn_in_counter(buf: &mut [u8], width: u32, height: u32, frame_index: u64) {
                             let px_x = dx + gx * FONT_SCALE + sx;
                             let px_y = dy + gy * FONT_SCALE + sy;
                             if px_x < width && px_y < height {
-                                let px =
-                                    (px_y as usize * width as usize + px_x as usize) * 3;
+                                let px = (px_y as usize * width as usize + px_x as usize) * 3;
                                 if px + 2 < buf.len() {
                                     buf[px] = 255;
                                     buf[px + 1] = 255;
@@ -143,4 +142,3 @@ fn burn_in_counter(buf: &mut [u8], width: u32, height: u32, frame_index: u64) {
         }
     }
 }
-

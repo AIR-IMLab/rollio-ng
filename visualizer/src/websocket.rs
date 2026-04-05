@@ -28,10 +28,7 @@ pub enum BroadcastMessage {
 /// Run the WebSocket server, accepting connections and broadcasting messages.
 ///
 /// This function runs forever (until the task is cancelled).
-pub async fn run_server(
-    addr: SocketAddr,
-    broadcast_tx: broadcast::Sender<BroadcastMessage>,
-) {
+pub async fn run_server(addr: SocketAddr, broadcast_tx: broadcast::Sender<BroadcastMessage>) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
             log::info!("WebSocket server listening on {addr}");
