@@ -114,17 +114,16 @@ export function StreamPanel({
   }
 
   // Render with ANSI content
+  // Note: we don't add │ side borders to ANSI lines because Ink cannot
+  // measure ANSI escape sequences, which causes width miscalculation and
+  // layout overflow. The top/bottom borders provide sufficient framing.
   const lines = ansiOutput.split("\n");
 
   return (
     <Box flexDirection="column" width={panelWidth}>
       <Text dimColor>{topBorder}</Text>
       {lines.map((line, i) => (
-        <Text key={i}>
-          {"│"}
-          {line}
-          {"\x1b[0m│"}
-        </Text>
+        <Text key={i}>{line}{"\x1b[0m"}</Text>
       ))}
       <Text dimColor>{bottomBorder}</Text>
     </Box>

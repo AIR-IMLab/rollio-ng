@@ -98,8 +98,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frames_since_status: u64 = 0;
 
     loop {
-        // Generate frame into temp buffer (needed for counter burn-in)
-        frames::generate_color_bars(&mut frame_buf, args.width, args.height, frame_index);
+        // Generate frame into temp buffer
+        frames::generate_color_bars(&mut frame_buf, args.width, args.height);
 
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
