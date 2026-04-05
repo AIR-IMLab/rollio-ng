@@ -1,131 +1,172 @@
 /**
- * Camera stream panel: decodes JPEG frames via sharp (native async)
- * and renders as ANSI half-block art.
+ * Camera stream panel logic: decodes JPEG frames via sharp (native async)
+ * and renders as ANSI half-block art lines.
  *
- * Performance:
- * - sharp decode+resize runs in libvips native thread pool (non-blocking)
- * - ANSI rendering uses pre-computed LUT for O(1) color mapping
- * - Only re-decodes when jpegData reference changes
+ * Uses a single combined decode effect for all cameras to avoid
+ * React hooks-in-loop violations. Merges multiple camera panels into
+ * single pre-composed <Text> lines so Ink doesn't try to measure ANSI widths.
  */
 
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { Box, Text } from "ink";
 import sharp from "sharp";
-import { renderToAnsi } from "../lib/ansi-renderer.js";
+import { renderToAnsiLines } from "../lib/ansi-renderer.js";
+import type { CameraFrame } from "../lib/websocket.js";
 
-interface StreamPanelProps {
-  jpegData: Buffer | null;
-  name: string;
-  panelWidth: number;
-  panelHeight: number;
+/** Decoded camera frame as ANSI lines. */
+interface DecodedFrame {
+  lines: string[];
 }
 
-export function StreamPanel({
-  jpegData,
-  name,
+interface CameraRowProps {
+  cameras: Array<{ name: string; frame: CameraFrame | undefined }>;
+  panelWidth: number;
+  panelHeight: number;
+  infoPanelLines?: string[];
+}
+
+/**
+ * Renders multiple camera panels side-by-side as pre-composed text lines.
+ *
+ * Instead of using Ink's flexbox (which can't measure ANSI escape codes),
+ * this component manually merges each camera's ANSI lines into single
+ * combined strings. Each output <Text> contains exactly the right number
+ * of visible characters, so Ink's layout stays correct.
+ */
+export function CameraRow({
+  cameras,
   panelWidth,
   panelHeight,
-}: StreamPanelProps) {
-  const [rgbPixels, setRgbPixels] = useState<Buffer | null>(null);
-  const [pixelWidth, setPixelWidth] = useState(0);
-  const [pixelHeight, setPixelHeight] = useState(0);
-  const lastJpegRef = useRef<Buffer | null>(null);
-  const decodeSeqRef = useRef(0);
+  infoPanelLines,
+}: CameraRowProps) {
+  const contentWidth = Math.max(1, panelWidth - 2);
+  const contentCharHeight = Math.max(1, panelHeight - 2);
+  const targetPixelWidth = Math.max(1, contentWidth);
+  const targetPixelHeight = Math.max(2, contentCharHeight * 2);
 
-  // Target dimensions for decode+resize (account for borders)
-  const targetWidth = Math.max(1, panelWidth - 2);
-  const targetHeight = Math.max(2, (panelHeight - 2) * 2); // ×2 for half-block
+  // Track decoded frames for all cameras in a single state object
+  const [decodedFrames, setDecodedFrames] = useState<
+    Map<string, DecodedFrame>
+  >(() => new Map());
+  const lastJpegsRef = useRef<Map<string, Buffer | null>>(new Map());
+  const seqRef = useRef(0);
 
+  // Single effect that decodes all cameras
   useEffect(() => {
-    // Skip if same JPEG buffer reference
-    if (jpegData === lastJpegRef.current) return;
-    lastJpegRef.current = jpegData;
+    let cancelled = false;
 
-    if (!jpegData || jpegData.length === 0) {
-      setRgbPixels(null);
-      return;
-    }
+    for (const cam of cameras) {
+      const jpegData = cam.frame?.jpegData ?? null;
+      const lastJpeg = lastJpegsRef.current.get(cam.name) ?? null;
 
-    // Increment sequence number to handle out-of-order async completions
-    const seq = ++decodeSeqRef.current;
+      // Skip if same buffer reference
+      if (jpegData === lastJpeg) continue;
+      lastJpegsRef.current.set(cam.name, jpegData);
 
-    // Async decode+resize via sharp (native, non-blocking)
-    sharp(jpegData)
-      .resize(targetWidth, targetHeight, { fit: "fill" })
-      .removeAlpha()
-      .raw()
-      .toBuffer({ resolveWithObject: true })
-      .then(({ data, info }) => {
-        // Only apply if this is still the latest decode request
-        if (seq === decodeSeqRef.current) {
-          setRgbPixels(data);
-          setPixelWidth(info.width);
-          setPixelHeight(info.height);
-        }
-      })
-      .catch(() => {
-        // Silently ignore decode errors (corrupted frame, etc.)
-      });
-  }, [jpegData, targetWidth, targetHeight]);
-
-  // Render ANSI art from decoded pixels (memoized on pixel data)
-  const ansiOutput = useMemo(() => {
-    if (!rgbPixels || pixelWidth === 0 || pixelHeight === 0) return null;
-    return renderToAnsi(rgbPixels, pixelWidth, pixelHeight);
-  }, [rgbPixels, pixelWidth, pixelHeight]);
-
-  // Border chars
-  const headerText = `─ ${name} `;
-  const headerPad = Math.max(0, panelWidth - headerText.length - 2);
-  const topBorder = `┌${headerText}${"─".repeat(headerPad)}┐`;
-  const bottomBorder = `└${"─".repeat(panelWidth - 2)}┘`;
-
-  // Content area height (in character rows)
-  const contentHeight = Math.max(1, panelHeight - 2);
-
-  if (!ansiOutput) {
-    // Placeholder: no signal
-    const placeholderLines: string[] = [];
-    for (let i = 0; i < contentHeight; i++) {
-      if (i === Math.floor(contentHeight / 2)) {
-        const msg = "╌ No signal ╌";
-        const pad = Math.max(0, panelWidth - 2 - msg.length);
-        const left = Math.floor(pad / 2);
-        const right = pad - left;
-        placeholderLines.push(
-          `│${" ".repeat(left)}${msg}${" ".repeat(right)}│`,
-        );
-      } else {
-        placeholderLines.push(`│${" ".repeat(panelWidth - 2)}│`);
+      if (!jpegData || jpegData.length === 0) {
+        setDecodedFrames((prev) => {
+          const next = new Map(prev);
+          next.delete(cam.name);
+          return next;
+        });
+        continue;
       }
+
+      const camName = cam.name;
+      const seq = ++seqRef.current;
+
+      sharp(jpegData)
+        .resize(targetPixelWidth, targetPixelHeight, { fit: "fill" })
+        .removeAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true })
+        .then(({ data, info }) => {
+          if (cancelled) return;
+          const lines = renderToAnsiLines(data, info.width, info.height);
+          setDecodedFrames((prev) => {
+            const next = new Map(prev);
+            next.set(camName, { lines });
+            return next;
+          });
+        })
+        .catch(() => {});
     }
 
-    return (
-      <Box flexDirection="column" width={panelWidth}>
-        <Text dimColor>{topBorder}</Text>
-        {placeholderLines.map((line, i) => (
-          <Text key={i} dimColor>
-            {line}
-          </Text>
-        ))}
-        <Text dimColor>{bottomBorder}</Text>
-      </Box>
-    );
-  }
+    return () => {
+      cancelled = true;
+    };
+  }, [cameras, targetPixelWidth, targetPixelHeight]);
 
-  // Render with ANSI content
-  // Note: we don't add │ side borders to ANSI lines because Ink cannot
-  // measure ANSI escape sequences, which causes width miscalculation and
-  // layout overflow. The top/bottom borders provide sufficient framing.
-  const lines = ansiOutput.split("\n");
+  // Build merged output lines
+  const outputLines = useMemo(() => {
+    const result: string[] = [];
+
+    // Top border line
+    let topLine = "";
+    for (let c = 0; c < cameras.length; c++) {
+      const name = cameras[c].name;
+      const headerText = `── ${name} `;
+      const pad = Math.max(0, panelWidth - headerText.length - 1);
+      topLine +=
+        headerText + "─".repeat(pad) + (c < cameras.length - 1 ? "┬" : "");
+    }
+    result.push(topLine);
+
+    // Content lines
+    for (let row = 0; row < contentCharHeight; row++) {
+      let line = "";
+      for (let c = 0; c < cameras.length; c++) {
+        const decoded = decodedFrames.get(cameras[c].name);
+        if (decoded && row < decoded.lines.length) {
+          line += decoded.lines[row];
+        } else {
+          // Placeholder line
+          if (row === Math.floor(contentCharHeight / 2)) {
+            const msg = "╌ No signal ╌";
+            const pad = Math.max(0, contentWidth - msg.length);
+            const left = Math.floor(pad / 2);
+            const right = pad - left;
+            line += " ".repeat(left) + msg + " ".repeat(right);
+          } else {
+            line += " ".repeat(contentWidth);
+          }
+        }
+        // Reset + separator between cameras
+        if (c < cameras.length - 1) {
+          line += "\x1b[0m│";
+        } else {
+          line += "\x1b[0m";
+        }
+      }
+      result.push(line);
+    }
+
+    // Bottom border line
+    let bottomLine = "";
+    for (let c = 0; c < cameras.length; c++) {
+      bottomLine +=
+        "─".repeat(panelWidth) + (c < cameras.length - 1 ? "┴" : "");
+    }
+    result.push(bottomLine);
+
+    return result;
+  }, [cameras, decodedFrames, panelWidth, contentCharHeight, contentWidth]);
+
+  // Merge info panel lines on the right if provided
+  const finalLines = useMemo(() => {
+    if (!infoPanelLines || infoPanelLines.length === 0) return outputLines;
+
+    return outputLines.map((line, i) => {
+      const infoLine = i < infoPanelLines.length ? infoPanelLines[i] : "";
+      return line + infoLine;
+    });
+  }, [outputLines, infoPanelLines]);
 
   return (
-    <Box flexDirection="column" width={panelWidth}>
-      <Text dimColor>{topBorder}</Text>
-      {lines.map((line, i) => (
-        <Text key={i}>{line}{"\x1b[0m"}</Text>
+    <Box flexDirection="column">
+      {finalLines.map((line, i) => (
+        <Text key={i}>{line}</Text>
       ))}
-      <Text dimColor>{bottomBorder}</Text>
     </Box>
   );
 }

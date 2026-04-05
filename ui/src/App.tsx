@@ -1,9 +1,9 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { Box, useStdout } from "ink";
 import { useWebSocket } from "./lib/websocket.js";
 import { TitleBar } from "./components/TitleBar.js";
 import { StatusBar } from "./components/StatusBar.js";
-import { StreamPanel } from "./components/StreamPanel.js";
+import { CameraRow } from "./components/StreamPanel.js";
 import { RobotStatePanel } from "./components/RobotStatePanel.js";
 import { InfoPanel } from "./components/InfoPanel.js";
 
@@ -37,12 +37,7 @@ export function App() {
   const { frames, robotStates, connected } = useWebSocket("ws://localhost:9090");
 
   // Derive health status
-  const hasData = frames.size > 0 || robotStates.size > 0;
-  const health = connected
-    ? hasData
-      ? ("normal" as const)
-      : ("normal" as const)
-    : ("degraded" as const);
+  const health = connected ? ("normal" as const) : ("degraded" as const);
 
   // Layout constants
   const isWide = columns >= 120;
@@ -50,26 +45,71 @@ export function App() {
   const contentWidth = isWide ? columns - infoPanelWidth : columns;
   const contentHeight = Math.max(1, rows - 2); // minus title + status bars
 
-  // Camera panel sizing
+  // Camera panel sizing: each camera gets equal share of content width
   const cameraNames = Array.from(frames.keys());
-  const numCameras = Math.max(cameraNames.length, 1); // at least 1 placeholder
+  const camKeys = cameraNames.length > 0 ? cameraNames : ["camera_0", "camera_1"];
+  const numCameras = camKeys.length;
   const cameraWidth = Math.max(10, Math.floor(contentWidth / numCameras));
 
   // Allocate vertical space
   const robotPanelHeight = isWide
     ? Math.max(5, Math.floor(contentHeight * 0.3))
     : Math.max(5, Math.min(8, Math.floor(contentHeight * 0.3)));
-  const infoPanelHeightH = isWide ? 0 : Math.min(5, Math.max(3, Math.floor(contentHeight * 0.15)));
+  const infoPanelHeightH = isWide
+    ? 0
+    : Math.min(5, Math.max(3, Math.floor(contentHeight * 0.15)));
   const cameraPanelHeight = Math.max(
     5,
     contentHeight - robotPanelHeight - (isWide ? 0 : infoPanelHeightH),
   );
 
-  // Build camera panel keys (use known names or placeholders)
-  const camKeys =
-    cameraNames.length > 0
-      ? cameraNames
-      : ["camera_0", "camera_1"];
+  // Build camera data for CameraRow
+  const cameraData = useMemo(
+    () =>
+      camKeys.map((name) => ({
+        name,
+        frame: frames.get(name),
+      })),
+    [camKeys, frames],
+  );
+
+  // Build info panel lines for wide mode (merged into camera row)
+  const infoPanelLines = useMemo(() => {
+    if (!isWide) return undefined;
+
+    const w = infoPanelWidth;
+    const lines: string[] = [];
+    const pad = (s: string) => {
+      const trimmed = s.substring(0, w);
+      return trimmed + " ".repeat(Math.max(0, w - trimmed.length));
+    };
+
+    // Top border
+    const headerText = "─ Info ";
+    const headerPad = Math.max(0, w - headerText.length - 1);
+    lines.push(`${headerText}${"─".repeat(headerPad)}┐`);
+
+    // Content
+    lines.push(pad(" Devices") + "│");
+    for (const [name, frame] of frames) {
+      lines.push(pad(`  ${name}  ${frame.width}x${frame.height}`) + "│");
+    }
+    for (const [name, state] of robotStates) {
+      lines.push(pad(`  ${name}  ${state.num_joints} DoF`) + "│");
+    }
+    lines.push(pad("") + "│");
+    lines.push(pad(` WS: ${connected ? "Connected" : "Disconnected"}`) + "│");
+
+    // Pad remaining rows
+    const totalRows = cameraPanelHeight + 2; // +2 for borders
+    while (lines.length < totalRows - 1) {
+      lines.push(pad("") + "│");
+    }
+    // Bottom border
+    lines.push(`${"─".repeat(w - 1)}┘`);
+
+    return lines;
+  }, [isWide, infoPanelWidth, frames, robotStates, connected, cameraPanelHeight]);
 
   // Build robot panel data
   const robotEntries = Array.from(robotStates.entries());
@@ -79,71 +119,46 @@ export function App() {
       {/* Title Bar */}
       <TitleBar mode="Collect" width={columns} />
 
-      {/* Content Area */}
-      <Box flexDirection="row" height={contentHeight}>
-        {/* Main content (cameras + robots) */}
-        <Box flexDirection="column" width={contentWidth}>
-          {/* Camera panels row */}
-          <Box flexDirection="row" height={cameraPanelHeight}>
-            {camKeys.map((name) => {
-              const frame = frames.get(name);
-              return (
-                <StreamPanel
-                  key={name}
-                  name={name}
-                  jpegData={frame?.jpegData ?? null}
-                  panelWidth={cameraWidth}
-                  panelHeight={cameraPanelHeight}
-                />
-              );
-            })}
-          </Box>
+      {/* Camera row (pre-composed ANSI lines, bypasses Ink width measurement) */}
+      <CameraRow
+        cameras={cameraData}
+        panelWidth={cameraWidth}
+        panelHeight={cameraPanelHeight}
+        infoPanelLines={infoPanelLines}
+      />
 
-          {/* Robot state panels */}
-          <Box flexDirection="column">
-            {robotEntries.length > 0 ? (
-              robotEntries.map(([name, state]) => (
-                <RobotStatePanel
-                  key={name}
-                  name={name}
-                  numJoints={state.num_joints}
-                  positions={state.positions}
-                  panelWidth={contentWidth}
-                />
-              ))
-            ) : (
-              <RobotStatePanel
-                name="robot_0"
-                numJoints={0}
-                positions={[]}
-                panelWidth={contentWidth}
-              />
-            )}
-          </Box>
-
-          {/* Info panel (horizontal mode, narrow terminals) */}
-          {!isWide && (
-            <InfoPanel
-              frames={frames}
-              robotStates={robotStates}
-              connected={connected}
-              orientation="horizontal"
-              panelWidth={columns}
+      {/* Robot state panels */}
+      <Box flexDirection="column">
+        {robotEntries.length > 0 ? (
+          robotEntries.map(([name, state]) => (
+            <RobotStatePanel
+              key={name}
+              name={name}
+              numJoints={state.num_joints}
+              positions={state.positions}
+              panelWidth={contentWidth}
             />
-          )}
-        </Box>
-
-        {/* Info panel (vertical mode, wide terminals) */}
-        {isWide && (
-          <InfoPanel
-            frames={frames}
-            robotStates={robotStates}
-            connected={connected}
-            orientation="vertical"
-            panelWidth={infoPanelWidth}
+          ))
+        ) : (
+          <RobotStatePanel
+            name="robot_0"
+            numJoints={0}
+            positions={[]}
+            panelWidth={contentWidth}
           />
         )}
       </Box>
+
+      {/* Info panel (horizontal mode, narrow terminals only) */}
+      {!isWide && (
+        <InfoPanel
+          frames={frames}
+          robotStates={robotStates}
+          connected={connected}
+          orientation="horizontal"
+          panelWidth={columns}
+        />
+      )}
 
       {/* Status Bar */}
       <StatusBar
