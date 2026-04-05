@@ -16,6 +16,10 @@ import type { CameraFrame } from "../lib/websocket.js";
 /** Decoded camera frame as ANSI lines. */
 interface DecodedFrame {
   lines: string[];
+  /** The pixel width these lines were decoded at. */
+  decodedWidth: number;
+  /** The pixel height these lines were decoded at. */
+  decodedHeight: number;
 }
 
 interface CameraRowProps {
@@ -24,6 +28,8 @@ interface CameraRowProps {
   totalWidth: number;
   panelHeight: number;
   infoPanelLines?: string[];
+  /** If true, the right border connects to an adjacent info panel. */
+  hasRightPanel?: boolean;
 }
 
 /**
@@ -31,42 +37,50 @@ interface CameraRowProps {
  *
  * Instead of using Ink's flexbox (which can't measure ANSI escape codes),
  * this component manually merges each camera's ANSI lines into single
- * combined strings. Each output <Text> has the correct visible width.
+ * combined strings with proper box-drawing borders.
  *
- * Width math:
- *   With N cameras and (N-1) separator │ chars:
- *   perCameraWidth = floor((totalWidth - (N-1)) / N)
- *   Each camera's ANSI content is exactly perCameraWidth visible chars wide.
- *   Headers and bottom borders match this width.
+ * Width math (visible chars):
+ *   totalWidth includes the outer left │ and outer right │.
+ *   With N cameras and (N-1) inner separator │ chars plus 2 outer │:
+ *   perCameraContentWidth = floor((totalWidth - 2 - (N-1)) / N)
  */
 export function CameraRow({
   cameras,
   totalWidth,
   panelHeight,
   infoPanelLines,
+  hasRightPanel = false,
 }: CameraRowProps) {
   const numCams = cameras.length;
-  const separators = numCams - 1;
-  const perCamWidth = Math.max(4, Math.floor((totalWidth - separators) / numCams));
+  // 2 for outer borders, (numCams-1) for inner separators
+  const innerSeparators = numCams - 1;
+  const perCamWidth = Math.max(
+    4,
+    Math.floor((totalWidth - 2 - innerSeparators) / numCams),
+  );
   const contentCharHeight = Math.max(1, panelHeight - 2); // minus top/bottom border
   const targetPixelHeight = Math.max(2, contentCharHeight * 2); // ×2 for half-block
 
-  // Track decoded frames for all cameras in a single state object
+  // Track decoded frames for all cameras
   const [decodedFrames, setDecodedFrames] = useState<Map<string, DecodedFrame>>(
     () => new Map(),
   );
-  const lastJpegsRef = useRef<Map<string, Buffer | null>>(new Map());
+  // Track last JPEG data AND dimensions to trigger re-decode on resize
+  const lastDecodeKeyRef = useRef<Map<string, string>>(new Map());
 
-  // Single effect that decodes all cameras
   useEffect(() => {
     let cancelled = false;
 
     for (const cam of cameras) {
       const jpegData = cam.frame?.jpegData ?? null;
-      const lastJpeg = lastJpegsRef.current.get(cam.name) ?? null;
 
-      if (jpegData === lastJpeg) continue;
-      lastJpegsRef.current.set(cam.name, jpegData);
+      // Build a decode key that includes dimensions so resize triggers re-decode
+      const dataId = jpegData ? `${jpegData.length}:${jpegData[0]}:${jpegData[jpegData.length - 1]}` : "null";
+      const decodeKey = `${dataId}:${perCamWidth}x${targetPixelHeight}`;
+      const lastKey = lastDecodeKeyRef.current.get(cam.name);
+
+      if (decodeKey === lastKey) continue;
+      lastDecodeKeyRef.current.set(cam.name, decodeKey);
 
       if (!jpegData || jpegData.length === 0) {
         setDecodedFrames((prev) => {
@@ -89,7 +103,11 @@ export function CameraRow({
           const lines = renderToAnsiLines(data, info.width, info.height);
           setDecodedFrames((prev) => {
             const next = new Map(prev);
-            next.set(camName, { lines });
+            next.set(camName, {
+              lines,
+              decodedWidth: perCamWidth,
+              decodedHeight: targetPixelHeight,
+            });
             return next;
           });
         })
@@ -101,31 +119,34 @@ export function CameraRow({
     };
   }, [cameras, perCamWidth, targetPixelHeight]);
 
-  // Build merged output lines
+  // Build merged output lines with proper box-drawing borders
   const outputLines = useMemo(() => {
     const result: string[] = [];
 
-    // === Top border ===
-    let topLine = "";
+    // Right-edge chars depend on whether an info panel is attached
+    const topRight = hasRightPanel ? "┬" : "┐";
+    const midRight = hasRightPanel ? "│" : "│";
+    const botRight = hasRightPanel ? "┴" : "┘";
+
+    // === Top border: ┌─ camera_0 ─┬─ camera_1 ─┐  (or ┬ if info panel) ===
+    let topLine = "┌";
     for (let c = 0; c < numCams; c++) {
       const name = cameras[c].name;
-      const label = `── ${name} `;
+      const label = `─ ${name} `;
       const remaining = Math.max(0, perCamWidth - label.length);
       topLine += label + "─".repeat(remaining);
-      if (c < numCams - 1) topLine += "┬";
+      topLine += c < numCams - 1 ? "┬" : topRight;
     }
     result.push(topLine);
 
-    // === Content lines ===
+    // === Content lines: │<ansi>│<ansi>│ ===
     for (let row = 0; row < contentCharHeight; row++) {
-      let line = "";
+      let line = "│";
       for (let c = 0; c < numCams; c++) {
         const decoded = decodedFrames.get(cameras[c].name);
         if (decoded && row < decoded.lines.length) {
-          // ANSI content — exactly perCamWidth visible chars
           line += decoded.lines[row] + "\x1b[0m";
         } else {
-          // Placeholder
           if (row === Math.floor(contentCharHeight / 2)) {
             const msg = "╌ No signal ╌";
             const pad = Math.max(0, perCamWidth - msg.length);
@@ -136,16 +157,16 @@ export function CameraRow({
             line += " ".repeat(perCamWidth);
           }
         }
-        if (c < numCams - 1) line += "│";
+        line += c < numCams - 1 ? "│" : midRight;
       }
       result.push(line);
     }
 
-    // === Bottom border ===
-    let bottomLine = "";
+    // === Bottom border: └──────┴──────┘  (or ┴ if info panel) ===
+    let bottomLine = "└";
     for (let c = 0; c < numCams; c++) {
       bottomLine += "─".repeat(perCamWidth);
-      if (c < numCams - 1) bottomLine += "┴";
+      bottomLine += c < numCams - 1 ? "┴" : botRight;
     }
     result.push(bottomLine);
 

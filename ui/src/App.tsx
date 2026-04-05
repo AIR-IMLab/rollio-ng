@@ -82,10 +82,10 @@ export function App() {
       return trimmed + " ".repeat(Math.max(0, w - trimmed.length));
     };
 
-    // Top border
+    // Top border (connects to camera panel's ┬ on the left)
     const headerText = "─ Info ";
     const headerPad = Math.max(0, w - headerText.length - 1);
-    lines.push(`${headerText}${"─".repeat(headerPad)}┐`);
+    lines.push(`${headerText}${"─".repeat(headerPad)}┐`);  // camera ┬ + this = ┬─ Info ──┐
 
     // Content
     lines.push(pad(" Devices") + "│");
@@ -123,6 +123,7 @@ export function App() {
         totalWidth={contentWidth}
         panelHeight={cameraPanelHeight}
         infoPanelLines={infoPanelLines}
+        hasRightPanel={isWide}
       />
 
       {/* Robot state panels */}

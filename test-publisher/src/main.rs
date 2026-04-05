@@ -98,8 +98,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut frames_since_status: u64 = 0;
 
     loop {
-        // Generate frame into temp buffer
-        frames::generate_color_bars(&mut frame_buf, args.width, args.height);
+        // Generate time-varying frame with scrolling bars + timestamp
+        let elapsed_secs = start_time.elapsed().as_secs_f64();
+        frames::generate_color_bars(
+            &mut frame_buf,
+            args.width,
+            args.height,
+            elapsed_secs,
+            frame_index,
+        );
 
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -122,7 +129,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Publish robot states with sine-wave positions
-        let elapsed_secs = start_time.elapsed().as_secs_f64();
         for (_name, publisher) in &robot_publishers {
             let mut positions = [0.0f64; 16];
             for (j, pos) in positions.iter_mut().enumerate().take(6) {
