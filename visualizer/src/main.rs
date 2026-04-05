@@ -4,6 +4,7 @@ mod protocol;
 mod websocket;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,10 +78,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         websocket::run_server(ws_addr, ws_broadcast_tx).await;
     });
 
+    // Shared shutdown flag
+    let shutdown = Arc::new(AtomicBool::new(false));
+
     // Spawn iceoryx2 poll loop on a blocking thread
     let max_preview_width = args.max_preview_width;
     let jpeg_quality = args.jpeg_quality;
     let ipc_broadcast_tx = broadcast_tx.clone();
+    let ipc_shutdown = shutdown.clone();
 
     tokio::task::spawn_blocking(move || {
         if let Err(e) = ipc_poll_loop(
@@ -89,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_preview_width,
             jpeg_quality,
             ipc_broadcast_tx,
+            &ipc_shutdown,
         ) {
             log::error!("IPC poll loop failed: {e}");
         }
@@ -97,6 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for Ctrl+C
     tokio::signal::ctrl_c().await?;
     log::info!("shutting down");
+    shutdown.store(true, Ordering::Relaxed);
+
+    // Give the blocking thread a moment to exit
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     Ok(())
 }
@@ -111,13 +121,14 @@ fn ipc_poll_loop(
     max_preview_width: u32,
     jpeg_quality: i32,
     broadcast_tx: broadcast::Sender<BroadcastMessage>,
+    shutdown: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let poller = IpcPoller::new(camera_names, robot_names)?;
     let mut compressor = JpegCompressor::new(jpeg_quality)?;
 
     log::info!("IPC poll loop started");
 
-    loop {
+    while !shutdown.load(Ordering::Relaxed) {
         let messages = poller.poll();
 
         for msg in messages {
@@ -151,4 +162,7 @@ fn ipc_poll_loop(
         // Wait briefly for more data (1ms — low latency, minimal CPU when idle)
         let _ = poller.node().wait(Duration::from_millis(1));
     }
+
+    log::info!("IPC poll loop stopped");
+    Ok(())
 }
