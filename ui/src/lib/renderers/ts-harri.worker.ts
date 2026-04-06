@@ -70,8 +70,8 @@ let rendererConstructorPromise: Promise<HarriRendererConstructor> | null = null;
 async function loadRendererConstructor(): Promise<HarriRendererConstructor> {
   if (!rendererConstructorPromise) {
     rendererConstructorPromise = import(
-      import.meta.url.endsWith(".ts") ? "./ts-harri.ts" : "./ts-harri.js"
-    ).then((module) => module.TypeScriptHarriRenderer);
+      import.meta.url.endsWith(".ts") ? "./wasm-harri.ts" : "./wasm-harri.js"
+    ).then((module) => module.RustWasmHarriRenderer);
   }
   return await rendererConstructorPromise;
 }
@@ -88,14 +88,17 @@ parentPort.on("message", async (message: HarriWorkerRequest) => {
     switch (message.type) {
       case "init": {
         const prepareStartedAtMs = performance.now();
-        postLog("info", `init thread=${threadId} cell=${formatCellGeometry(message.options)}`);
-        const TypeScriptHarriRenderer = await loadRendererConstructor();
-        renderer = new TypeScriptHarriRenderer(message.options);
+        postLog(
+          "info",
+          `init thread=${threadId} core=wasm cell=${formatCellGeometry(message.options)}`,
+        );
+        const RustWasmHarriRenderer = await loadRendererConstructor();
+        renderer = new RustWasmHarriRenderer(message.options);
         await renderer.prepare?.();
         parentPort?.postMessage({ type: "ready", threadId });
         postLog(
           "info",
-          `ready thread=${threadId} prepare=${(performance.now() - prepareStartedAtMs).toFixed(2)}ms`,
+          `ready thread=${threadId} core=wasm prepare=${(performance.now() - prepareStartedAtMs).toFixed(2)}ms`,
         );
         return;
       }

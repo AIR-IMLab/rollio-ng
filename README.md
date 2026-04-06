@@ -13,6 +13,7 @@ See `design/` for architecture docs and sprint plans.
 | Tool       | Minimum version | Purpose              |
 |------------|-----------------|----------------------|
 | Rust       | 1.85+           | Cargo workspace      |
+| Rust target | `wasm32-unknown-unknown` | Harri WASM renderer |
 | CMake      | 3.22+           | C++ modules          |
 | g++ / clang| C++17 support   | C++ modules          |
 | NASM       | recent          | `libjpeg-turbo` SIMD build used by `turbojpeg` |
@@ -43,6 +44,7 @@ sudo apt-get install -y build-essential cmake nasm
 # Rust
 cargo build --workspace
 cargo test --workspace
+rustup target add wasm32-unknown-unknown
 
 # Camera drivers (C++)
 cmake -B cameras/build -S cameras -DCMAKE_CXX_COMPILER=g++

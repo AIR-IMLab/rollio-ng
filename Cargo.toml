@@ -13,5 +13,6 @@ members = [
     "robots/pseudo",
     "test-publisher",
     "cameras/v4l2",
+    "ui/harri-wasm-core",
 ]
 exclude = ["third_party"]

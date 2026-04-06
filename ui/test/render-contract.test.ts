@@ -104,6 +104,7 @@ test("ts-harri uses the worker-backed path by default", async () => {
 
   try {
     assert.equal(backend.kind, "worker");
+    assert.equal(backend.algorithm, "shape-lookup-rust-wasm-worker");
     const layout: AsciiRenderLayout = { columns: 8, rows: 4 };
     const raster = backend.describeRaster(layout);
     const result = await backend.render({
@@ -114,6 +115,29 @@ test("ts-harri uses the worker-backed path by default", async () => {
     });
     assert.equal(backend.kind, "worker");
     assert.notEqual(result.stats.timings.adapterMs, undefined);
+  } finally {
+    await disposeBackends([backend]);
+  }
+});
+
+test("wasm-harri uses the direct wasm path", async () => {
+  const backend = createAsciiRendererBackend("wasm-harri");
+  await backend.prepare?.();
+
+  try {
+    assert.equal(backend.kind, "wasm");
+    assert.equal(backend.algorithm, "shape-lookup-rust-wasm");
+    const layout: AsciiRenderLayout = { columns: 8, rows: 4 };
+    const raster = backend.describeRaster(layout);
+    const result = await backend.render({
+      pixels: new Uint8Array(raster.width * raster.height * 3),
+      width: raster.width,
+      height: raster.height,
+      layout,
+    });
+    assert.equal(backend.kind, "wasm");
+    assert.equal(result.backendId, "wasm-harri");
+    assert.equal(result.stats.timings.adapterMs, undefined);
   } finally {
     await disposeBackends([backend]);
   }

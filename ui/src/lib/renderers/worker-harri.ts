@@ -111,7 +111,7 @@ function cloneTransferablePixels(pixels: Buffer | Uint8Array): Uint8Array {
 
 export class WorkerThreadHarriRenderer implements AsciiRendererBackend {
   readonly id = "ts-harri";
-  readonly label = "TypeScript Harri";
+  readonly label = "Harri (Worker)";
 
   private readonly geometryRenderer: TypeScriptHarriRenderer;
   private fallbackRenderer: TypeScriptHarriRenderer | null = null;
@@ -146,7 +146,7 @@ export class WorkerThreadHarriRenderer implements AsciiRendererBackend {
   }
 
   get algorithm(): string {
-    return this.useFallback ? "shape-lookup-fallback" : "shape-lookup-worker";
+    return this.useFallback ? "shape-lookup-typescript-fallback" : "shape-lookup-rust-wasm-worker";
   }
 
   describeRaster(layout: AsciiRenderLayout): AsciiRasterDimensions {

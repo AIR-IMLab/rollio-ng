@@ -54,9 +54,18 @@ test("ts-harri honors custom terminal cell geometry", () => {
   assert.deepEqual(raster, { width: 16, height: 48 });
 });
 
+test("wasm-harri matches ts-harri raster geometry", () => {
+  const backend = createAsciiRendererBackend("wasm-harri", {
+    cellGeometry: { pixelWidth: 1, pixelHeight: 3 },
+  });
+  const raster = backend.describeRaster({ columns: 2, rows: 2 });
+  assert.deepEqual(raster, { width: 16, height: 48 });
+});
+
 test("nextAsciiRendererId cycles the available camera renderers", () => {
   assert.equal(nextAsciiRendererId("ts-half-block"), "ts-harri");
-  assert.equal(nextAsciiRendererId("ts-harri"), "ts-half-block");
+  assert.equal(nextAsciiRendererId("ts-harri"), "wasm-harri");
+  assert.equal(nextAsciiRendererId("wasm-harri"), "ts-half-block");
 });
 
 test("prepareRendererRaster expands single-channel previews to RGB", async () => {

@@ -336,6 +336,10 @@ function formatHarriWorkerSummary(
   rendererBackend: string,
   snapshot: DebugSnapshot,
 ): string {
+  if (rendererBackend === "wasm-harri") {
+    return " Harri worker: not in use | renderer=direct wasm";
+  }
+
   if (rendererBackend !== "ts-harri") {
     return ` Harri worker: inactive | last=${gaugeValue(snapshot, "stream.harri_worker.state", "n/a")} | log=${gaugeValue(snapshot, "stream.harri_worker.last_log", "n/a")}`;
   }

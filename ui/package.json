@@ -4,9 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build:harri-wasm": "node scripts/build-harri-wasm.mjs",
+    "build:ts": "tsc",
+    "build": "npm run build:harri-wasm && npm run build:ts",
     "start": "node dist/index.js",
-    "test": "tsx --test test/**/*.test.ts",
+    "test": "npm run build && tsx --test test/**/*.test.ts",
     "bench:ascii": "tsx test/render-bench.ts",
     "render:latency": "tsx scripts/render-latency.ts"
   },

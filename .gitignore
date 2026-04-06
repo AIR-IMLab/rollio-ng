@@ -8,6 +8,7 @@ cameras/build/
 # Node / UI
 ui/node_modules/
 ui/dist/
+ui/wasm/
 
 # Editor
 .vscode/

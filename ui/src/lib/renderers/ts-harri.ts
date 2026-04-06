@@ -47,6 +47,14 @@ interface GlyphDatabase {
   cache: Map<number, number>;
 }
 
+export interface HarriGlyphPayload {
+  cellWidth: number;
+  cellHeight: number;
+  glyphChars: Uint8Array;
+  glyphVectors: Float32Array;
+  vectorLength: number;
+}
+
 const INTERNAL_CIRCLES: CircleSpec[] = [
   { cx: 0.24, cy: 0.18, radius: CIRCLE_RADIUS },
   { cx: 0.76, cy: 0.18, radius: CIRCLE_RADIUS },
@@ -119,6 +127,30 @@ export class TypeScriptHarriRenderer implements AsciiRendererBackend {
 
   async prepare(): Promise<void> {
     await this.getGlyphDatabase();
+  }
+
+  async exportGlyphPayload(): Promise<HarriGlyphPayload> {
+    const glyphDb = await this.getGlyphDatabase();
+    const vectorLength = this.internalMasks.length;
+    const glyphChars = new Uint8Array(glyphDb.glyphs.length);
+    const glyphVectors = new Float32Array(glyphDb.glyphs.length * vectorLength);
+
+    glyphDb.glyphs.forEach((glyph, glyphIndex) => {
+      const charCode = glyph.char.codePointAt(0);
+      if (charCode === undefined || charCode > 0x7f) {
+        throw new Error(`Unsupported Harri glyph: ${glyph.char}`);
+      }
+      glyphChars[glyphIndex] = charCode;
+      glyphVectors.set(glyph.vector, glyphIndex * vectorLength);
+    });
+
+    return {
+      cellWidth: this.cellWidth,
+      cellHeight: this.cellHeight,
+      glyphChars,
+      glyphVectors,
+      vectorLength,
+    };
   }
 
   async render(input: AsciiRenderInput): Promise<AsciiRenderResult> {

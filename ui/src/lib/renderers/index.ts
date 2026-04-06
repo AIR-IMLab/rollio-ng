@@ -1,17 +1,20 @@
 import { TypeScriptHalfBlockRenderer } from "./half-block.js";
+import { RustWasmHarriRenderer } from "./wasm-harri.js";
 import { WorkerThreadHarriRenderer } from "./worker-harri.js";
 import type { AsciiRendererBackend, AsciiRendererOptions } from "./types.js";
 
 export const ASCII_RENDERER_IDS = [
   "ts-half-block",
   "ts-harri",
+  "wasm-harri",
 ] as const;
 
 export type AsciiRendererId = (typeof ASCII_RENDERER_IDS)[number];
 
 export const ASCII_RENDERER_LABELS: Record<AsciiRendererId, string> = {
   "ts-half-block": "Half Block",
-  "ts-harri": "Harri",
+  "ts-harri": "Harri (Worker)",
+  "wasm-harri": "Harri (WASM)",
 };
 
 export function createAsciiRendererBackend(
@@ -23,6 +26,11 @@ export function createAsciiRendererBackend(
       return new TypeScriptHalfBlockRenderer();
     case "ts-harri":
       return new WorkerThreadHarriRenderer(options);
+    case "wasm-harri":
+      return new RustWasmHarriRenderer(options, {
+        rendererId: "wasm-harri",
+        label: ASCII_RENDERER_LABELS["wasm-harri"],
+      });
   }
 }
 
