@@ -12,12 +12,33 @@ import { Box, Text } from "ink";
 import sharp from "sharp";
 import { renderToAnsiLines } from "../lib/ansi-renderer.js";
 import type { CameraFrame } from "../lib/websocket.js";
+import {
+  incrementGauge,
+  nowMs,
+  recordTiming,
+  setGauge,
+} from "../lib/debug-metrics.js";
 
 const RESET = "\x1b[0m";
+const DECODE_COMMIT_INTERVAL_MS = 16;
+const SHARP_DECODE_CONCURRENCY = 6;
+const TARGET_TOTAL_DECODE_FPS = 360;
+const MAX_DECODE_FPS_PER_CAMERA = 60;
+const MIN_DECODE_FPS_PER_CAMERA = 30;
+
+// Keep libvips from scaling CPU usage linearly with camera count.
+sharp.concurrency(SHARP_DECODE_CONCURRENCY);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /** Decoded camera frame as ANSI lines. */
 interface DecodedFrame {
   lines: string[];
+  frameKey: string;
+  sourceTimestampNs: number;
+  sourceFrameIndex: number;
   /** The pixel width these lines were decoded at. */
   decodedWidth: number;
   /** The pixel height these lines were decoded at. */
@@ -27,6 +48,10 @@ interface DecodedFrame {
 interface PendingDecode {
   key: string;
   jpegData: Buffer;
+  sourceTimestampNs: number;
+  sourceFrameIndex: number;
+  sourceWidth: number;
+  sourceHeight: number;
 }
 
 interface CameraRowProps {
@@ -59,6 +84,14 @@ export function CameraRow({
   hasRightPanel = false,
 }: CameraRowProps) {
   const numCams = cameras.length;
+  const perCameraDecodeFps = Math.max(
+    MIN_DECODE_FPS_PER_CAMERA,
+    Math.min(
+      MAX_DECODE_FPS_PER_CAMERA,
+      Math.floor(TARGET_TOTAL_DECODE_FPS / Math.max(1, numCams)),
+    ),
+  );
+  const perCameraDecodeIntervalMs = 1000 / perCameraDecodeFps;
   // 2 for outer borders, (numCams-1) for inner separators
   const innerSeparators = numCams - 1;
   const perCamWidth = Math.max(
@@ -72,33 +105,90 @@ export function CameraRow({
   const [decodedFrames, setDecodedFrames] = useState<Map<string, DecodedFrame>>(
     () => new Map(),
   );
+  const decodedFramesRef = useRef<Map<string, DecodedFrame>>(new Map());
+  const decodedFramesDirtyRef = useRef(false);
+  const committedFrameKeyRef = useRef<Map<string, string>>(new Map());
   const requestedDecodeKeyRef = useRef<Map<string, string>>(new Map());
   const pendingDecodeRef = useRef<Map<string, PendingDecode>>(new Map());
   const activeDecodeRef = useRef<Set<string>>(new Set());
+  const lastDecodeStartedAtRef = useRef<Map<string, number>>(new Map());
   const isMountedRef = useRef(true);
 
   const clearDecodedFrame = (camName: string) => {
-    setDecodedFrames((prev) => {
-      if (!prev.has(camName)) return prev;
-      const next = new Map(prev);
-      next.delete(camName);
-      return next;
-    });
+    if (!decodedFramesRef.current.has(camName)) return;
+    decodedFramesRef.current.delete(camName);
+    decodedFramesDirtyRef.current = true;
   };
 
   useEffect(() => {
     isMountedRef.current = true;
+    setGauge("stream.frames_presented_total", 0);
+    const flushDecodedFrames = setInterval(() => {
+      if (!isMountedRef.current || !decodedFramesDirtyRef.current) return;
+      const flushStartMs = nowMs();
+      decodedFramesDirtyRef.current = false;
+      let presentedFrameCount = 0;
+      for (const [camName, decodedFrame] of decodedFramesRef.current) {
+        if (committedFrameKeyRef.current.get(camName) === decodedFrame.frameKey) {
+          continue;
+        }
+        committedFrameKeyRef.current.set(camName, decodedFrame.frameKey);
+        presentedFrameCount += 1;
+        incrementGauge(`stream.frames_presented_total.${camName}`);
+        const displayedLatencyMs = Math.max(
+          0,
+          Date.now() - decodedFrame.sourceTimestampNs / 1_000_000,
+        );
+        setGauge(`stream.display_latency_ms.${camName}`, displayedLatencyMs);
+        setGauge(
+          `stream.displayed_source_timestamp_ns.${camName}`,
+          decodedFrame.sourceTimestampNs,
+        );
+        setGauge(`stream.displayed_frame_index.${camName}`, decodedFrame.sourceFrameIndex);
+        recordTiming("stream.latency.displayed", displayedLatencyMs);
+      }
+      for (const camName of Array.from(committedFrameKeyRef.current.keys())) {
+        if (!decodedFramesRef.current.has(camName)) {
+          committedFrameKeyRef.current.delete(camName);
+        }
+      }
+      setDecodedFrames(new Map(decodedFramesRef.current));
+      recordTiming("stream.decode.commit", nowMs() - flushStartMs);
+      setGauge("stream.decoded_frames", decodedFramesRef.current.size);
+      if (presentedFrameCount > 0) {
+        incrementGauge("stream.frames_presented_total", presentedFrameCount);
+      }
+    }, DECODE_COMMIT_INTERVAL_MS);
+
     return () => {
       isMountedRef.current = false;
+      clearInterval(flushDecodedFrames);
+      decodedFramesRef.current.clear();
+      decodedFramesDirtyRef.current = false;
+      committedFrameKeyRef.current.clear();
       requestedDecodeKeyRef.current.clear();
       pendingDecodeRef.current.clear();
       activeDecodeRef.current.clear();
+      lastDecodeStartedAtRef.current.clear();
     };
   }, []);
 
   useEffect(() => {
-    const black = { r: 0, g: 0, b: 0 };
+    const black = { r: 0, g: 0, b: 0, alpha: 1 };
     const activeNames = new Set(cameras.map((cam) => cam.name));
+
+    const updateDecodeGauges = () => {
+      setGauge("stream.pending_decodes", pendingDecodeRef.current.size);
+      setGauge("stream.active_decodes", activeDecodeRef.current.size);
+      setGauge("stream.target_width", perCamWidth);
+      setGauge("stream.target_height", targetPixelHeight);
+      setGauge("stream.target_char_height", contentCharHeight);
+      setGauge("stream.target_cells_per_camera", perCamWidth * contentCharHeight);
+      setGauge("stream.target_pixels_per_camera", perCamWidth * targetPixelHeight);
+      setGauge("stream.decode_fps_cap", perCameraDecodeFps);
+      setGauge("stream.decode_interval_ms", perCameraDecodeIntervalMs);
+      setGauge("stream.sharp_concurrency", SHARP_DECODE_CONCURRENCY);
+    };
 
     const pumpDecode = (camName: string) => {
       if (activeDecodeRef.current.has(camName)) return;
@@ -106,6 +196,7 @@ export function CameraRow({
       if (!initialPending) return;
 
       activeDecodeRef.current.add(camName);
+      updateDecodeGauges();
 
       void (async () => {
         try {
@@ -113,16 +204,45 @@ export function CameraRow({
 
           while (isMountedRef.current && pending) {
             pendingDecodeRef.current.delete(camName);
+            updateDecodeGauges();
 
             try {
-              const { data, info } = await sharp(pending.jpegData)
-                .flatten({ background: black })
+              const lastDecodeStartedAt =
+                lastDecodeStartedAtRef.current.get(camName);
+              if (lastDecodeStartedAt !== undefined) {
+                const waitMs =
+                  lastDecodeStartedAt + perCameraDecodeIntervalMs - nowMs();
+                if (waitMs > 1) {
+                  recordTiming("stream.decode.wait", waitMs);
+                  await sleep(waitMs);
+                  if (!isMountedRef.current) return;
+
+                  const latestPending = pendingDecodeRef.current.get(camName);
+                  if (latestPending) {
+                    pending = latestPending;
+                    pendingDecodeRef.current.delete(camName);
+                    updateDecodeGauges();
+                  }
+                }
+              }
+
+              lastDecodeStartedAtRef.current.set(camName, nowMs());
+              const totalDecodeStartMs = nowMs();
+              const resizeStartMs = nowMs();
+              const { data, info } = await sharp(pending.jpegData, {
+                sequentialRead: true,
+              })
                 .resize(perCamWidth, targetPixelHeight, {
-                  fit: "fill",
+                  // Preserve the camera aspect ratio and pad the rest of the panel
+                  // instead of stretching the frame to the available space.
+                  fit: "contain",
+                  position: "centre",
+                  background: black,
                   kernel: sharp.kernel.nearest,
                 })
                 .raw()
                 .toBuffer({ resolveWithObject: true });
+              const resizeDurationMs = nowMs() - resizeStartMs;
 
               if (!isMountedRef.current) return;
               if (requestedDecodeKeyRef.current.get(camName) !== pending.key) {
@@ -130,16 +250,49 @@ export function CameraRow({
                 continue;
               }
 
-              const lines = renderToAnsiLines(data, info.width, info.height);
-              setDecodedFrames((prev) => {
-                const next = new Map(prev);
-                next.set(camName, {
-                  lines,
-                  decodedWidth: info.width,
-                  decodedHeight: info.height,
-                });
-                return next;
+              const ansiStartMs = nowMs();
+              const ansiResult = renderToAnsiLines(data, info.width, info.height);
+              const ansiDurationMs = nowMs() - ansiStartMs;
+              const totalDecodeDurationMs = nowMs() - totalDecodeStartMs;
+              recordTiming("stream.decode.resize", resizeDurationMs);
+              recordTiming(`stream.decode.resize.${camName}`, resizeDurationMs);
+              recordTiming("stream.decode.ansi", ansiDurationMs);
+              recordTiming(`stream.decode.ansi.${camName}`, ansiDurationMs);
+              recordTiming("stream.decode.total", totalDecodeDurationMs);
+              recordTiming(`stream.decode.total.${camName}`, totalDecodeDurationMs);
+              setGauge(
+                `stream.source_resolution.${camName}`,
+                `${pending.sourceWidth}x${pending.sourceHeight}`,
+              );
+              setGauge(
+                `stream.source_pixels.${camName}`,
+                pending.sourceWidth * pending.sourceHeight,
+              );
+              setGauge(`stream.jpeg_bytes.${camName}`, pending.jpegData.length);
+              setGauge(
+                `stream.decoded_resolution.${camName}`,
+                `${info.width}x${info.height}`,
+              );
+              setGauge(`stream.ansi_cells.${camName}`, ansiResult.cellCount);
+              setGauge(
+                `stream.ansi_sgr_changes.${camName}`,
+                ansiResult.sgrChangeCount,
+              );
+              setGauge(
+                `stream.ansi_sgr_per_cell.${camName}`,
+                ansiResult.cellCount > 0
+                  ? ansiResult.sgrChangeCount / ansiResult.cellCount
+                  : 0,
+              );
+              decodedFramesRef.current.set(camName, {
+                lines: ansiResult.lines,
+                frameKey: pending.key,
+                sourceTimestampNs: pending.sourceTimestampNs,
+                sourceFrameIndex: pending.sourceFrameIndex,
+                decodedWidth: info.width,
+                decodedHeight: info.height,
               });
+              decodedFramesDirtyRef.current = true;
             } catch {
               if (!isMountedRef.current) return;
             }
@@ -148,6 +301,7 @@ export function CameraRow({
           }
         } finally {
           activeDecodeRef.current.delete(camName);
+          updateDecodeGauges();
           if (isMountedRef.current && pendingDecodeRef.current.has(camName)) {
             pumpDecode(camName);
           }
@@ -162,6 +316,7 @@ export function CameraRow({
         requestedDecodeKeyRef.current.delete(cam.name);
         pendingDecodeRef.current.delete(cam.name);
         clearDecodedFrame(cam.name);
+        updateDecodeGauges();
         continue;
       }
 
@@ -174,7 +329,12 @@ export function CameraRow({
       pendingDecodeRef.current.set(cam.name, {
         key: decodeKey,
         jpegData: frame.jpegData,
+        sourceTimestampNs: frame.timestampNs,
+        sourceFrameIndex: frame.frameIndex,
+        sourceWidth: frame.width,
+        sourceHeight: frame.height,
       });
+      updateDecodeGauges();
       pumpDecode(cam.name);
     }
 
@@ -183,11 +343,25 @@ export function CameraRow({
       requestedDecodeKeyRef.current.delete(name);
       pendingDecodeRef.current.delete(name);
       clearDecodedFrame(name);
+      updateDecodeGauges();
     }
-  }, [cameras, perCamWidth, targetPixelHeight]);
+  }, [
+    cameras,
+    perCamWidth,
+    targetPixelHeight,
+    perCameraDecodeFps,
+    perCameraDecodeIntervalMs,
+  ]);
+
+  useEffect(() => {
+    setGauge("stream.rendered_cameras", numCams);
+    setGauge("stream.decoded_frames", decodedFrames.size);
+    setGauge("stream.target_visible_cells", numCams * perCamWidth * contentCharHeight);
+  }, [numCams, decodedFrames.size, perCamWidth, contentCharHeight]);
 
   // Build merged output lines with proper box-drawing borders
-  const outputLines = useMemo(() => {
+  const outputResult = useMemo(() => {
+    const composeStartMs = nowMs();
     const result: string[] = [];
 
     // Right-edge chars depend on whether an info panel is attached
@@ -237,28 +411,52 @@ export function CameraRow({
     }
     result.push(bottomLine);
 
-    return result;
+    return {
+      lines: result,
+      composeDurationMs: nowMs() - composeStartMs,
+    };
   }, [cameras, decodedFrames, numCams, perCamWidth, contentCharHeight]);
 
-  // Merge info panel lines on the right if provided
-  const finalLines = useMemo(() => {
-    if (!infoPanelLines || infoPanelLines.length === 0) {
-      return outputLines.map((line) => line + RESET);
-    }
+  useEffect(() => {
+    recordTiming("stream.compose", outputResult.composeDurationMs);
+  }, [outputResult.composeDurationMs]);
 
-    return outputLines.map((line, i) => {
-      const infoLine = i < infoPanelLines.length ? infoPanelLines[i] : "";
-      return line + infoLine + RESET;
-    });
+  const outputLines = outputResult.lines;
+
+  // Merge info panel lines on the right if provided
+  const finalOutputResult = useMemo(() => {
+    const finalizeStartMs = nowMs();
+    const finalLines =
+      !infoPanelLines || infoPanelLines.length === 0
+        ? outputLines.map((line) => line + RESET)
+        : outputLines.map((line, i) => {
+            const infoLine = i < infoPanelLines.length ? infoPanelLines[i] : "";
+            return line + infoLine + RESET;
+          });
+    const finalText = finalLines.join("\n");
+    return {
+      finalLines,
+      finalText,
+      finalizeDurationMs: nowMs() - finalizeStartMs,
+      outputBytes: Buffer.byteLength(finalText, "utf8"),
+    };
   }, [outputLines, infoPanelLines]);
+
+  useEffect(() => {
+    recordTiming("stream.finalize", finalOutputResult.finalizeDurationMs);
+    setGauge("stream.output_rows", finalOutputResult.finalLines.length);
+    setGauge("stream.output_bytes", finalOutputResult.outputBytes);
+  }, [
+    finalOutputResult.finalizeDurationMs,
+    finalOutputResult.finalLines.length,
+    finalOutputResult.outputBytes,
+  ]);
+
+  const finalText = finalOutputResult.finalText;
 
   return (
     <Box flexDirection="column">
-      {finalLines.map((line, i) => (
-        <Text key={i} wrap="end">
-          {line}
-        </Text>
-      ))}
+      <Text wrap="end">{finalText}</Text>
     </Box>
   );
 }

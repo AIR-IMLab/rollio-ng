@@ -9,6 +9,8 @@
 export interface CameraFrameMessage {
   type: "camera_frame";
   name: string;
+  timestampNs: number;
+  frameIndex: number;
   width: number;
   height: number;
   jpegData: Buffer;
@@ -23,6 +25,30 @@ export interface RobotStateMessage {
   positions: number[];
   velocities: number[];
   efforts: number[];
+}
+
+/** Metadata about websocket-published streams from the visualizer. */
+export interface StreamInfoCamera {
+  name: string;
+  source_width: number | null;
+  source_height: number | null;
+  latest_timestamp_ns: number | null;
+  latest_frame_index: number | null;
+  source_fps_estimate: number | null;
+  published_fps_estimate: number | null;
+  last_published_timestamp_ns: number | null;
+}
+
+export interface StreamInfoMessage {
+  type: "stream_info";
+  server_timestamp_ns: number;
+  configured_preview_fps: number;
+  max_preview_width: number;
+  max_preview_height: number;
+  preview_workers: number;
+  jpeg_quality: number;
+  cameras: StreamInfoCamera[];
+  robots: string[];
 }
 
 /** Command sent from UI to Visualizer. */
@@ -41,8 +67,10 @@ const FRAME_TYPE_JPEG = 0x01;
  *   Byte 0:       frame encoding type (0x01 = JPEG)
  *   Bytes 1-2:    camera name length (u16 LE)
  *   Bytes 3..N:   camera name (UTF-8)
- *   Bytes N+1..4: original width (u32 LE)
- *   Bytes N+5..8: original height (u32 LE)
+ *   Bytes N+1..8: original source timestamp_ns (u64 LE)
+ *   Bytes N+9..16: original source frame_index (u64 LE)
+ *   Bytes N+17..20: original width (u32 LE)
+ *   Bytes N+21..24: original height (u32 LE)
  *   Remaining:    JPEG payload
  */
 export function parseBinaryMessage(
@@ -54,17 +82,23 @@ export function parseBinaryMessage(
   if (typeTag !== FRAME_TYPE_JPEG) return null;
 
   const nameLen = data.readUInt16LE(1);
-  const headerEnd = 3 + nameLen + 4 + 4;
+  const headerStart = 3 + nameLen;
+  const headerEnd = headerStart + 8 + 8 + 4 + 4;
   if (data.length < headerEnd) return null;
 
   const name = data.subarray(3, 3 + nameLen).toString("utf-8");
-  const width = data.readUInt32LE(3 + nameLen);
-  const height = data.readUInt32LE(3 + nameLen + 4);
-  const jpegData = Buffer.from(data.subarray(headerEnd));
+  const timestampNs = Number(data.readBigUInt64LE(headerStart));
+  const frameIndex = Number(data.readBigUInt64LE(headerStart + 8));
+  const width = data.readUInt32LE(headerStart + 16);
+  const height = data.readUInt32LE(headerStart + 20);
+  // Reuse the incoming WebSocket buffer instead of copying the JPEG payload.
+  const jpegData = data.subarray(headerEnd);
 
   return {
     type: "camera_frame",
     name,
+    timestampNs,
+    frameIndex,
     width,
     height,
     jpegData,
@@ -72,13 +106,18 @@ export function parseBinaryMessage(
 }
 
 /**
- * Parse a JSON WebSocket text message into a RobotStateMessage.
+ * Parse a JSON WebSocket text message from the visualizer.
  */
-export function parseJsonMessage(text: string): RobotStateMessage | null {
+export function parseJsonMessage(
+  text: string,
+): RobotStateMessage | StreamInfoMessage | null {
   try {
     const obj = JSON.parse(text);
     if (obj && obj.type === "robot_state") {
       return obj as RobotStateMessage;
+    }
+    if (obj && obj.type === "stream_info") {
+      return obj as StreamInfoMessage;
     }
     return null;
   } catch {

@@ -1,11 +1,19 @@
 import React, { useState, useEffect, useMemo } from "react";
-import { Box, useStdout } from "ink";
+import { Box, useInput, useStdout } from "ink";
 import { useWebSocket } from "./lib/websocket.js";
 import { TitleBar } from "./components/TitleBar.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { CameraRow } from "./components/StreamPanel.js";
 import { RobotStatePanel } from "./components/RobotStatePanel.js";
 import { InfoPanel } from "./components/InfoPanel.js";
+import { DebugPanel, DEBUG_PANEL_HEIGHT } from "./components/DebugPanel.js";
+import {
+  nowMs,
+  recordTiming,
+  setGauge,
+  snapshotDebugMetrics,
+  type DebugSnapshot,
+} from "./lib/debug-metrics.js";
 
 /** Custom hook to track terminal dimensions with live resize updates. */
 function useTerminalSize() {
@@ -33,17 +41,31 @@ function useTerminalSize() {
 }
 
 export function App() {
+  const renderStartMs = nowMs();
   const { columns, rows } = useTerminalSize();
-  const { frames, robotStates, connected } = useWebSocket("ws://localhost:9090");
+  const { frames, robotStates, streamInfo, connected } = useWebSocket(
+    "ws://localhost:9090",
+  );
+  const [showDebug, setShowDebug] = useState(false);
+  const [debugSnapshot, setDebugSnapshot] = useState<DebugSnapshot>(() =>
+    snapshotDebugMetrics(),
+  );
 
   // Derive health status
   const health = connected ? ("normal" as const) : ("degraded" as const);
 
+  useInput((input, key) => {
+    if (!key.ctrl && !key.meta && input.toLowerCase() === "d") {
+      setShowDebug((prev) => !prev);
+    }
+  });
+
   // Layout constants
   const isWide = columns >= 120;
   const infoPanelWidth = isWide ? 25 : columns;
+  const debugPanelHeight = showDebug ? DEBUG_PANEL_HEIGHT : 0;
   const contentWidth = isWide ? columns - infoPanelWidth : columns;
-  const contentHeight = Math.max(1, rows - 2); // minus title + status bars
+  const contentHeight = Math.max(1, rows - 2 - debugPanelHeight); // minus title + status bars
 
   // Camera panel sizing
   const cameraNames = Array.from(frames.keys());
@@ -113,6 +135,34 @@ export function App() {
   // Build robot panel data
   const robotEntries = Array.from(robotStates.entries());
 
+  useEffect(() => {
+    setGauge("ui.layout", `${columns}x${rows} ${isWide ? "wide" : "narrow"}`);
+    setGauge("ui.camera_count", frames.size);
+    setGauge("ui.robot_count", robotStates.size);
+    setGauge("ui.debug_enabled", showDebug ? "On" : "Off");
+    setGauge(
+      "ui.stream_info_available",
+      streamInfo ? "Ready" : "Waiting",
+    );
+  }, [columns, rows, isWide, frames.size, robotStates.size, showDebug, streamInfo]);
+
+  useEffect(() => {
+    if (!showDebug) return;
+    setDebugSnapshot(snapshotDebugMetrics());
+    const interval = setInterval(() => {
+      setDebugSnapshot(snapshotDebugMetrics());
+    }, 250);
+    return () => {
+      clearInterval(interval);
+    };
+  }, [showDebug]);
+
+  const renderDurationMs = nowMs() - renderStartMs;
+
+  useEffect(() => {
+    recordTiming("app.render", renderDurationMs);
+  });
+
   return (
     <Box flexDirection="column" width={columns} height={rows}>
       {/* Title Bar */}
@@ -160,6 +210,14 @@ export function App() {
         />
       )}
 
+      {showDebug && (
+        <DebugPanel
+          width={columns}
+          snapshot={debugSnapshot}
+          streamInfo={streamInfo}
+        />
+      )}
+
       {/* Status Bar */}
       <StatusBar
         mode="Collect"
@@ -168,6 +226,7 @@ export function App() {
         connected={connected}
         health={health}
         width={columns}
+        debugEnabled={showDebug}
       />
     </Box>
   );

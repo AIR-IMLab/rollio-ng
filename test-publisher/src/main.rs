@@ -7,7 +7,25 @@ use rollio_types::messages::{CameraFrameHeader, PixelFormat, RobotState};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::video_file::LocalVideoFileSource;
+use crate::video_file::FfmpegRgbSource;
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CameraDeviceInputFormat {
+    #[default]
+    Auto,
+    Mjpeg,
+    Yuyv422,
+}
+
+impl CameraDeviceInputFormat {
+    fn ffmpeg_input_format(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Mjpeg => Some("mjpeg"),
+            Self::Yuyv422 => Some("yuyv422"),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "rollio-test-publisher")]
@@ -36,8 +54,22 @@ struct Args {
     /// Optional local video file to decode and publish for every camera.
     /// The file is looped indefinitely and resampled to `--fps`, `--width`,
     /// and `--height`.
-    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, conflicts_with = "camera_device")]
     camera_file: Option<PathBuf>,
+
+    /// Optional V4L2 camera device (for example `/dev/video0`) to capture and
+    /// publish for every camera topic.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath,
+        conflicts_with = "camera_file"
+    )]
+    camera_device: Option<PathBuf>,
+
+    /// Requested V4L2 input pixel format for `--camera-device`.
+    #[arg(long, default_value = "auto")]
+    camera_device_format: CameraDeviceInputFormat,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,6 +80,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .camera_file
         .as_ref()
         .map(|path| format!("file={}", path.display()))
+        .or_else(|| {
+            args.camera_device.as_ref().map(|path| {
+                let format = args
+                    .camera_device_format
+                    .ffmpeg_input_format()
+                    .unwrap_or("auto");
+                format!("device={} format={format}", path.display())
+            })
+        })
         .unwrap_or_else(|| "synthetic=color-bars".to_string());
 
     eprintln!(
@@ -103,12 +144,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (we need a temp buffer because write_from_fn is per-byte, and burning
     //  in the counter requires reading back neighboring pixels)
     let mut frame_buf = vec![0u8; payload_len];
-    let mut video_source = match (&args.camera_file, args.cameras) {
-        (Some(path), cameras) if cameras > 0 => Some(LocalVideoFileSource::new(
+    let mut video_source = match (
+        args.camera_file.as_ref(),
+        args.camera_device.as_ref(),
+        args.cameras,
+    ) {
+        (Some(path), None, cameras) if cameras > 0 => Some(FfmpegRgbSource::from_file(
             path.clone(),
             args.width,
             args.height,
             args.fps,
+        )?),
+        (None, Some(device), cameras) if cameras > 0 => Some(FfmpegRgbSource::from_v4l2_device(
+            device.clone(),
+            args.width,
+            args.height,
+            args.fps,
+            args.camera_device_format.ffmpeg_input_format(),
         )?),
         _ => None,
     };
@@ -188,9 +240,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Precise frame pacing: sleep until next frame time
         next_frame_time += frame_duration;
-        let sleep_until = next_frame_time;
-        if sleep_until > Instant::now() {
-            std::thread::sleep(sleep_until - Instant::now());
+        let now = Instant::now();
+        if next_frame_time > now {
+            std::thread::sleep(next_frame_time - now);
+        } else {
+            // If capture/publish work ran long, drop schedule debt instead of
+            // bursting frames to "catch up" with stale timestamps.
+            next_frame_time = now;
         }
     }
 }

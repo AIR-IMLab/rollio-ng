@@ -9,16 +9,26 @@
  *
  * Optimizations:
  * - O(1) color lookup via pre-computed LUT (color-palette.ts)
+ * - Reuses precomputed SGR strings for ANSI 256 colors
+ * - Emits fg/bg codes only when the color actually changes within a row
  *
- * Note: We intentionally emit full fg/bg SGR codes for every cell instead of
- * relying on previous color state. This matches the safer prototype behavior
- * and avoids color bleed when downstream renderers split or reflow ANSI rows.
+ * Note: Each rendered row ends with a reset, so tracking fg/bg state within
+ * a row is still safe and avoids color bleed across rows while cutting down
+ * the amount of ANSI output that Ink has to push to the terminal.
  */
 
 import { nearestAnsi256 } from "./color-palette.js";
 
 const HALF_BLOCK = "\u2584";
 const RESET = "\x1b[0m";
+const FG_SGR = Array.from({ length: 256 }, (_, idx) => `\x1b[38;5;${idx}m`);
+const BG_SGR = Array.from({ length: 256 }, (_, idx) => `\x1b[48;5;${idx}m`);
+
+export interface AnsiRenderResult {
+  lines: string[];
+  cellCount: number;
+  sgrChangeCount: number;
+}
 
 /**
  * Render RGB pixel data as an array of ANSI 256-color half-block lines.
@@ -30,22 +40,33 @@ const RESET = "\x1b[0m";
  * @param rgbPixels - Raw RGB24 pixel data (3 bytes per pixel, row-major)
  * @param imgWidth  - Width of the image in pixels
  * @param imgHeight - Height of the image in pixels (should be even)
- * @returns Array of ANSI-escaped strings, one per character row
+ * @returns ANSI-escaped rows plus basic output complexity stats
  */
 export function renderToAnsiLines(
   rgbPixels: Buffer | Uint8Array,
   imgWidth: number,
   imgHeight: number,
-): string[] {
+): AnsiRenderResult {
   const charRows = Math.floor(imgHeight / 2);
-  if (charRows === 0 || imgWidth === 0) return [];
+  if (charRows === 0 || imgWidth === 0) {
+    return {
+      lines: [],
+      cellCount: 0,
+      sgrChangeCount: 0,
+    };
+  }
 
-  const lines: string[] = [];
+  const lines = new Array<string>(charRows);
+  const maxPartsPerRow = imgWidth * 3 + 1;
+  let sgrChangeCount = 0;
 
   for (let cy = 0; cy < charRows; cy++) {
     const topRowY = cy * 2;
     const botRowY = cy * 2 + 1;
-    const parts: string[] = [];
+    const parts = new Array<string>(maxPartsPerRow);
+    let partCount = 0;
+    let previousBgAnsi = -1;
+    let previousFgAnsi = -1;
 
     for (let x = 0; x < imgWidth; x++) {
       const topIdx = (topRowY * imgWidth + x) * 3;
@@ -62,12 +83,26 @@ export function renderToAnsiLines(
         rgbPixels[botIdx + 2],
       );
 
-      parts.push(`\x1b[48;5;${bgAnsi}m\x1b[38;5;${fgAnsi}m${HALF_BLOCK}`);
+      if (bgAnsi !== previousBgAnsi) {
+        parts[partCount++] = BG_SGR[bgAnsi];
+        previousBgAnsi = bgAnsi;
+        sgrChangeCount += 1;
+      }
+      if (fgAnsi !== previousFgAnsi) {
+        parts[partCount++] = FG_SGR[fgAnsi];
+        previousFgAnsi = fgAnsi;
+        sgrChangeCount += 1;
+      }
+      parts[partCount++] = HALF_BLOCK;
     }
 
-    parts.push(RESET);
-    lines.push(parts.join(""));
+    parts[partCount++] = RESET;
+    lines[cy] = parts.slice(0, partCount).join("");
   }
 
-  return lines;
+  return {
+    lines,
+    cellCount: charRows * imgWidth,
+    sgrChangeCount,
+  };
 }
