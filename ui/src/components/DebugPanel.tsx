@@ -46,6 +46,7 @@ export function DebugPanel({ width, snapshot, streamInfo }: DebugPanelProps) {
     () => getCameraNames(snapshot, streamInfo),
     [snapshot, streamInfo],
   );
+  const rendererBackend = gaugeValue(snapshot, "stream.renderer_backend", "n/a");
 
   useEffect(() => {
     const receivedCounts: Record<string, number> = {};
@@ -173,31 +174,37 @@ export function DebugPanel({ width, snapshot, streamInfo }: DebugPanelProps) {
     },
     {
       text: padLine(
-        ` Display latency: ${formatCameraMetrics(cameraNames, (cameraName) => currentDisplayedLatencyMs(snapshot, cameraName), formatLatencyValue)}`,
+        ` Renderer: ${rendererBackend} (${gaugeValue(snapshot, "stream.renderer_kind")}/${gaugeValue(snapshot, "stream.renderer_algorithm")}) | raster=${gaugeValue(snapshot, "stream.target_width")}x${gaugeValue(snapshot, "stream.target_height")} | out=${gaugeValue(snapshot, "stream.output_columns")}x${gaugeValue(snapshot, "stream.output_rows")}`,
         innerWidth,
       ),
     },
     {
       text: padLine(
-        ` Source/JPEG: ${formatCameraSourceStats(cameraNames, snapshot)}`,
+        ` Source/JPEG: ${formatCameraSourceStats(cameraNames, snapshot, streamInfo)}`,
         innerWidth,
       ),
     },
     {
       text: padLine(
-        ` Hot decode: total=${formatHottestTiming(snapshot, cameraNames, "stream.decode.total")} | resize=${formatHottestTiming(snapshot, cameraNames, "stream.decode.resize")} | ansi=${formatHottestTiming(snapshot, cameraNames, "stream.decode.ansi")}`,
+        ` Hot render: total=${formatHottestTiming(snapshot, cameraNames, "stream.render.total")} | sample=${formatHottestTiming(snapshot, cameraNames, "stream.render.sample")} | lookup=${formatHottestTiming(snapshot, cameraNames, "stream.render.lookup")}`,
         innerWidth,
       ),
     },
     {
       text: padLine(
-        ` Target/output: ${gaugeValue(snapshot, "stream.target_width")}x${gaugeValue(snapshot, "stream.target_height")} px/cam | cells=${gaugeValue(snapshot, "stream.target_visible_cells")} | out=${formatBytes(numericGaugeValue(snapshot, "stream.output_bytes", Number.NaN))} | rows=${gaugeValue(snapshot, "stream.output_rows")}`,
+        ` Resize/queue: resize=${formatHottestTiming(snapshot, cameraNames, "stream.decode.resize")} | queue=${formatLast(snapshot.timings["stream.render.queue_wait"])} | depth=${gaugeValue(snapshot, "stream.render_queue_depth", "0")} | stale=${gaugeValue(snapshot, "stream.render_stale_drops", "0")} | active=${gaugeValue(snapshot, "stream.render_active_camera", "Idle")}`,
         innerWidth,
       ),
     },
     {
       text: padLine(
-        ` ANSI/finalize: hot=${formatHottestGauge(snapshot, cameraNames, "stream.ansi_sgr_per_cell", formatRatioValue)} | finalize=${formatLast(snapshot.timings["stream.finalize"])}`,
+        ` Target/output: cells=${gaugeValue(snapshot, "stream.target_visible_cells")} | out=${formatBytes(numericGaugeValue(snapshot, "stream.output_bytes", Number.NaN))} | rows=${gaugeValue(snapshot, "stream.output_frame_rows")} | hot/cam=${formatHottestGauge(snapshot, cameraNames, "stream.render_output_bytes", formatBytes)}`,
+        innerWidth,
+      ),
+    },
+    {
+      text: padLine(
+        ` Display/cache: latency=${formatCameraMetrics(cameraNames, (cameraName) => currentDisplayedLatencyMs(snapshot, cameraName), formatLatencyValue)} | sgr=${formatHottestGauge(snapshot, cameraNames, "stream.ansi_sgr_per_cell", formatRatioValue)} | hits=${formatHottestGauge(snapshot, cameraNames, "stream.render_cache_hits", formatCountValue)} | misses=${formatHottestGauge(snapshot, cameraNames, "stream.render_cache_misses", formatCountValue)} | finalize=${formatLast(snapshot.timings["stream.finalize"])}`,
         innerWidth,
       ),
     },
@@ -318,6 +325,10 @@ function formatRatioValue(value: number | null | undefined): string {
   return Number.isFinite(value) ? `${(value as number).toFixed(2)}` : "n/a";
 }
 
+function formatCountValue(value: number | null | undefined): string {
+  return Number.isFinite(value) ? `${Math.round(value as number)}` : "n/a";
+}
+
 function formatCameraMetrics(
   cameraNames: string[],
   getValue: (cameraName: string) => number | null | undefined,
@@ -379,7 +390,8 @@ function formatPreviewConfig(streamInfo: StreamInfoMessage | null): string {
     ? `${streamInfo.configured_preview_fps}fps`
     : "unthrottled";
   return (
-    `${preview} | max=${streamInfo.max_preview_width}x${streamInfo.max_preview_height}` +
+    `${preview} | cfg=${streamInfo.max_preview_width}x${streamInfo.max_preview_height}` +
+    ` | active=${streamInfo.active_preview_width}x${streamInfo.active_preview_height}` +
     ` | q=${streamInfo.jpeg_quality}` +
     ` | workers=${streamInfo.preview_workers}`
   );
@@ -463,20 +475,30 @@ function formatHottestGauge(
 function formatCameraSourceStats(
   cameraNames: string[],
   snapshot: DebugSnapshot,
+  streamInfo: StreamInfoMessage | null,
 ): string {
   if (cameraNames.length === 0) return "n/a";
   return cameraNames
     .map((cameraName) => {
-      const resolution = gaugeValue(
+      const previewResolution = gaugeValue(
         snapshot,
-        `stream.source_resolution.${cameraName}`,
+        `stream.preview_resolution.${cameraName}`,
       );
+      const camera = cameraInfo(streamInfo, cameraName);
+      const sourceResolution =
+        camera?.source_width != null && camera.source_height != null
+          ? `${camera.source_width}x${camera.source_height}`
+          : previewResolution;
       const jpegBytes = numericGaugeValue(
         snapshot,
         `stream.jpeg_bytes.${cameraName}`,
         Number.NaN,
       );
-      return `${cameraName}=${resolution}/${formatBytes(jpegBytes)}`;
+      const resolutionSummary =
+        previewResolution !== "n/a" && previewResolution !== sourceResolution
+          ? `${sourceResolution}->${previewResolution}`
+          : sourceResolution;
+      return `${cameraName}=${resolutionSummary}/${formatBytes(jpegBytes)}`;
     })
     .join(", ");
 }

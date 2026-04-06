@@ -6,13 +6,13 @@
 ///   Bytes 3..N:  camera name (UTF-8)
 ///   Bytes N+1..N+8:   source timestamp_ns (u64 LE)
 ///   Bytes N+9..N+16:  source frame_index (u64 LE)
-///   Bytes N+17..N+20: original width (u32 LE)
-///   Bytes N+21..N+24: original height (u32 LE)
+///   Bytes N+17..N+20: encoded preview width (u32 LE)
+///   Bytes N+21..N+24: encoded preview height (u32 LE)
 ///   Remaining:   encoded frame data (JPEG payload)
 ///
 /// Text/JSON messages (both directions):
 ///   Visualizer → UI: {"type":"robot_state","name":"...","timestamp_ns":...,...}
-///   UI → Visualizer:  {"type":"command","action":"..."}
+///   UI → Visualizer:  {"type":"command","action":"...","width":...,"height":...}
 use rollio_types::messages::RobotState;
 use serde::{Deserialize, Serialize};
 
@@ -89,14 +89,20 @@ pub fn encode_stream_info(snapshot: &StreamInfoSnapshot) -> String {
 
 /// A command received from the UI via WebSocket.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct Command {
     #[serde(rename = "type")]
     pub msg_type: String,
-    pub action: Option<String>,
+    pub action: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Attempt to parse a JSON text message as a command from the UI.
 pub fn decode_command(text: &str) -> Option<Command> {
-    serde_json::from_str(text).ok()
+    let command: Command = serde_json::from_str(text).ok()?;
+    if command.msg_type == "command" {
+        Some(command)
+    } else {
+        None
+    }
 }

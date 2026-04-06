@@ -11,8 +11,8 @@ export interface CameraFrameMessage {
   name: string;
   timestampNs: number;
   frameIndex: number;
-  width: number;
-  height: number;
+  previewWidth: number;
+  previewHeight: number;
   jpegData: Buffer;
 }
 
@@ -45,6 +45,8 @@ export interface StreamInfoMessage {
   configured_preview_fps: number;
   max_preview_width: number;
   max_preview_height: number;
+  active_preview_width: number;
+  active_preview_height: number;
   preview_workers: number;
   jpeg_quality: number;
   cameras: StreamInfoCamera[];
@@ -52,9 +54,13 @@ export interface StreamInfoMessage {
 }
 
 /** Command sent from UI to Visualizer. */
+export type CommandAction = "get_stream_info" | "set_preview_size";
+
 export interface CommandMessage {
   type: "command";
-  action: string;
+  action: CommandAction;
+  width?: number;
+  height?: number;
 }
 
 /** Frame encoding type tags. */
@@ -69,8 +75,8 @@ const FRAME_TYPE_JPEG = 0x01;
  *   Bytes 3..N:   camera name (UTF-8)
  *   Bytes N+1..8: original source timestamp_ns (u64 LE)
  *   Bytes N+9..16: original source frame_index (u64 LE)
- *   Bytes N+17..20: original width (u32 LE)
- *   Bytes N+21..24: original height (u32 LE)
+ *   Bytes N+17..20: encoded preview width (u32 LE)
+ *   Bytes N+21..24: encoded preview height (u32 LE)
  *   Remaining:    JPEG payload
  */
 export function parseBinaryMessage(
@@ -99,8 +105,8 @@ export function parseBinaryMessage(
     name,
     timestampNs,
     frameIndex,
-    width,
-    height,
+    previewWidth: width,
+    previewHeight: height,
     jpegData,
   };
 }
@@ -128,6 +134,13 @@ export function parseJsonMessage(
 /**
  * Encode a command message as JSON for sending to the Visualizer.
  */
-export function encodeCommand(action: string): string {
-  return JSON.stringify({ type: "command", action });
+export function encodeCommand(
+  action: CommandAction,
+  fields: Partial<Pick<CommandMessage, "width" | "height">> = {},
+): string {
+  return JSON.stringify({ type: "command", action, ...fields });
+}
+
+export function encodeSetPreviewSize(width: number, height: number): string {
+  return encodeCommand("set_preview_size", { width, height });
 }

@@ -9,6 +9,7 @@ use rollio_types::messages::CameraFrameHeader;
 use tokio::sync::broadcast;
 
 use crate::jpeg::JpegCompressor;
+use crate::preview_config::RuntimePreviewConfig;
 use crate::protocol;
 use crate::stream_info::StreamInfoRegistry;
 use crate::websocket::BroadcastMessage;
@@ -38,8 +39,7 @@ impl PreviewPipeline {
     pub fn new(
         camera_names: &[String],
         worker_count: usize,
-        max_preview_width: u32,
-        max_preview_height: u32,
+        preview_config: Arc<RuntimePreviewConfig>,
         jpeg_quality: i32,
         broadcast_tx: broadcast::Sender<BroadcastMessage>,
         stream_info: Arc<Mutex<StreamInfoRegistry>>,
@@ -60,6 +60,7 @@ impl PreviewPipeline {
             let worker_tx = work_tx.clone();
             let worker_rx = work_rx.clone();
             let worker_shutdown = Arc::clone(&shutdown);
+            let worker_preview_config = Arc::clone(&preview_config);
             let worker_broadcast_tx = broadcast_tx.clone();
             let worker_stream_info = Arc::clone(&stream_info);
 
@@ -70,8 +71,7 @@ impl PreviewPipeline {
                     worker_tx,
                     worker_states,
                     worker_shutdown,
-                    max_preview_width,
-                    max_preview_height,
+                    worker_preview_config,
                     jpeg_quality,
                     worker_broadcast_tx,
                     worker_stream_info,
@@ -125,8 +125,7 @@ fn preview_worker_loop(
     work_tx: Sender<String>,
     camera_states: Arc<Mutex<HashMap<String, CameraPreviewState>>>,
     shutdown: Arc<AtomicBool>,
-    max_preview_width: u32,
-    max_preview_height: u32,
+    preview_config: Arc<RuntimePreviewConfig>,
     jpeg_quality: i32,
     broadcast_tx: broadcast::Sender<BroadcastMessage>,
     stream_info: Arc<Mutex<StreamInfoRegistry>>,
@@ -148,21 +147,22 @@ fn preview_worker_loop(
 
         let pending_frame = take_latest_frame(&camera_states, &camera_name);
         if let Some(pending_frame) = pending_frame {
+            let preview_size = preview_config.current_size();
             match compressor.compress(
                 &pending_frame.data,
                 pending_frame.header.width,
                 pending_frame.header.height,
-                max_preview_width,
-                max_preview_height,
+                preview_size.width,
+                preview_size.height,
             ) {
-                Ok(jpeg_data) => {
+                Ok(preview) => {
                     let encoded = protocol::encode_camera_frame(
                         &camera_name,
                         pending_frame.header.timestamp_ns,
                         pending_frame.header.frame_index,
-                        pending_frame.header.width,
-                        pending_frame.header.height,
-                        jpeg_data,
+                        preview.width,
+                        preview.height,
+                        preview.jpeg_data,
                     );
                     if let Ok(mut info) = stream_info.lock() {
                         info.observe_published_frame(&camera_name);

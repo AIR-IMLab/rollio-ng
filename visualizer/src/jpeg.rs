@@ -17,6 +17,12 @@ pub struct JpegCompressor {
     jpeg_dst: turbojpeg::OutputBuf<'static>,
 }
 
+pub struct CompressedPreview<'a> {
+    pub jpeg_data: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+}
+
 impl JpegCompressor {
     /// Create a new compressor with the given JPEG quality (1-100).
     /// Uses 4:2:0 chroma subsampling for optimal compression ratio.
@@ -49,14 +55,18 @@ impl JpegCompressor {
         height: u32,
         max_width: u32,
         max_height: u32,
-    ) -> Result<&'a [u8], Box<dyn std::error::Error>> {
+    ) -> Result<CompressedPreview<'a>, Box<dyn std::error::Error>> {
         let compressor = &mut self.compressor;
         let resizer = &mut self.resizer;
         let resize_dst = &mut self.resize_dst;
         let jpeg_dst = &mut self.jpeg_dst;
 
         if width <= max_width && height <= max_height {
-            return compress_raw(compressor, jpeg_dst, rgb_data, width, height);
+            return Ok(CompressedPreview {
+                jpeg_data: compress_raw(compressor, jpeg_dst, rgb_data, width, height)?,
+                width,
+                height,
+            });
         }
 
         let scale_w = max_width as f64 / width as f64;
@@ -84,7 +94,11 @@ impl JpegCompressor {
         ) {
             Ok(jpeg_data) => {
                 *resize_dst = Some(dst_image);
-                Ok(jpeg_data)
+                Ok(CompressedPreview {
+                    jpeg_data,
+                    width: new_width,
+                    height: new_height,
+                })
             }
             Err(e) => {
                 *resize_dst = Some(dst_image);

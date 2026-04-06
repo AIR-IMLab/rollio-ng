@@ -11,6 +11,7 @@ interface StatusBarProps {
   health: HealthStatus;
   width: number;
   debugEnabled?: boolean;
+  rendererLabel?: string;
 }
 
 const HEALTH_COLORS: Record<HealthStatus, string> = {
@@ -33,12 +34,14 @@ export function StatusBar({
   health,
   width,
   debugEnabled = false,
+  rendererLabel,
 }: StatusBarProps) {
   const connStatus = connected ? "Connected" : "Disconnected";
   const debugStatus = debugEnabled ? "On" : "Off";
+  const rendererStatus = rendererLabel ? ` | Render ${rendererLabel}` : "";
   const left =
     ` ${mode} | ${state} | Ep: ${episodeCount} | WS: ${connStatus}` +
-    ` | d:Debug ${debugStatus}`;
+    ` | d:Debug ${debugStatus}${rendererStatus}`;
   const right = ` ${HEALTH_LABELS[health]} `;
   const padding = Math.max(0, width - left.length - right.length);
 

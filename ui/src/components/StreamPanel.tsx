@@ -1,16 +1,6 @@
-/**
- * Camera stream panel logic: decodes JPEG frames via sharp (native async)
- * and renders as ANSI half-block art lines.
- *
- * Uses a single combined decode effect for all cameras to avoid
- * React hooks-in-loop violations. Merges multiple camera panels into
- * single pre-composed <Text> lines so Ink doesn't try to measure ANSI widths.
- */
-
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text } from "ink";
 import sharp from "sharp";
-import { renderToAnsiLines } from "../lib/ansi-renderer.js";
 import type { CameraFrame } from "../lib/websocket.js";
 import {
   incrementGauge,
@@ -18,6 +8,10 @@ import {
   recordTiming,
   setGauge,
 } from "../lib/debug-metrics.js";
+import {
+  createAsciiRendererBackend,
+  type AsciiRenderLayout,
+} from "../lib/renderers/index.js";
 
 const RESET = "\x1b[0m";
 const DECODE_COMMIT_INTERVAL_MS = 16;
@@ -25,24 +19,23 @@ const SHARP_DECODE_CONCURRENCY = 6;
 const TARGET_TOTAL_DECODE_FPS = 360;
 const MAX_DECODE_FPS_PER_CAMERA = 60;
 const MIN_DECODE_FPS_PER_CAMERA = 30;
+const BLACK_BACKGROUND = { r: 0, g: 0, b: 0, alpha: 1 };
+const CAMERA_RENDERER_ID = "ts-harri";
 
-// Keep libvips from scaling CPU usage linearly with camera count.
 sharp.concurrency(SHARP_DECODE_CONCURRENCY);
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Decoded camera frame as ANSI lines. */
-interface DecodedFrame {
+interface PresentedFrame {
   lines: string[];
   frameKey: string;
   sourceTimestampNs: number;
   sourceFrameIndex: number;
-  /** The pixel width these lines were decoded at. */
   decodedWidth: number;
-  /** The pixel height these lines were decoded at. */
   decodedHeight: number;
+  outputBytes: number;
 }
 
 interface PendingDecode {
@@ -50,40 +43,83 @@ interface PendingDecode {
   jpegData: Buffer;
   sourceTimestampNs: number;
   sourceFrameIndex: number;
-  sourceWidth: number;
-  sourceHeight: number;
+  previewWidth: number;
+  previewHeight: number;
 }
 
 interface CameraRowProps {
   cameras: Array<{ name: string; frame: CameraFrame | undefined }>;
-  /** Total width available for ALL cameras combined (excluding info panel). */
-  totalWidth: number;
-  panelHeight: number;
+  previewRaster: CameraPreviewRaster;
   infoPanelLines?: string[];
-  /** If true, the right border connects to an adjacent info panel. */
   hasRightPanel?: boolean;
 }
 
-/**
- * Renders multiple camera panels side-by-side as pre-composed text lines.
- *
- * Instead of using Ink's flexbox (which can't measure ANSI escape codes),
- * this component manually merges each camera's ANSI lines into single
- * combined strings with proper box-drawing borders.
- *
- * Width math (visible chars):
- *   totalWidth includes the outer left │ and outer right │.
- *   With N cameras and (N-1) inner separator │ chars plus 2 outer │:
- *   perCameraContentWidth = floor((totalWidth - 2 - (N-1)) / N)
- */
+export interface CameraPreviewRaster {
+  columns: number;
+  rows: number;
+  width: number;
+  height: number;
+}
+
+interface PreparedRaster {
+  data: Buffer;
+  width: number;
+  height: number;
+}
+
+function describeCameraCellGrid(
+  totalWidth: number,
+  panelHeight: number,
+  numCameras: number,
+): Pick<CameraPreviewRaster, "columns" | "rows"> {
+  const safeCameraCount = Math.max(1, numCameras);
+  const innerSeparators = safeCameraCount - 1;
+  return {
+    columns: Math.max(
+      4,
+      Math.floor((totalWidth - 2 - innerSeparators) / safeCameraCount),
+    ),
+    rows: Math.max(1, panelHeight - 2),
+  };
+}
+
+export function describeCameraPreviewRaster(
+  totalWidth: number,
+  panelHeight: number,
+  numCameras: number,
+): CameraPreviewRaster {
+  const grid = describeCameraCellGrid(totalWidth, panelHeight, numCameras);
+  const raster = createAsciiRendererBackend(CAMERA_RENDERER_ID).describeRaster({
+    columns: grid.columns,
+    rows: grid.rows,
+  });
+  return {
+    ...grid,
+    width: raster.width,
+    height: raster.height,
+  };
+}
+
 export function CameraRow({
   cameras,
-  totalWidth,
-  panelHeight,
+  previewRaster,
   infoPanelLines,
   hasRightPanel = false,
 }: CameraRowProps) {
   const numCams = cameras.length;
+  const perCamWidth = previewRaster.columns;
+  const contentCharHeight = previewRaster.rows;
+  const rendererRaster = useMemo(
+    () => ({ width: previewRaster.width, height: previewRaster.height }),
+    [previewRaster.height, previewRaster.width],
+  );
+  const renderLayout = useMemo<AsciiRenderLayout>(
+    () => ({
+      columns: perCamWidth,
+      rows: contentCharHeight,
+    }),
+    [contentCharHeight, perCamWidth],
+  );
   const perCameraDecodeFps = Math.max(
     MIN_DECODE_FPS_PER_CAMERA,
     Math.min(
@@ -92,69 +128,97 @@ export function CameraRow({
     ),
   );
   const perCameraDecodeIntervalMs = 1000 / perCameraDecodeFps;
-  // 2 for outer borders, (numCams-1) for inner separators
-  const innerSeparators = numCams - 1;
-  const perCamWidth = Math.max(
-    4,
-    Math.floor((totalWidth - 2 - innerSeparators) / numCams),
+  const asciiRendererBackend = useMemo(
+    () => createAsciiRendererBackend(CAMERA_RENDERER_ID),
+    [],
   );
-  const contentCharHeight = Math.max(1, panelHeight - 2); // minus top/bottom border
-  const targetPixelHeight = Math.max(2, contentCharHeight * 2); // ×2 for half-block
 
-  // Track decoded frames for all cameras
-  const [decodedFrames, setDecodedFrames] = useState<Map<string, DecodedFrame>>(
+  const [presentedFrames, setPresentedFrames] = useState<Map<string, PresentedFrame>>(
     () => new Map(),
   );
-  const decodedFramesRef = useRef<Map<string, DecodedFrame>>(new Map());
-  const decodedFramesDirtyRef = useRef(false);
+  const presentedFramesRef = useRef<Map<string, PresentedFrame>>(new Map());
+  const presentedFramesDirtyRef = useRef(false);
   const committedFrameKeyRef = useRef<Map<string, string>>(new Map());
   const requestedDecodeKeyRef = useRef<Map<string, string>>(new Map());
   const pendingDecodeRef = useRef<Map<string, PendingDecode>>(new Map());
   const activeDecodeRef = useRef<Set<string>>(new Set());
   const lastDecodeStartedAtRef = useRef<Map<string, number>>(new Map());
+  const renderQueueTailRef = useRef<Promise<void>>(Promise.resolve());
+  const queuedRenderCountRef = useRef(0);
+  const activeRenderCameraRef = useRef<string | null>(null);
   const isMountedRef = useRef(true);
 
-  const clearDecodedFrame = (camName: string) => {
-    if (!decodedFramesRef.current.has(camName)) return;
-    decodedFramesRef.current.delete(camName);
-    decodedFramesDirtyRef.current = true;
+  const clearPresentedFrame = (cameraName: string) => {
+    if (!presentedFramesRef.current.has(cameraName)) {
+      return;
+    }
+    presentedFramesRef.current.delete(cameraName);
+    presentedFramesDirtyRef.current = true;
+  };
+
+  const updateDecodeGauges = () => {
+    setGauge("stream.pending_decodes", pendingDecodeRef.current.size);
+    setGauge("stream.active_decodes", activeDecodeRef.current.size);
+    setGauge("stream.renderer_backend", asciiRendererBackend.id);
+    setGauge("stream.renderer_kind", asciiRendererBackend.kind);
+    setGauge("stream.renderer_algorithm", asciiRendererBackend.algorithm);
+    setGauge("stream.output_columns", renderLayout.columns);
+    setGauge("stream.output_rows", renderLayout.rows);
+    setGauge("stream.target_width", rendererRaster.width);
+    setGauge("stream.target_height", rendererRaster.height);
+    setGauge("stream.target_char_height", contentCharHeight);
+    setGauge("stream.target_cells_per_camera", perCamWidth * contentCharHeight);
+    setGauge(
+      "stream.target_pixels_per_camera",
+      rendererRaster.width * rendererRaster.height,
+    );
+    setGauge("stream.decode_fps_cap", perCameraDecodeFps);
+    setGauge("stream.decode_interval_ms", perCameraDecodeIntervalMs);
+    setGauge("stream.sharp_concurrency", SHARP_DECODE_CONCURRENCY);
+    setGauge("stream.render_queue_depth", queuedRenderCountRef.current);
+    setGauge("stream.render_active_camera", activeRenderCameraRef.current ?? "Idle");
   };
 
   useEffect(() => {
     isMountedRef.current = true;
     setGauge("stream.frames_presented_total", 0);
-    const flushDecodedFrames = setInterval(() => {
-      if (!isMountedRef.current || !decodedFramesDirtyRef.current) return;
+    const flushPresentedFrames = setInterval(() => {
+      if (!isMountedRef.current || !presentedFramesDirtyRef.current) {
+        return;
+      }
+
       const flushStartMs = nowMs();
-      decodedFramesDirtyRef.current = false;
+      presentedFramesDirtyRef.current = false;
       let presentedFrameCount = 0;
-      for (const [camName, decodedFrame] of decodedFramesRef.current) {
-        if (committedFrameKeyRef.current.get(camName) === decodedFrame.frameKey) {
+      for (const [cameraName, frame] of presentedFramesRef.current) {
+        if (committedFrameKeyRef.current.get(cameraName) === frame.frameKey) {
           continue;
         }
-        committedFrameKeyRef.current.set(camName, decodedFrame.frameKey);
+        committedFrameKeyRef.current.set(cameraName, frame.frameKey);
         presentedFrameCount += 1;
-        incrementGauge(`stream.frames_presented_total.${camName}`);
+        incrementGauge(`stream.frames_presented_total.${cameraName}`);
         const displayedLatencyMs = Math.max(
           0,
-          Date.now() - decodedFrame.sourceTimestampNs / 1_000_000,
+          Date.now() - frame.sourceTimestampNs / 1_000_000,
         );
-        setGauge(`stream.display_latency_ms.${camName}`, displayedLatencyMs);
+        setGauge(`stream.display_latency_ms.${cameraName}`, displayedLatencyMs);
         setGauge(
-          `stream.displayed_source_timestamp_ns.${camName}`,
-          decodedFrame.sourceTimestampNs,
+          `stream.displayed_source_timestamp_ns.${cameraName}`,
+          frame.sourceTimestampNs,
         );
-        setGauge(`stream.displayed_frame_index.${camName}`, decodedFrame.sourceFrameIndex);
+        setGauge(`stream.displayed_frame_index.${cameraName}`, frame.sourceFrameIndex);
         recordTiming("stream.latency.displayed", displayedLatencyMs);
       }
-      for (const camName of Array.from(committedFrameKeyRef.current.keys())) {
-        if (!decodedFramesRef.current.has(camName)) {
-          committedFrameKeyRef.current.delete(camName);
+
+      for (const cameraName of Array.from(committedFrameKeyRef.current.keys())) {
+        if (!presentedFramesRef.current.has(cameraName)) {
+          committedFrameKeyRef.current.delete(cameraName);
         }
       }
-      setDecodedFrames(new Map(decodedFramesRef.current));
+
+      setPresentedFrames(new Map(presentedFramesRef.current));
       recordTiming("stream.decode.commit", nowMs() - flushStartMs);
-      setGauge("stream.decoded_frames", decodedFramesRef.current.size);
+      setGauge("stream.decoded_frames", presentedFramesRef.current.size);
       if (presentedFrameCount > 0) {
         incrementGauge("stream.frames_presented_total", presentedFrameCount);
       }
@@ -162,40 +226,77 @@ export function CameraRow({
 
     return () => {
       isMountedRef.current = false;
-      clearInterval(flushDecodedFrames);
-      decodedFramesRef.current.clear();
-      decodedFramesDirtyRef.current = false;
+      clearInterval(flushPresentedFrames);
+      void asciiRendererBackend.dispose?.();
+      presentedFramesRef.current.clear();
+      presentedFramesDirtyRef.current = false;
       committedFrameKeyRef.current.clear();
       requestedDecodeKeyRef.current.clear();
       pendingDecodeRef.current.clear();
       activeDecodeRef.current.clear();
       lastDecodeStartedAtRef.current.clear();
+      renderQueueTailRef.current = Promise.resolve();
+      queuedRenderCountRef.current = 0;
+      activeRenderCameraRef.current = null;
     };
-  }, []);
+  }, [asciiRendererBackend]);
 
   useEffect(() => {
-    const black = { r: 0, g: 0, b: 0, alpha: 1 };
-    const activeNames = new Set(cameras.map((cam) => cam.name));
+    void asciiRendererBackend.prepare?.();
+  }, [asciiRendererBackend]);
 
-    const updateDecodeGauges = () => {
-      setGauge("stream.pending_decodes", pendingDecodeRef.current.size);
-      setGauge("stream.active_decodes", activeDecodeRef.current.size);
-      setGauge("stream.target_width", perCamWidth);
-      setGauge("stream.target_height", targetPixelHeight);
-      setGauge("stream.target_char_height", contentCharHeight);
-      setGauge("stream.target_cells_per_camera", perCamWidth * contentCharHeight);
-      setGauge("stream.target_pixels_per_camera", perCamWidth * targetPixelHeight);
-      setGauge("stream.decode_fps_cap", perCameraDecodeFps);
-      setGauge("stream.decode_interval_ms", perCameraDecodeIntervalMs);
-      setGauge("stream.sharp_concurrency", SHARP_DECODE_CONCURRENCY);
+  useEffect(() => {
+    requestedDecodeKeyRef.current.clear();
+    pendingDecodeRef.current.clear();
+    lastDecodeStartedAtRef.current.clear();
+    committedFrameKeyRef.current.clear();
+    presentedFramesRef.current.clear();
+    presentedFramesDirtyRef.current = true;
+    updateDecodeGauges();
+  }, [
+    renderLayout.columns,
+    renderLayout.rows,
+    rendererRaster.height,
+    rendererRaster.width,
+  ]);
+
+  useEffect(() => {
+    const activeNames = new Set(cameras.map((camera) => camera.name));
+
+    const waitForRenderTurn = async (cameraName: string) => {
+      queuedRenderCountRef.current += 1;
+      updateDecodeGauges();
+
+      let releaseRenderTurn: (() => void) | undefined;
+      const queuedTurn = new Promise<void>((resolve) => {
+        releaseRenderTurn = resolve;
+      });
+      const previousTurn = renderQueueTailRef.current.catch(() => undefined);
+      renderQueueTailRef.current = previousTurn.then(() => queuedTurn);
+      await previousTurn;
+
+      queuedRenderCountRef.current = Math.max(0, queuedRenderCountRef.current - 1);
+      activeRenderCameraRef.current = cameraName;
+      updateDecodeGauges();
+
+      return () => {
+        activeRenderCameraRef.current = null;
+        releaseRenderTurn?.();
+        updateDecodeGauges();
+      };
     };
 
-    const pumpDecode = (camName: string) => {
-      if (activeDecodeRef.current.has(camName)) return;
-      const initialPending = pendingDecodeRef.current.get(camName);
-      if (!initialPending) return;
+    const pumpDecode = (cameraName: string) => {
+      if (activeDecodeRef.current.has(cameraName)) {
+        return;
+      }
 
-      activeDecodeRef.current.add(camName);
+      const initialPending = pendingDecodeRef.current.get(cameraName);
+      if (!initialPending) {
+        return;
+      }
+
+      activeDecodeRef.current.add(cameraName);
       updateDecodeGauges();
 
       void (async () => {
@@ -203,211 +304,316 @@ export function CameraRow({
           let pending: PendingDecode | undefined = initialPending;
 
           while (isMountedRef.current && pending) {
-            pendingDecodeRef.current.delete(camName);
+            pendingDecodeRef.current.delete(cameraName);
             updateDecodeGauges();
 
             try {
               const lastDecodeStartedAt =
-                lastDecodeStartedAtRef.current.get(camName);
+                lastDecodeStartedAtRef.current.get(cameraName);
               if (lastDecodeStartedAt !== undefined) {
                 const waitMs =
                   lastDecodeStartedAt + perCameraDecodeIntervalMs - nowMs();
                 if (waitMs > 1) {
                   recordTiming("stream.decode.wait", waitMs);
                   await sleep(waitMs);
-                  if (!isMountedRef.current) return;
+                  if (!isMountedRef.current) {
+                    return;
+                  }
 
-                  const latestPending = pendingDecodeRef.current.get(camName);
+                  const latestPending = pendingDecodeRef.current.get(cameraName);
                   if (latestPending) {
                     pending = latestPending;
-                    pendingDecodeRef.current.delete(camName);
+                    pendingDecodeRef.current.delete(cameraName);
                     updateDecodeGauges();
                   }
                 }
               }
 
-              lastDecodeStartedAtRef.current.set(camName, nowMs());
+              lastDecodeStartedAtRef.current.set(cameraName, nowMs());
               const totalDecodeStartMs = nowMs();
               const resizeStartMs = nowMs();
-              const { data, info } = await sharp(pending.jpegData, {
-                sequentialRead: true,
-              })
-                .resize(perCamWidth, targetPixelHeight, {
-                  // Preserve the camera aspect ratio and pad the rest of the panel
-                  // instead of stretching the frame to the available space.
-                  fit: "contain",
-                  position: "centre",
-                  background: black,
-                  kernel: sharp.kernel.nearest,
-                })
-                .raw()
-                .toBuffer({ resolveWithObject: true });
+              const preparedRaster = await prepareRendererRaster(
+                pending.jpegData,
+                rendererRaster.width,
+                rendererRaster.height,
+              );
               const resizeDurationMs = nowMs() - resizeStartMs;
 
-              if (!isMountedRef.current) return;
-              if (requestedDecodeKeyRef.current.get(camName) !== pending.key) {
-                pending = pendingDecodeRef.current.get(camName);
+              if (!isMountedRef.current) {
+                return;
+              }
+              if (requestedDecodeKeyRef.current.get(cameraName) !== pending.key) {
+                incrementGauge("stream.render_stale_drops");
+                incrementGauge(`stream.render_stale_drops.${cameraName}`);
+                pending = pendingDecodeRef.current.get(cameraName);
                 continue;
               }
 
-              const ansiStartMs = nowMs();
-              const ansiResult = renderToAnsiLines(data, info.width, info.height);
-              const ansiDurationMs = nowMs() - ansiStartMs;
+              const renderQueueWaitStartMs = nowMs();
+              const releaseRenderTurn = await waitForRenderTurn(cameraName);
+              let renderResult;
+              try {
+                const renderQueueWaitMs = nowMs() - renderQueueWaitStartMs;
+                recordTiming("stream.render.queue_wait", renderQueueWaitMs);
+                recordTiming(
+                  `stream.render.queue_wait.${cameraName}`,
+                  renderQueueWaitMs,
+                );
+                if (!isMountedRef.current) {
+                  return;
+                }
+                if (requestedDecodeKeyRef.current.get(cameraName) !== pending.key) {
+                  incrementGauge("stream.render_stale_drops");
+                  incrementGauge(`stream.render_stale_drops.${cameraName}`);
+                  pending = pendingDecodeRef.current.get(cameraName);
+                  continue;
+                }
+
+                renderResult = await asciiRendererBackend.render({
+                  pixels: preparedRaster.data,
+                  width: preparedRaster.width,
+                  height: preparedRaster.height,
+                  layout: renderLayout,
+                });
+              } finally {
+                releaseRenderTurn();
+              }
+
               const totalDecodeDurationMs = nowMs() - totalDecodeStartMs;
               recordTiming("stream.decode.resize", resizeDurationMs);
-              recordTiming(`stream.decode.resize.${camName}`, resizeDurationMs);
-              recordTiming("stream.decode.ansi", ansiDurationMs);
-              recordTiming(`stream.decode.ansi.${camName}`, ansiDurationMs);
+              recordTiming(`stream.decode.resize.${cameraName}`, resizeDurationMs);
+              recordTiming(
+                "stream.render.total",
+                renderResult.stats.timings.totalMs,
+              );
+              recordTiming(
+                `stream.render.total.${cameraName}`,
+                renderResult.stats.timings.totalMs,
+              );
+              if (renderResult.stats.timings.sampleMs !== undefined) {
+                recordTiming(
+                  "stream.render.sample",
+                  renderResult.stats.timings.sampleMs,
+                );
+                recordTiming(
+                  `stream.render.sample.${cameraName}`,
+                  renderResult.stats.timings.sampleMs,
+                );
+              }
+              if (renderResult.stats.timings.lookupMs !== undefined) {
+                recordTiming(
+                  "stream.render.lookup",
+                  renderResult.stats.timings.lookupMs,
+                );
+                recordTiming(
+                  `stream.render.lookup.${cameraName}`,
+                  renderResult.stats.timings.lookupMs,
+                );
+              }
+              if (renderResult.stats.timings.assembleMs !== undefined) {
+                recordTiming(
+                  "stream.render.assemble",
+                  renderResult.stats.timings.assembleMs,
+                );
+                recordTiming(
+                  `stream.render.assemble.${cameraName}`,
+                  renderResult.stats.timings.assembleMs,
+                );
+              }
+              if (renderResult.stats.timings.ansiMs !== undefined) {
+                recordTiming("stream.decode.ansi", renderResult.stats.timings.ansiMs);
+                recordTiming(
+                  `stream.decode.ansi.${cameraName}`,
+                  renderResult.stats.timings.ansiMs,
+                );
+              }
+              if (renderResult.stats.timings.adapterMs !== undefined) {
+                recordTiming(
+                  "stream.render.adapter",
+                  renderResult.stats.timings.adapterMs,
+                );
+                recordTiming(
+                  `stream.render.adapter.${cameraName}`,
+                  renderResult.stats.timings.adapterMs,
+                );
+              }
               recordTiming("stream.decode.total", totalDecodeDurationMs);
-              recordTiming(`stream.decode.total.${camName}`, totalDecodeDurationMs);
+              recordTiming(`stream.decode.total.${cameraName}`, totalDecodeDurationMs);
               setGauge(
-                `stream.source_resolution.${camName}`,
-                `${pending.sourceWidth}x${pending.sourceHeight}`,
+                `stream.preview_resolution.${cameraName}`,
+                `${pending.previewWidth}x${pending.previewHeight}`,
               );
               setGauge(
-                `stream.source_pixels.${camName}`,
-                pending.sourceWidth * pending.sourceHeight,
+                `stream.preview_pixels.${cameraName}`,
+                pending.previewWidth * pending.previewHeight,
               );
-              setGauge(`stream.jpeg_bytes.${camName}`, pending.jpegData.length);
+              setGauge(`stream.jpeg_bytes.${cameraName}`, pending.jpegData.length);
               setGauge(
-                `stream.decoded_resolution.${camName}`,
-                `${info.width}x${info.height}`,
-              );
-              setGauge(`stream.ansi_cells.${camName}`, ansiResult.cellCount);
-              setGauge(
-                `stream.ansi_sgr_changes.${camName}`,
-                ansiResult.sgrChangeCount,
+                `stream.decoded_resolution.${cameraName}`,
+                `${preparedRaster.width}x${preparedRaster.height}`,
               );
               setGauge(
-                `stream.ansi_sgr_per_cell.${camName}`,
-                ansiResult.cellCount > 0
-                  ? ansiResult.sgrChangeCount / ansiResult.cellCount
+                `stream.output_resolution.${cameraName}`,
+                `${renderResult.stats.outputColumns}x${renderResult.stats.outputRows}`,
+              );
+              setGauge(`stream.ansi_cells.${cameraName}`, renderResult.stats.cellCount);
+              setGauge(
+                `stream.ansi_sgr_changes.${cameraName}`,
+                renderResult.stats.sgrChangeCount ?? 0,
+              );
+              setGauge(
+                `stream.ansi_sgr_per_cell.${cameraName}`,
+                renderResult.stats.cellCount > 0
+                  ? (renderResult.stats.sgrChangeCount ?? 0) /
+                      renderResult.stats.cellCount
                   : 0,
               );
-              decodedFramesRef.current.set(camName, {
-                lines: ansiResult.lines,
+              setGauge(
+                `stream.render_output_bytes.${cameraName}`,
+                renderResult.stats.outputBytes,
+              );
+              setGauge(
+                `stream.render_cache_hits.${cameraName}`,
+                renderResult.stats.cacheHits ?? 0,
+              );
+              setGauge(
+                `stream.render_cache_misses.${cameraName}`,
+                renderResult.stats.cacheMisses ?? 0,
+              );
+              setGauge(
+                `stream.render_sample_count.${cameraName}`,
+                renderResult.stats.sampleCount ?? 0,
+              );
+              presentedFramesRef.current.set(cameraName, {
+                lines: renderResult.lines,
                 frameKey: pending.key,
                 sourceTimestampNs: pending.sourceTimestampNs,
                 sourceFrameIndex: pending.sourceFrameIndex,
-                decodedWidth: info.width,
-                decodedHeight: info.height,
+                decodedWidth: preparedRaster.width,
+                decodedHeight: preparedRaster.height,
+                outputBytes: renderResult.stats.outputBytes,
               });
-              decodedFramesDirtyRef.current = true;
+              presentedFramesDirtyRef.current = true;
             } catch {
-              if (!isMountedRef.current) return;
+              if (!isMountedRef.current) {
+                return;
+              }
             }
 
-            pending = pendingDecodeRef.current.get(camName);
+            pending = pendingDecodeRef.current.get(cameraName);
           }
         } finally {
-          activeDecodeRef.current.delete(camName);
+          activeDecodeRef.current.delete(cameraName);
           updateDecodeGauges();
-          if (isMountedRef.current && pendingDecodeRef.current.has(camName)) {
-            pumpDecode(camName);
+          if (isMountedRef.current && pendingDecodeRef.current.has(cameraName)) {
+            pumpDecode(cameraName);
           }
         }
       })();
     };
 
-    for (const cam of cameras) {
-      const frame = cam.frame;
-
+    for (const camera of cameras) {
+      const frame = camera.frame;
       if (!frame?.jpegData || frame.jpegData.length === 0) {
-        requestedDecodeKeyRef.current.delete(cam.name);
-        pendingDecodeRef.current.delete(cam.name);
-        clearDecodedFrame(cam.name);
+        requestedDecodeKeyRef.current.delete(camera.name);
+        pendingDecodeRef.current.delete(camera.name);
+        clearPresentedFrame(camera.name);
         updateDecodeGauges();
         continue;
       }
 
-      const decodeKey = `${frame.sequence}:${perCamWidth}x${targetPixelHeight}`;
-      if (requestedDecodeKeyRef.current.get(cam.name) === decodeKey) {
+      const decodeKey = [
+        frame.sequence,
+        frame.previewWidth,
+        frame.previewHeight,
+        rendererRaster.width,
+        rendererRaster.height,
+        renderLayout.columns,
+        renderLayout.rows,
+      ].join(":");
+      if (requestedDecodeKeyRef.current.get(camera.name) === decodeKey) {
         continue;
       }
 
-      requestedDecodeKeyRef.current.set(cam.name, decodeKey);
-      pendingDecodeRef.current.set(cam.name, {
+      requestedDecodeKeyRef.current.set(camera.name, decodeKey);
+      pendingDecodeRef.current.set(camera.name, {
         key: decodeKey,
         jpegData: frame.jpegData,
         sourceTimestampNs: frame.timestampNs,
         sourceFrameIndex: frame.frameIndex,
-        sourceWidth: frame.width,
-        sourceHeight: frame.height,
+        previewWidth: frame.previewWidth,
+        previewHeight: frame.previewHeight,
       });
       updateDecodeGauges();
-      pumpDecode(cam.name);
+      pumpDecode(camera.name);
     }
 
-    for (const name of Array.from(requestedDecodeKeyRef.current.keys())) {
-      if (activeNames.has(name)) continue;
-      requestedDecodeKeyRef.current.delete(name);
-      pendingDecodeRef.current.delete(name);
-      clearDecodedFrame(name);
+    for (const cameraName of Array.from(requestedDecodeKeyRef.current.keys())) {
+      if (activeNames.has(cameraName)) {
+        continue;
+      }
+      requestedDecodeKeyRef.current.delete(cameraName);
+      pendingDecodeRef.current.delete(cameraName);
+      clearPresentedFrame(cameraName);
       updateDecodeGauges();
     }
   }, [
+    asciiRendererBackend,
     cameras,
-    perCamWidth,
-    targetPixelHeight,
+    contentCharHeight,
     perCameraDecodeFps,
     perCameraDecodeIntervalMs,
+    renderLayout,
+    rendererRaster,
   ]);
 
   useEffect(() => {
     setGauge("stream.rendered_cameras", numCams);
-    setGauge("stream.decoded_frames", decodedFrames.size);
+    setGauge("stream.decoded_frames", presentedFrames.size);
     setGauge("stream.target_visible_cells", numCams * perCamWidth * contentCharHeight);
-  }, [numCams, decodedFrames.size, perCamWidth, contentCharHeight]);
+  }, [contentCharHeight, numCams, perCamWidth, presentedFrames.size]);
 
-  // Build merged output lines with proper box-drawing borders
   const outputResult = useMemo(() => {
     const composeStartMs = nowMs();
     const result: string[] = [];
-
-    // Right-edge chars depend on whether an info panel is attached
     const topRight = hasRightPanel ? "┬" : "┐";
     const midRight = hasRightPanel ? "│" : "│";
     const botRight = hasRightPanel ? "┴" : "┘";
 
-    // === Top border: ┌─ camera_0 ─┬─ camera_1 ─┐  (or ┬ if info panel) ===
     let topLine = "┌";
-    for (let c = 0; c < numCams; c++) {
-      const name = cameras[c].name;
+    for (let index = 0; index < numCams; index++) {
+      const name = cameras[index]?.name ?? `camera_${index}`;
       const label = `─ ${name} `;
       const remaining = Math.max(0, perCamWidth - label.length);
       topLine += label + "─".repeat(remaining);
-      topLine += c < numCams - 1 ? "┬" : topRight;
+      topLine += index < numCams - 1 ? "┬" : topRight;
     }
     result.push(topLine);
 
-    // === Content lines: │<ansi>│<ansi>│ ===
     for (let row = 0; row < contentCharHeight; row++) {
       let line = "│";
-      for (let c = 0; c < numCams; c++) {
-        const decoded = decodedFrames.get(cameras[c].name);
-        if (decoded && row < decoded.lines.length) {
-          line += decoded.lines[row] + "\x1b[0m";
+      for (let index = 0; index < numCams; index++) {
+        const frame = presentedFrames.get(cameras[index]?.name ?? "");
+        if (frame && row < frame.lines.length) {
+          line += frame.lines[row] + RESET;
+        } else if (row === Math.floor(contentCharHeight / 2)) {
+          const message = "╌ No signal ╌";
+          const pad = Math.max(0, perCamWidth - message.length);
+          const left = Math.floor(pad / 2);
+          const right = pad - left;
+          line += " ".repeat(left) + message + " ".repeat(right);
         } else {
-          if (row === Math.floor(contentCharHeight / 2)) {
-            const msg = "╌ No signal ╌";
-            const pad = Math.max(0, perCamWidth - msg.length);
-            const left = Math.floor(pad / 2);
-            const right = pad - left;
-            line += " ".repeat(left) + msg + " ".repeat(right);
-          } else {
-            line += " ".repeat(perCamWidth);
-          }
+          line += " ".repeat(perCamWidth);
         }
-        line += c < numCams - 1 ? "│" : midRight;
+        line += index < numCams - 1 ? "│" : midRight;
       }
       result.push(line);
     }
 
-    // === Bottom border: └──────┴──────┘  (or ┴ if info panel) ===
     let bottomLine = "└";
-    for (let c = 0; c < numCams; c++) {
+    for (let index = 0; index < numCams; index++) {
       bottomLine += "─".repeat(perCamWidth);
-      bottomLine += c < numCams - 1 ? "┴" : botRight;
+      bottomLine += index < numCams - 1 ? "┴" : botRight;
     }
     result.push(bottomLine);
 
@@ -415,48 +621,157 @@ export function CameraRow({
       lines: result,
       composeDurationMs: nowMs() - composeStartMs,
     };
-  }, [cameras, decodedFrames, numCams, perCamWidth, contentCharHeight]);
+  }, [
+    cameras,
+    contentCharHeight,
+    hasRightPanel,
+    numCams,
+    perCamWidth,
+    presentedFrames,
+  ]);
 
   useEffect(() => {
     recordTiming("stream.compose", outputResult.composeDurationMs);
   }, [outputResult.composeDurationMs]);
 
-  const outputLines = outputResult.lines;
-
-  // Merge info panel lines on the right if provided
   const finalOutputResult = useMemo(() => {
     const finalizeStartMs = nowMs();
     const finalLines =
       !infoPanelLines || infoPanelLines.length === 0
-        ? outputLines.map((line) => line + RESET)
-        : outputLines.map((line, i) => {
-            const infoLine = i < infoPanelLines.length ? infoPanelLines[i] : "";
+        ? outputResult.lines.map((line) => line + RESET)
+        : outputResult.lines.map((line, index) => {
+            const infoLine = index < infoPanelLines.length ? infoPanelLines[index] : "";
             return line + infoLine + RESET;
           });
     const finalText = finalLines.join("\n");
+    const textOutputBytes = Buffer.byteLength(finalText, "utf8");
     return {
       finalLines,
       finalText,
       finalizeDurationMs: nowMs() - finalizeStartMs,
-      outputBytes: Buffer.byteLength(finalText, "utf8"),
+      presentationBytes: textOutputBytes,
+      textOutputBytes,
     };
-  }, [outputLines, infoPanelLines]);
+  }, [infoPanelLines, outputResult.lines]);
 
   useEffect(() => {
     recordTiming("stream.finalize", finalOutputResult.finalizeDurationMs);
-    setGauge("stream.output_rows", finalOutputResult.finalLines.length);
-    setGauge("stream.output_bytes", finalOutputResult.outputBytes);
+    setGauge("stream.output_frame_rows", finalOutputResult.finalLines.length);
+    setGauge("stream.output_bytes", finalOutputResult.presentationBytes);
+    setGauge("stream.text_output_bytes", finalOutputResult.textOutputBytes);
   }, [
-    finalOutputResult.finalizeDurationMs,
     finalOutputResult.finalLines.length,
-    finalOutputResult.outputBytes,
+    finalOutputResult.finalizeDurationMs,
+    finalOutputResult.presentationBytes,
+    finalOutputResult.textOutputBytes,
   ]);
-
-  const finalText = finalOutputResult.finalText;
 
   return (
     <Box flexDirection="column">
-      <Text wrap="end">{finalText}</Text>
+      <Text wrap="end">{finalOutputResult.finalText}</Text>
     </Box>
   );
+}
+
+async function prepareRendererRaster(
+  jpegData: Buffer,
+  targetWidth: number,
+  targetHeight: number,
+): Promise<PreparedRaster> {
+  const decoded = await sharp(jpegData, {
+    sequentialRead: true,
+  })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  if (
+    decoded.info.channels === 3 &&
+    decoded.info.width === targetWidth &&
+    decoded.info.height === targetHeight
+  ) {
+    return {
+      data: decoded.data,
+      width: decoded.info.width,
+      height: decoded.info.height,
+    };
+  }
+
+  if (
+    decoded.info.channels === 3 &&
+    decoded.info.width <= targetWidth &&
+    decoded.info.height <= targetHeight
+  ) {
+    return centerPadRgbRaster(
+      decoded.data,
+      decoded.info.width,
+      decoded.info.height,
+      targetWidth,
+      targetHeight,
+    );
+  }
+
+  return await resizePreparedRaster(
+    decoded.data,
+    decoded.info.width,
+    decoded.info.height,
+    decoded.info.channels as 1 | 2 | 3 | 4,
+    targetWidth,
+    targetHeight,
+  );
+}
+
+function centerPadRgbRaster(
+  data: Buffer,
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+): PreparedRaster {
+  const output = Buffer.alloc(targetWidth * targetHeight * 3, 0);
+  const offsetX = Math.floor((targetWidth - sourceWidth) / 2);
+  const offsetY = Math.floor((targetHeight - sourceHeight) / 2);
+  const sourceStride = sourceWidth * 3;
+
+  for (let row = 0; row < sourceHeight; row++) {
+    const sourceStart = row * sourceStride;
+    const targetStart = ((offsetY + row) * targetWidth + offsetX) * 3;
+    data.copy(output, targetStart, sourceStart, sourceStart + sourceStride);
+  }
+
+  return {
+    data: output,
+    width: targetWidth,
+    height: targetHeight,
+  };
+}
+
+async function resizePreparedRaster(
+  data: Buffer,
+  sourceWidth: number,
+  sourceHeight: number,
+  channels: 1 | 2 | 3 | 4,
+  targetWidth: number,
+  targetHeight: number,
+): Promise<PreparedRaster> {
+  const resized = await sharp(data, {
+    raw: {
+      width: sourceWidth,
+      height: sourceHeight,
+      channels,
+    },
+  })
+    .resize(targetWidth, targetHeight, {
+      fit: "contain",
+      position: "centre",
+      background: BLACK_BACKGROUND,
+      kernel: sharp.kernel.nearest,
+    })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  return {
+    data: resized.data,
+    width: resized.info.width,
+    height: resized.info.height,
+  };
 }

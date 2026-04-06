@@ -1,5 +1,6 @@
 mod ipc;
 mod jpeg;
+mod preview_config;
 mod preview_pipeline;
 mod protocol;
 mod stream_info;
@@ -16,6 +17,7 @@ use iceoryx2::node::NodeWaitFailure;
 use tokio::sync::broadcast;
 
 use crate::ipc::{IpcMessage, IpcPoller};
+use crate::preview_config::RuntimePreviewConfig;
 use crate::preview_pipeline::PreviewPipeline;
 use crate::stream_info::StreamInfoRegistry;
 use crate::websocket::BroadcastMessage;
@@ -60,8 +62,6 @@ struct Args {
 
 #[derive(Clone, Copy, Debug)]
 struct IpcPollConfig {
-    max_preview_width: u32,
-    max_preview_height: u32,
     jpeg_quality: i32,
     preview_fps: u32,
     preview_workers: usize,
@@ -113,13 +113,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         preview_workers,
         args.jpeg_quality,
     )));
+    let preview_config = Arc::new(RuntimePreviewConfig::new(
+        args.max_preview_width,
+        args.max_preview_height,
+    ));
 
     // Start WebSocket server
     let ws_addr: SocketAddr = ([0, 0, 0, 0], args.port).into();
     let ws_broadcast_tx = broadcast_tx.clone();
     let ws_stream_info = stream_info.clone();
+    let ws_preview_config = preview_config.clone();
     tokio::spawn(async move {
-        websocket::run_server(ws_addr, ws_broadcast_tx, ws_stream_info).await;
+        websocket::run_server(ws_addr, ws_broadcast_tx, ws_stream_info, ws_preview_config).await;
     });
 
     // Shared shutdown flag
@@ -130,8 +135,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shutdown, which can make Ctrl+C appear stuck if the poll loop is inside
     // a blocking iceoryx wait.
     let ipc_config = IpcPollConfig {
-        max_preview_width: args.max_preview_width,
-        max_preview_height: args.max_preview_height,
         jpeg_quality: args.jpeg_quality,
         preview_fps: args.preview_fps,
         preview_workers,
@@ -139,6 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ipc_broadcast_tx = broadcast_tx.clone();
     let ipc_shutdown = shutdown.clone();
     let ipc_stream_info = stream_info.clone();
+    let ipc_preview_config = preview_config.clone();
 
     std::thread::Builder::new()
         .name("rollio-visualizer-ipc".to_string())
@@ -149,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ipc_config,
                 ipc_broadcast_tx,
                 ipc_stream_info,
+                ipc_preview_config,
                 &ipc_shutdown,
             ) {
                 log::error!("IPC poll loop failed: {e}");
@@ -176,14 +181,14 @@ fn ipc_poll_loop(
     config: IpcPollConfig,
     broadcast_tx: broadcast::Sender<BroadcastMessage>,
     stream_info: Arc<Mutex<StreamInfoRegistry>>,
+    preview_config: Arc<RuntimePreviewConfig>,
     shutdown: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let poller = IpcPoller::new(camera_names, robot_names)?;
     let preview_pipeline = PreviewPipeline::new(
         camera_names,
         config.preview_workers,
-        config.max_preview_width,
-        config.max_preview_height,
+        preview_config,
         config.jpeg_quality,
         broadcast_tx.clone(),
         stream_info.clone(),

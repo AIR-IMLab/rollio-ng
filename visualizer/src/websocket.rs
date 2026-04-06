@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
+use crate::preview_config::RuntimePreviewConfig;
 use crate::protocol;
 use crate::stream_info::StreamInfoRegistry;
 
@@ -33,6 +34,7 @@ pub async fn run_server(
     addr: SocketAddr,
     broadcast_tx: broadcast::Sender<BroadcastMessage>,
     stream_info: Arc<Mutex<StreamInfoRegistry>>,
+    preview_config: Arc<RuntimePreviewConfig>,
 ) {
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => {
@@ -51,7 +53,14 @@ pub async fn run_server(
                 log::info!("new WebSocket connection from {peer}");
                 let rx = broadcast_tx.subscribe();
                 let client_stream_info = stream_info.clone();
-                tokio::spawn(handle_client(stream, peer, rx, client_stream_info));
+                let client_preview_config = preview_config.clone();
+                tokio::spawn(handle_client(
+                    stream,
+                    peer,
+                    rx,
+                    client_stream_info,
+                    client_preview_config,
+                ));
             }
             Err(e) => {
                 log::warn!("accept error: {e}");
@@ -69,6 +78,7 @@ async fn handle_client(
     peer: SocketAddr,
     mut broadcast_rx: broadcast::Receiver<BroadcastMessage>,
     stream_info: Arc<Mutex<StreamInfoRegistry>>,
+    preview_config: Arc<RuntimePreviewConfig>,
 ) {
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
@@ -92,6 +102,7 @@ async fn handle_client(
         let _ = ws_sink.close().await;
         return;
     }
+    preview_config.client_connected();
 
     loop {
         tokio::select! {
@@ -100,14 +111,42 @@ async fn handle_client(
                     Some(Ok(Message::Text(text))) => {
                         if let Some(cmd) = protocol::decode_command(&text) {
                             log::info!("command from {peer}: {:?}", cmd);
-                            if matches!(cmd.action.as_deref(), Some("get_stream_info")) {
-                                let stream_info_payload = {
-                                    let info = stream_info.lock().expect("stream info mutex poisoned");
-                                    protocol::encode_stream_info(&info.snapshot())
-                                };
-                                if let Err(e) = ws_sink.send(Message::Text(stream_info_payload.into())).await {
-                                    log::debug!("write error to {peer}: {e}");
-                                    break;
+                            match cmd.action.as_str() {
+                                "get_stream_info" => {
+                                    let stream_info_payload = {
+                                        let info = stream_info.lock().expect("stream info mutex poisoned");
+                                        protocol::encode_stream_info(&info.snapshot())
+                                    };
+                                    if let Err(e) = ws_sink.send(Message::Text(stream_info_payload.into())).await {
+                                        log::debug!("write error to {peer}: {e}");
+                                        break;
+                                    }
+                                }
+                                "set_preview_size" => {
+                                    let Some(width) = cmd.width else {
+                                        log::warn!("ignoring preview resize from {peer} without width");
+                                        continue;
+                                    };
+                                    let Some(height) = cmd.height else {
+                                        log::warn!("ignoring preview resize from {peer} without height");
+                                        continue;
+                                    };
+                                    let active_preview = preview_config.set_requested_size(width, height);
+                                    let stream_info_payload = {
+                                        let mut info = stream_info.lock().expect("stream info mutex poisoned");
+                                        info.set_active_preview_bounds(
+                                            active_preview.width,
+                                            active_preview.height,
+                                        );
+                                        protocol::encode_stream_info(&info.snapshot())
+                                    };
+                                    if let Err(e) = ws_sink.send(Message::Text(stream_info_payload.into())).await {
+                                        log::debug!("write error to {peer}: {e}");
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    log::debug!("ignoring unsupported command from {peer}: {}", cmd.action);
                                 }
                             }
                         }
@@ -148,6 +187,11 @@ async fn handle_client(
         }
     }
 
+    if let Some(default_preview) = preview_config.client_disconnected() {
+        if let Ok(mut info) = stream_info.lock() {
+            info.set_active_preview_bounds(default_preview.width, default_preview.height);
+        }
+    }
     let _ = ws_sink.close().await;
     log::info!("client {peer} disconnected");
 }

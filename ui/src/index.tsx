@@ -2,4 +2,7 @@ import React from "react";
 import { render } from "ink";
 import { App } from "./App.js";
 
-render(<App />, { maxFps: 60, incrementalRendering: true });
+render(<App />, {
+  maxFps: 60,
+  incrementalRendering: true,
+});

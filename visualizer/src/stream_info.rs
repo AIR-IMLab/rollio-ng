@@ -13,6 +13,8 @@ pub struct StreamInfoRegistry {
     configured_preview_fps: u32,
     max_preview_width: u32,
     max_preview_height: u32,
+    active_preview_width: u32,
+    active_preview_height: u32,
     preview_workers: usize,
     jpeg_quality: i32,
     cameras: HashMap<String, CameraRuntimeInfo>,
@@ -46,6 +48,8 @@ pub struct StreamInfoSnapshot {
     pub configured_preview_fps: u32,
     pub max_preview_width: u32,
     pub max_preview_height: u32,
+    pub active_preview_width: u32,
+    pub active_preview_height: u32,
     pub preview_workers: usize,
     pub jpeg_quality: i32,
     pub cameras: Vec<CameraInfoSnapshot>,
@@ -85,10 +89,17 @@ impl StreamInfoRegistry {
             configured_preview_fps,
             max_preview_width,
             max_preview_height,
+            active_preview_width: max_preview_width,
+            active_preview_height: max_preview_height,
             preview_workers,
             jpeg_quality,
             cameras,
         }
+    }
+
+    pub fn set_active_preview_bounds(&mut self, width: u32, height: u32) {
+        self.active_preview_width = width;
+        self.active_preview_height = height;
     }
 
     pub fn observe_source_frame(&mut self, name: &str, header: &CameraFrameHeader) {
@@ -141,6 +152,8 @@ impl StreamInfoRegistry {
             configured_preview_fps: self.configured_preview_fps,
             max_preview_width: self.max_preview_width,
             max_preview_height: self.max_preview_height,
+            active_preview_width: self.active_preview_width,
+            active_preview_height: self.active_preview_height,
             preview_workers: self.preview_workers,
             jpeg_quality: self.jpeg_quality,
             cameras,

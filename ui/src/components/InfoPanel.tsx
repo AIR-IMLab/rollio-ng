@@ -1,11 +1,12 @@
 import React from "react";
 import { Box, Text } from "ink";
 import type { CameraFrame } from "../lib/websocket.js";
-import type { RobotStateMessage } from "../lib/protocol.js";
+import type { RobotStateMessage, StreamInfoMessage } from "../lib/protocol.js";
 
 interface InfoPanelProps {
   frames: Map<string, CameraFrame>;
   robotStates: Map<string, RobotStateMessage>;
+  streamInfo?: StreamInfoMessage | null;
   connected: boolean;
   orientation: "vertical" | "horizontal";
   panelWidth: number;
@@ -14,6 +15,7 @@ interface InfoPanelProps {
 export function InfoPanel({
   frames,
   robotStates,
+  streamInfo = null,
   connected,
   orientation,
   panelWidth,
@@ -48,7 +50,9 @@ export function InfoPanel({
     lines.push(padLine(" Devices", innerW));
 
     for (const [name, frame] of frames) {
-      lines.push(padLine(`  ${name}  ${frame.width}x${frame.height}`, innerW));
+      lines.push(
+        padLine(`  ${name}  ${cameraResolution(name, frame, streamInfo)}`, innerW),
+      );
     }
 
     for (const [name, state] of robotStates) {
@@ -63,7 +67,7 @@ export function InfoPanel({
     // Horizontal: compact 2-line strip
     const camParts: string[] = [];
     for (const [name, frame] of frames) {
-      camParts.push(`${name}: ${frame.width}x${frame.height}`);
+      camParts.push(`${name}: ${cameraResolution(name, frame, streamInfo)}`);
     }
 
     const robotParts: string[] = [];
@@ -92,4 +96,19 @@ export function InfoPanel({
 function padLine(text: string, width: number): string {
   const trimmed = text.substring(0, width);
   return trimmed + " ".repeat(Math.max(0, width - trimmed.length));
+}
+
+function cameraResolution(
+  name: string,
+  frame: CameraFrame | undefined,
+  streamInfo: StreamInfoMessage | null,
+): string {
+  const camera = streamInfo?.cameras.find((entry) => entry.name === name);
+  if (camera?.source_width != null && camera.source_height != null) {
+    return `${camera.source_width}x${camera.source_height}`;
+  }
+  if (frame) {
+    return `${frame.previewWidth}x${frame.previewHeight}`;
+  }
+  return "n/a";
 }

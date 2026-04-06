@@ -59,28 +59,30 @@ export function renderToAnsiLines(
   const lines = new Array<string>(charRows);
   const maxPartsPerRow = imgWidth * 3 + 1;
   let sgrChangeCount = 0;
+  const pixels = rgbPixels;
+  const rowStride = imgWidth * 3;
 
   for (let cy = 0; cy < charRows; cy++) {
-    const topRowY = cy * 2;
-    const botRowY = cy * 2 + 1;
+    const topRowStart = cy * 2 * rowStride;
+    const botRowStart = topRowStart + rowStride;
     const parts = new Array<string>(maxPartsPerRow);
     let partCount = 0;
     let previousBgAnsi = -1;
     let previousFgAnsi = -1;
+    let topIdx = topRowStart;
+    let botIdx = botRowStart;
 
     for (let x = 0; x < imgWidth; x++) {
-      const topIdx = (topRowY * imgWidth + x) * 3;
       const bgAnsi = nearestAnsi256(
-        rgbPixels[topIdx],
-        rgbPixels[topIdx + 1],
-        rgbPixels[topIdx + 2],
+        pixels[topIdx],
+        pixels[topIdx + 1],
+        pixels[topIdx + 2],
       );
 
-      const botIdx = (botRowY * imgWidth + x) * 3;
       const fgAnsi = nearestAnsi256(
-        rgbPixels[botIdx],
-        rgbPixels[botIdx + 1],
-        rgbPixels[botIdx + 2],
+        pixels[botIdx],
+        pixels[botIdx + 1],
+        pixels[botIdx + 2],
       );
 
       if (bgAnsi !== previousBgAnsi) {
@@ -94,10 +96,13 @@ export function renderToAnsiLines(
         sgrChangeCount += 1;
       }
       parts[partCount++] = HALF_BLOCK;
+      topIdx += 3;
+      botIdx += 3;
     }
 
     parts[partCount++] = RESET;
-    lines[cy] = parts.slice(0, partCount).join("");
+    parts.length = partCount;
+    lines[cy] = parts.join("");
   }
 
   return {

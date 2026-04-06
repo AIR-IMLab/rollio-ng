@@ -26,8 +26,8 @@ import {
 /** Camera frame data for rendering. */
 export interface CameraFrame {
   jpegData: Buffer;
-  width: number;
-  height: number;
+  previewWidth: number;
+  previewHeight: number;
   timestampNs: number;
   frameIndex: number;
   receivedAtWallTimeMs: number;
@@ -141,8 +141,8 @@ export function useWebSocket(url: string): WebSocketState {
             const sequence = ++frameSequenceRef.current;
             framesRef.current.set(msg.name, {
               jpegData: msg.jpegData,
-              width: msg.width,
-              height: msg.height,
+              previewWidth: msg.previewWidth,
+              previewHeight: msg.previewHeight,
               timestampNs: msg.timestampNs,
               frameIndex: msg.frameIndex,
               receivedAtWallTimeMs,
@@ -171,6 +171,10 @@ export function useWebSocket(url: string): WebSocketState {
             dirtyRef.current = true;
             setGauge("ws.stream_info_status", "Ready");
             setGauge("ws.preview_fps_config", msg.configured_preview_fps);
+            setGauge(
+              "ws.active_preview_size",
+              `${msg.active_preview_width}x${msg.active_preview_height}`,
+            );
           }
         }
       });
@@ -180,6 +184,7 @@ export function useWebSocket(url: string): WebSocketState {
         setConnected(false);
         setGauge("ws.connected", "Disconnected");
         setGauge("ws.stream_info_status", "Unavailable");
+        setGauge("ws.active_preview_size", "Unavailable");
         streamInfoRef.current = null;
         dirtyRef.current = true;
         wsRef.current = null;
