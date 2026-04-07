@@ -22,7 +22,7 @@ test("resolveRuntimeConfig lets CLI flags override environment values", () => {
     ["--ws", "ws://127.0.0.1:9922", "--renderer", "ts-half-block"],
     {
       ROLLIO_VISUALIZER_WS: "ws://127.0.0.1:9911",
-      ROLLIO_ASCII_RENDERER: "ts-harri",
+      ROLLIO_ASCII_RENDERER: "wasm-harri",
     },
   );
   assert.equal(runtimeConfig.websocketUrl, "ws://127.0.0.1:9922");

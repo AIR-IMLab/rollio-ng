@@ -3,13 +3,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 export interface NativeAsciiAddonModule {
-  NativeAsciiRenderer: new (
-    cellWidth: number,
-    cellHeight: number,
-    glyphChars: Uint8Array,
-    glyphVectors: Uint8Array,
-    vectorSize: number,
-  ) => {
+  NativeAsciiRenderer: new (cellWidth: number, cellHeight: number) => {
     render(
       pixels: Uint8Array,
       width: number,
@@ -20,6 +14,8 @@ export interface NativeAsciiAddonModule {
       lines: string[];
       stats: {
         totalMs: number;
+        sampleMs?: number;
+        lookupMs?: number;
         sampleCount: number;
         lookupCount: number;
         cacheHits: number;

@@ -1,8 +1,8 @@
 use std::time::Instant;
 
+use ascii_video_renderer::harri::NativeHarriRenderer;
 use napi::bindgen_prelude::{Buffer, Error, Result};
 use napi_derive::napi;
-use rollio_harri_wasm_core::NativeHarriRenderer;
 
 fn to_napi_error(error: impl std::fmt::Display) -> Error {
     Error::from_reason(error.to_string())
@@ -11,6 +11,8 @@ fn to_napi_error(error: impl std::fmt::Display) -> Error {
 #[napi(object)]
 pub struct NativeAsciiRenderStats {
     pub total_ms: f64,
+    pub sample_ms: Option<f64>,
+    pub lookup_ms: Option<f64>,
     pub sample_count: u32,
     pub lookup_count: u32,
     pub cache_hits: u32,
@@ -35,18 +37,8 @@ pub struct NativeAsciiRenderer {
 #[napi]
 impl NativeAsciiRenderer {
     #[napi(constructor)]
-    pub fn new(
-        cell_width: u32,
-        cell_height: u32,
-        glyph_chars: Buffer,
-        glyph_vectors: Buffer,
-        vector_size: u32,
-    ) -> Result<Self> {
-        let mut renderer =
-            NativeHarriRenderer::new(cell_width as usize, cell_height as usize)
-            .map_err(to_napi_error)?;
-        renderer
-            .set_glyphs(glyph_chars.as_ref(), glyph_vectors.as_ref(), vector_size as usize)
+    pub fn new(cell_width: u32, cell_height: u32) -> Result<Self> {
+        let mut renderer = NativeHarriRenderer::new(cell_width as usize, cell_height as usize)
             .map_err(to_napi_error)?;
         Ok(Self { renderer })
     }
@@ -75,7 +67,11 @@ impl NativeAsciiRenderer {
 
         Ok(NativeAsciiRenderResult {
             stats: NativeAsciiRenderStats {
-                total_ms: started_at.elapsed().as_secs_f64() * 1_000.0,
+                total_ms: stats
+                    .total_ms
+                    .max(started_at.elapsed().as_secs_f64() * 1_000.0),
+                sample_ms: stats.sample_ms,
+                lookup_ms: stats.lookup_ms,
                 sample_count: stats.sample_count,
                 lookup_count: stats.lookup_count,
                 cache_hits: stats.cache_hits,
@@ -83,7 +79,7 @@ impl NativeAsciiRenderer {
                 cell_count: columns.saturating_mul(rows),
                 output_bytes: stats.output_bytes,
                 sgr_change_count: Some(stats.sgr_change_count),
-                assemble_ms: None,
+                assemble_ms: stats.assemble_ms,
             },
             lines: if output_text.is_empty() {
                 Vec::new()

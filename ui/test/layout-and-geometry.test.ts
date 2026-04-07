@@ -40,28 +40,31 @@ test("metricsFromWinsize uses tty pixel geometry when available", () => {
   assert.equal(metrics.cellGeometry.pixelHeight, 50);
 });
 
-test("ts-harri defaults to a 1:2 cell aspect ratio", () => {
-  const backend = createAsciiRendererBackend("ts-harri");
+test("wasm-harri defaults to a 1:2 cell aspect ratio", () => {
+  const backend = createAsciiRendererBackend("wasm-harri");
   const raster = backend.describeRaster({ columns: 4, rows: 3 });
   assert.deepEqual(raster, { width: 32, height: 48 });
 });
 
-test("native-rust matches ts-harri raster geometry", () => {
-  const backend = createAsciiRendererBackend("native-rust");
-  const raster = backend.describeRaster({ columns: 4, rows: 3 });
-  assert.deepEqual(raster, { width: 32, height: 48 });
+test("native-rust matches wasm-harri raster geometry", () => {
+  const nativeBackend = createAsciiRendererBackend("native-rust");
+  const wasmBackend = createAsciiRendererBackend("wasm-harri");
+  assert.deepEqual(
+    nativeBackend.describeRaster({ columns: 4, rows: 3 }),
+    wasmBackend.describeRaster({ columns: 4, rows: 3 }),
+  );
 });
 
-test("ts-harri honors custom terminal cell geometry", () => {
-  const backend = createAsciiRendererBackend("ts-harri", {
+test("wasm-harri honors custom terminal cell geometry", () => {
+  const backend = createAsciiRendererBackend("wasm-harri", {
     cellGeometry: { pixelWidth: 1, pixelHeight: 3 },
   });
   const raster = backend.describeRaster({ columns: 2, rows: 2 });
   assert.deepEqual(raster, { width: 16, height: 48 });
 });
 
-test("wasm-harri matches ts-harri raster geometry", () => {
-  const backend = createAsciiRendererBackend("wasm-harri", {
+test("native-rust matches custom wasm-harri geometry", () => {
+  const backend = createAsciiRendererBackend("native-rust", {
     cellGeometry: { pixelWidth: 1, pixelHeight: 3 },
   });
   const raster = backend.describeRaster({ columns: 2, rows: 2 });
@@ -70,8 +73,7 @@ test("wasm-harri matches ts-harri raster geometry", () => {
 
 test("nextAsciiRendererId cycles the available camera renderers", () => {
   assert.equal(nextAsciiRendererId("ts-half-block"), "native-rust");
-  assert.equal(nextAsciiRendererId("native-rust"), "ts-harri");
-  assert.equal(nextAsciiRendererId("ts-harri"), "wasm-harri");
+  assert.equal(nextAsciiRendererId("native-rust"), "wasm-harri");
   assert.equal(nextAsciiRendererId("wasm-harri"), "ts-half-block");
 });
 

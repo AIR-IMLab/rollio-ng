@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { nowMs } from "../debug-metrics.js";
-import { TypeScriptHarriRenderer } from "./ts-harri.js";
+import { HarriGeometry } from "./harri-geometry.js";
 import type {
   AsciiRenderInput,
   AsciiRenderLayout,
@@ -16,14 +16,6 @@ interface HarriWasmExports extends WebAssembly.Exports {
   dealloc(ptr: number, len: number, cap: number): void;
   renderer_create(cellWidth: number, cellHeight: number): number;
   renderer_destroy(handle: number): void;
-  renderer_set_glyphs(
-    handle: number,
-    glyphCharsPtr: number,
-    glyphCharsLen: number,
-    glyphVectorsPtr: number,
-    glyphVectorsLen: number,
-    vectorSize: number,
-  ): number;
   renderer_render(
     handle: number,
     pixelsPtr: number,
@@ -40,6 +32,10 @@ interface HarriWasmExports extends WebAssembly.Exports {
   renderer_cache_misses(handle: number): number;
   renderer_sample_count(handle: number): number;
   renderer_lookup_count(handle: number): number;
+  renderer_total_ms(handle: number): number;
+  renderer_sample_ms(handle: number): number;
+  renderer_lookup_ms(handle: number): number;
+  renderer_assemble_ms(handle: number): number;
   last_error_ptr(): number;
   last_error_len(): number;
 }
@@ -106,32 +102,32 @@ function readLastError(exports: HarriWasmExports): Error {
 export class RustWasmHarriRenderer implements AsciiRendererBackend {
   readonly kind = "wasm" as const;
   readonly algorithm = "shape-lookup-rust-wasm";
-  readonly pixelFormat = "rgb24" as const;
+  readonly pixelFormat = "luma8" as const;
   readonly id: string;
   readonly label: string;
 
-  private readonly geometryRenderer: TypeScriptHarriRenderer;
+  private readonly geometry: HarriGeometry;
   private exports: HarriWasmExports | null = null;
   private handle = 0;
 
   constructor(
     options: AsciiRendererOptions = {},
     {
-      rendererId = "ts-harri",
+      rendererId = "wasm-harri",
       label = "Harri (WASM)",
     }: RustWasmHarriRendererOptions = {},
   ) {
     this.id = rendererId;
     this.label = label;
-    this.geometryRenderer = new TypeScriptHarriRenderer(options);
+    this.geometry = new HarriGeometry(options);
   }
 
   describeRaster(layout: AsciiRenderLayout): AsciiRasterDimensions {
-    return this.geometryRenderer.describeRaster(layout);
+    return this.geometry.describeRaster(layout);
   }
 
   layoutForRaster(raster: AsciiRasterDimensions): AsciiRenderLayout {
-    return this.geometryRenderer.layoutForRaster(raster);
+    return this.geometry.layoutForRaster(raster);
   }
 
   async prepare(): Promise<void> {
@@ -140,37 +136,9 @@ export class RustWasmHarriRenderer implements AsciiRendererBackend {
     }
 
     const exports = await loadHarriWasmExports();
-    const glyphPayload = await this.geometryRenderer.exportGlyphPayload();
-    const handle = exports.renderer_create(glyphPayload.cellWidth, glyphPayload.cellHeight);
+    const handle = exports.renderer_create(this.geometry.cellWidth, this.geometry.cellHeight);
     if (handle === 0) {
       throw readLastError(exports);
-    }
-
-    const glyphCharsAllocation = allocateBytes(exports, glyphPayload.glyphChars);
-    const glyphVectorsAllocation = allocateBytes(
-      exports,
-      new Uint8Array(
-        glyphPayload.glyphVectors.buffer,
-        glyphPayload.glyphVectors.byteOffset,
-        glyphPayload.glyphVectors.byteLength,
-      ),
-    );
-    try {
-      const ok = exports.renderer_set_glyphs(
-        handle,
-        glyphCharsAllocation.ptr,
-        glyphCharsAllocation.len,
-        glyphVectorsAllocation.ptr,
-        glyphVectorsAllocation.len,
-        glyphPayload.vectorLength,
-      );
-      if (ok === 0) {
-        exports.renderer_destroy(handle);
-        throw readLastError(exports);
-      }
-    } finally {
-      freeAllocation(exports, glyphCharsAllocation);
-      freeAllocation(exports, glyphVectorsAllocation);
     }
 
     this.exports = exports;
@@ -220,6 +188,7 @@ export class RustWasmHarriRenderer implements AsciiRendererBackend {
           : new Uint8Array();
       const outputText = UTF8_DECODER.decode(outputBytes);
 
+      const backendTotalMs = optionalTiming(this.exports.renderer_total_ms(this.handle));
       return {
         backendId: this.id,
         lines: outputText.length > 0 ? outputText.split("\n") : [],
@@ -236,7 +205,10 @@ export class RustWasmHarriRenderer implements AsciiRendererBackend {
           cacheHits: this.exports.renderer_cache_hits(this.handle),
           cacheMisses: this.exports.renderer_cache_misses(this.handle),
           timings: {
-            totalMs: nowMs() - startedAtMs,
+            totalMs: backendTotalMs ?? nowMs() - startedAtMs,
+            sampleMs: optionalTiming(this.exports.renderer_sample_ms(this.handle)),
+            lookupMs: optionalTiming(this.exports.renderer_lookup_ms(this.handle)),
+            assembleMs: optionalTiming(this.exports.renderer_assemble_ms(this.handle)),
           },
         },
       };
@@ -252,4 +224,8 @@ export class RustWasmHarriRenderer implements AsciiRendererBackend {
     this.exports.renderer_destroy(this.handle);
     this.handle = 0;
   }
+}
+
+function optionalTiming(value: number): number | undefined {
+  return Number.isFinite(value) && value > 0 ? value : undefined;
 }

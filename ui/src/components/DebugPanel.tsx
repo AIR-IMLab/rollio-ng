@@ -337,21 +337,14 @@ function formatHarriWorkerSummary(
   snapshot: DebugSnapshot,
 ): string {
   if (rendererBackend === "wasm-harri") {
-    return " Harri worker: not in use | renderer=direct wasm";
+    return " Harri worker: retired | renderer=shared-engine wasm";
   }
 
-  if (rendererBackend !== "ts-harri") {
-    return ` Harri worker: inactive | last=${gaugeValue(snapshot, "stream.harri_worker.state", "n/a")} | log=${gaugeValue(snapshot, "stream.harri_worker.last_log", "n/a")}`;
+  if (rendererBackend === "native-rust") {
+    return " Harri worker: retired | renderer=shared-engine native";
   }
 
-  return (
-    ` Harri worker: mode=${gaugeValue(snapshot, "stream.harri_worker.mode", "n/a")}` +
-    ` | state=${gaugeValue(snapshot, "stream.harri_worker.state", "n/a")}` +
-    ` | tid=${gaugeValue(snapshot, "stream.harri_worker.thread_id", "n/a")}` +
-    ` | pending=${gaugeValue(snapshot, "stream.harri_worker.pending_requests", "0")}` +
-    ` | rt=${formatGaugeMs(snapshot, "stream.harri_worker.last_roundtrip_ms")}` +
-    ` | log=${gaugeValue(snapshot, "stream.harri_worker.last_log", "n/a")}`
-  );
+  return ` Harri worker: inactive | last=${gaugeValue(snapshot, "stream.harri_worker.state", "n/a")} | log=${gaugeValue(snapshot, "stream.harri_worker.last_log", "n/a")}`;
 }
 
 function formatRatioValue(value: number | null | undefined): string {

@@ -5,12 +5,9 @@ import type { AsciiRenderLayout, AsciiRenderResult } from "./types.js";
 type NativeAsciiWorkerRequest =
   | {
       type: "init";
-      glyphPayload: {
+      geometry: {
         cellWidth: number;
         cellHeight: number;
-        glyphChars: Uint8Array;
-        glyphVectors: Uint8Array;
-        vectorLength: number;
       };
     }
   | {
@@ -66,6 +63,8 @@ function mapRenderResult(
       cacheMisses: nativeResult.stats.cacheMisses,
       timings: {
         totalMs: nativeResult.stats.totalMs,
+        sampleMs: nativeResult.stats.sampleMs,
+        lookupMs: nativeResult.stats.lookupMs,
         assembleMs: nativeResult.stats.assembleMs,
       },
     },
@@ -84,11 +83,8 @@ parentPort.on("message", (message: NativeAsciiWorkerRequest) => {
     switch (message.type) {
       case "init": {
         renderer = new addon.NativeAsciiRenderer(
-          message.glyphPayload.cellWidth,
-          message.glyphPayload.cellHeight,
-          message.glyphPayload.glyphChars,
-          message.glyphPayload.glyphVectors,
-          message.glyphPayload.vectorLength,
+          message.geometry.cellWidth,
+          message.geometry.cellHeight,
         );
         const response: NativeAsciiWorkerResponse = { type: "ready" };
         parentPort?.postMessage(response);

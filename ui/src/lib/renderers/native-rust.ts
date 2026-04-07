@@ -11,17 +11,14 @@ import {
   type AsciiRendererOptions,
   type AsciiRasterDimensions,
 } from "./types.js";
-import { TypeScriptHarriRenderer } from "./ts-harri.js";
+import { HarriGeometry } from "./harri-geometry.js";
 
 type NativeAsciiWorkerRequest =
   | {
       type: "init";
-      glyphPayload: {
+      geometry: {
         cellWidth: number;
         cellHeight: number;
-        glyphChars: Uint8Array;
-        glyphVectors: Uint8Array;
-        vectorLength: number;
       };
     }
   | {
@@ -59,15 +56,6 @@ function createError(message: string, stack?: string): Error {
 }
 
 function cloneTransferablePixels(pixels: Buffer | Uint8Array): Uint8Array {
-  if (
-    !Buffer.isBuffer(pixels) &&
-    pixels.byteOffset === 0 &&
-    pixels.byteLength === pixels.buffer.byteLength &&
-    !(pixels.buffer instanceof SharedArrayBuffer)
-  ) {
-    return new Uint8Array(pixels.buffer, 0, pixels.byteLength);
-  }
-
   const copy = new Uint8Array(pixels.byteLength);
   copy.set(pixels);
   return copy;
@@ -93,7 +81,7 @@ export class WorkerThreadNativeRustRenderer implements AsciiRendererBackend {
   readonly algorithm = "shape-lookup-rust-native-harri";
   readonly pixelFormat = "luma8" as const;
 
-  private readonly geometryRenderer: TypeScriptHarriRenderer;
+  private readonly geometry: HarriGeometry;
   private worker: Worker | null = null;
   private readyPromise: Promise<void> | null = null;
   private readyResolver:
@@ -108,15 +96,15 @@ export class WorkerThreadNativeRustRenderer implements AsciiRendererBackend {
   private terminatingWorker = false;
 
   constructor(options: AsciiRendererOptions = {}) {
-    this.geometryRenderer = new TypeScriptHarriRenderer(options);
+    this.geometry = new HarriGeometry(options);
   }
 
   describeRaster(layout: AsciiRenderLayout): AsciiRasterDimensions {
-    return this.geometryRenderer.describeRaster(layout);
+    return this.geometry.describeRaster(layout);
   }
 
   layoutForRaster(raster: AsciiRasterDimensions): AsciiRenderLayout {
-    return this.geometryRenderer.layoutForRaster(raster);
+    return this.geometry.layoutForRaster(raster);
   }
 
   async prepare(): Promise<void> {
@@ -159,7 +147,6 @@ export class WorkerThreadNativeRustRenderer implements AsciiRendererBackend {
     const worker = new Worker(workerUrl);
     this.worker = worker;
     this.terminatingWorker = false;
-    const glyphPayload = await this.geometryRenderer.exportGlyphPayload();
 
     worker.on("message", (message: NativeAsciiWorkerResponse) => {
       this.handleWorkerMessage(message);
@@ -184,23 +171,12 @@ export class WorkerThreadNativeRustRenderer implements AsciiRendererBackend {
 
     const initMessage: NativeAsciiWorkerRequest = {
       type: "init",
-      glyphPayload: {
-        cellWidth: glyphPayload.cellWidth,
-        cellHeight: glyphPayload.cellHeight,
-        glyphChars: glyphPayload.glyphChars,
-        glyphVectors: new Uint8Array(
-          glyphPayload.glyphVectors.buffer,
-          glyphPayload.glyphVectors.byteOffset,
-          glyphPayload.glyphVectors.byteLength,
-        ),
-        vectorLength: glyphPayload.vectorLength,
+      geometry: {
+        cellWidth: this.geometry.cellWidth,
+        cellHeight: this.geometry.cellHeight,
       },
     };
-    const transfers = [
-      initMessage.glyphPayload.glyphChars.buffer,
-      initMessage.glyphPayload.glyphVectors.buffer,
-    ].filter((value): value is ArrayBuffer => value instanceof ArrayBuffer);
-    worker.postMessage(initMessage, transfers);
+    worker.postMessage(initMessage);
     await readyPromise;
   }
 
