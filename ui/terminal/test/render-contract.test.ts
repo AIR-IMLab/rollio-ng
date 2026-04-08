@@ -69,7 +69,7 @@ test("native-rust uses the worker-backed native path", async () => {
 
   try {
     assert.equal(backend.kind, "worker");
-    assert.equal(backend.algorithm, "ascii-video-renderer-native");
+    assert.equal(backend.algorithm, "context_shape");
     assert.equal(backend.pixelFormat, "luma8");
     const layout: AsciiRenderLayout = { columns: 8, rows: 4 };
     const raster = backend.describeRaster(layout);
@@ -82,6 +82,31 @@ test("native-rust uses the worker-backed native path", async () => {
     assert.equal(result.backendId, "native-rust");
     assert.equal(result.lines.length, layout.rows);
     assert.match(result.lines[0] ?? "", /\x1b\[38;5;\d+m/);
+    assert.notEqual(result.stats.timings.adapterMs, undefined);
+  } finally {
+    await disposeBackends([backend]);
+  }
+});
+
+test("native-rust-color uses the worker-backed color path", async () => {
+  const backend = createAsciiRendererBackend("native-rust-color");
+  await backend.prepare?.();
+
+  try {
+    assert.equal(backend.kind, "worker");
+    assert.equal(backend.algorithm, "context_shape_color");
+    assert.equal(backend.pixelFormat, "rgb24");
+    const layout: AsciiRenderLayout = { columns: 6, rows: 3 };
+    const raster = backend.describeRaster(layout);
+    const result = await backend.render({
+      pixels: new Uint8Array(raster.width * raster.height * 3),
+      width: raster.width,
+      height: raster.height,
+      layout,
+    });
+    assert.equal(result.backendId, "native-rust-color");
+    assert.equal(result.lines.length, layout.rows);
+    assert.match(result.lines[0] ?? "", /\x1b\[38;2;\d+;\d+;\d+m/);
     assert.notEqual(result.stats.timings.adapterMs, undefined);
   } finally {
     await disposeBackends([backend]);
@@ -125,6 +150,7 @@ test("native-rust produces visible ASCII glyphs for shaped input", async () => {
 
 test("ts-half-block emits truecolor ANSI for paired pixels", async () => {
   const backend = createAsciiRendererBackend("ts-half-block");
+  await backend.prepare?.();
   const result = await backend.render({
     pixels: Uint8Array.from([
       255,
@@ -139,10 +165,17 @@ test("ts-half-block emits truecolor ANSI for paired pixels", async () => {
     layout: { columns: 1, rows: 1 },
   });
 
-  assert.equal(result.lines.length, 1);
-  assert.match(result.lines[0], /\x1b\[48;2;255;32;16m/);
-  assert.match(result.lines[0], /\x1b\[38;2;12;200;240m/);
-  assert.equal(stripAnsi(result.lines[0]), "▄");
+  try {
+    assert.equal(backend.kind, "worker");
+    assert.equal(backend.algorithm, "half_block_color");
+    assert.equal(backend.pixelFormat, "rgb24");
+    assert.equal(result.lines.length, 1);
+    assert.match(result.lines[0], /\x1b\[38;2;255;32;16m/);
+    assert.match(result.lines[0], /\x1b\[48;2;12;200;240m/);
+    assert.equal(stripAnsi(result.lines[0]), "▀");
+  } finally {
+    await disposeBackends([backend]);
+  }
 });
 
 test("native-rust dispose during in-flight render avoids unhandled rejections", async () => {

@@ -1,26 +1,40 @@
-import { TypeScriptHalfBlockRenderer } from "./half-block.js";
-import { WorkerThreadNativeRustRenderer } from "./native-rust.js";
+import {
+  WorkerThreadNativeRustRenderer,
+  type NativeAsciiRendererPreset,
+} from "./native-rust.js";
 import type { AsciiRendererBackend, AsciiRendererOptions } from "./types.js";
 
-export const ASCII_RENDERER_IDS = ["ts-half-block", "native-rust"] as const;
+export const ASCII_RENDERER_IDS = [
+  "native-rust",
+  "native-rust-color",
+  "ts-half-block",
+] as const;
 
 export type AsciiRendererId = (typeof ASCII_RENDERER_IDS)[number];
 
-export const ASCII_RENDERER_LABELS: Record<AsciiRendererId, string> = {
-  "ts-half-block": "Half Block",
-  "native-rust": "Rust (Native)",
+const ASCII_RENDERER_PRESETS: Record<AsciiRendererId, NativeAsciiRendererPreset> = {
+  "native-rust": {
+    id: "native-rust",
+    label: "Context Shape",
+    algorithmId: "context_shape",
+  },
+  "native-rust-color": {
+    id: "native-rust-color",
+    label: "Context Shape Color",
+    algorithmId: "context_shape_color",
+  },
+  "ts-half-block": {
+    id: "ts-half-block",
+    label: "Half Block",
+    algorithmId: "half_block_color",
+  },
 };
 
 export function createAsciiRendererBackend(
   id: AsciiRendererId,
   options: AsciiRendererOptions = {},
 ): AsciiRendererBackend {
-  switch (id) {
-    case "ts-half-block":
-      return new TypeScriptHalfBlockRenderer();
-    case "native-rust":
-      return new WorkerThreadNativeRustRenderer(options);
-  }
+  return new WorkerThreadNativeRustRenderer(ASCII_RENDERER_PRESETS[id], options);
 }
 
 export function listAsciiRendererBackends(): AsciiRendererBackend[] {
@@ -46,7 +60,7 @@ export function nextAsciiRendererId(current: AsciiRendererId): AsciiRendererId {
 }
 
 export function getAsciiRendererLabel(id: AsciiRendererId): string {
-  return ASCII_RENDERER_LABELS[id];
+  return ASCII_RENDERER_PRESETS[id].label;
 }
 
 export type {

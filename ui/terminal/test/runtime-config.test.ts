@@ -28,3 +28,10 @@ test("resolveRuntimeConfig lets CLI flags override environment values", () => {
   assert.equal(runtimeConfig.websocketUrl, "ws://127.0.0.1:9922");
   assert.equal(runtimeConfig.asciiRendererId, "ts-half-block");
 });
+
+test("resolveRuntimeConfig accepts the native-rust-color preset", () => {
+  const runtimeConfig = resolveRuntimeConfig([], {
+    ROLLIO_ASCII_RENDERER: "native-rust-color",
+  });
+  assert.equal(runtimeConfig.asciiRendererId, "native-rust-color");
+});

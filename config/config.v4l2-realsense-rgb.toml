@@ -12,7 +12,7 @@ port = 9090
 max_preview_width = 320
 max_preview_height = 240
 jpeg_quality = 80
-preview_fps = 30
+preview_fps = 60
 
 [[devices]]
 name = "camera_webcam_front"

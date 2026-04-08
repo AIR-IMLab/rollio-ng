@@ -1,9 +1,23 @@
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import type { AsciiPixelFormat, AsciiRasterDimensions, AsciiRenderLayout } from "./types.js";
 
 export interface NativeAsciiAddonModule {
-  NativeAsciiRenderer: new (cellWidth: number, cellHeight: number) => {
+  pixelFormatForAlgorithm: (algorithmId: string) => AsciiPixelFormat;
+  describeRasterForAlgorithm: (
+    algorithmId: string,
+    cellAspect: number,
+    columns: number,
+    rows: number,
+  ) => AsciiRasterDimensions;
+  layoutForRasterForAlgorithm: (
+    algorithmId: string,
+    cellAspect: number,
+    width: number,
+    height: number,
+  ) => AsciiRenderLayout;
+  NativeAsciiRenderer: new (algorithmId: string, cellAspect: number) => {
     render(
       pixels: Uint8Array,
       width: number,

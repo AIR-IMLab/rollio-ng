@@ -333,10 +333,16 @@ function formatGaugeMs(snapshot: DebugSnapshot, name: string): string {
 }
 
 function formatNativeAsciiSummary(rendererBackend: string): string {
-  if (rendererBackend === "native-rust") {
-    return " Native ASCII: Node worker + N-API (ascii-video-renderer)";
+  switch (rendererBackend) {
+    case "native-rust":
+      return " Native ASCII: Context Shape preset via worker + N-API";
+    case "native-rust-color":
+      return " Native ASCII: Context Shape Color preset via worker + N-API";
+    case "ts-half-block":
+      return " Native ASCII: Half Block preset via worker + N-API";
+    default:
+      return " Native ASCII: inactive";
   }
-  return " Native ASCII: inactive (half-block path)";
 }
 
 function formatRatioValue(value: number | null | undefined): string {

@@ -20,3 +20,4 @@ ui/terminal/native/
 external/reference
 
 **/__pycache__/
+.understand-anything/

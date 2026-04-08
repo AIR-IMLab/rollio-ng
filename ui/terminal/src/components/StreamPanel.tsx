@@ -707,22 +707,27 @@ export async function prepareRendererRaster(
   targetHeight: number,
   pixelFormat: AsciiPixelFormat = "rgb24",
 ): Promise<PreparedRaster> {
-  if (pixelFormat === "luma8") {
-    return await prepareGrayscaleRaster(jpegData, targetWidth, targetHeight);
-  }
-
   const decoded = await sharp(jpegData, {
     sequentialRead: true,
   })
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  const normalized = normalizeDecodedRasterToRgb(
-    decoded.data,
-    decoded.info.width,
-    decoded.info.height,
-    decoded.info.channels as 1 | 2 | 3 | 4,
-  );
+  const normalized =
+    pixelFormat === "luma8"
+      ? normalizeDecodedRasterToLuma(
+          decoded.data,
+          decoded.info.width,
+          decoded.info.height,
+          decoded.info.channels as 1 | 2 | 3 | 4,
+        )
+      : normalizeDecodedRasterToRgb(
+          decoded.data,
+          decoded.info.width,
+          decoded.info.height,
+          decoded.info.channels as 1 | 2 | 3 | 4,
+        );
+  const channels: 1 | 3 = pixelFormat === "luma8" ? 1 : 3;
 
   if (
     normalized.width === targetWidth &&
@@ -741,46 +746,7 @@ export async function prepareRendererRaster(
     normalized.height,
     targetWidth,
     targetHeight,
-    3,
-  );
-}
-
-async function prepareGrayscaleRaster(
-  jpegData: Buffer,
-  targetWidth: number,
-  targetHeight: number,
-): Promise<PreparedRaster> {
-  const decoded = await sharp(jpegData, {
-    sequentialRead: true,
-  })
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  const normalized = normalizeDecodedRasterToLuma(
-    decoded.data,
-    decoded.info.width,
-    decoded.info.height,
-    decoded.info.channels as 1 | 2 | 3 | 4,
-  );
-
-  if (
-    normalized.width === targetWidth &&
-    normalized.height === targetHeight
-  ) {
-    return {
-      data: normalized.data,
-      width: normalized.width,
-      height: normalized.height,
-    };
-  }
-
-  return await resizePreparedRaster(
-    normalized.data,
-    normalized.width,
-    normalized.height,
-    targetWidth,
-    targetHeight,
-    1,
+    channels,
   );
 }
 

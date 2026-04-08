@@ -3,7 +3,6 @@ import test from "node:test";
 import sharp from "sharp";
 import { resolveCameraNames } from "../src/lib/camera-layout.js";
 import { metricsFromWinsize } from "../src/lib/terminal-geometry.js";
-import { HarriGeometry } from "../src/lib/renderers/harri-geometry.js";
 import {
   createAsciiRendererBackend,
   nextAsciiRendererId,
@@ -41,45 +40,48 @@ test("metricsFromWinsize uses tty pixel geometry when available", () => {
   assert.equal(metrics.cellGeometry.pixelHeight, 50);
 });
 
-test("HarriGeometry defaults to a 1:2 cell aspect ratio for native-rust layout", () => {
-  const ref = new HarriGeometry();
-  const raster = ref.describeRaster({ columns: 4, rows: 3 });
-  assert.deepEqual(raster, { width: 32, height: 48 });
-});
-
-test("native-rust matches HarriGeometry raster layout", () => {
-  const nativeBackend = createAsciiRendererBackend("native-rust");
-  const ref = new HarriGeometry();
-  assert.deepEqual(
-    nativeBackend.describeRaster({ columns: 4, rows: 3 }),
-    ref.describeRaster({ columns: 4, rows: 3 }),
-  );
-});
-
-test("HarriGeometry honors custom terminal cell geometry", () => {
-  const ref = new HarriGeometry({
-    cellGeometry: { pixelWidth: 1, pixelHeight: 3 },
+test("native-rust uses engine-backed context-shape raster layout", () => {
+  const backend = createAsciiRendererBackend("native-rust");
+  assert.deepEqual(backend.describeRaster({ columns: 4, rows: 3 }), {
+    width: 32,
+    height: 48,
   });
-  const raster = ref.describeRaster({ columns: 2, rows: 2 });
-  assert.deepEqual(raster, { width: 16, height: 48 });
 });
 
-test("native-rust matches custom HarriGeometry layout", () => {
+test("native-rust-color shares context-shape raster layout", () => {
+  const backend = createAsciiRendererBackend("native-rust-color");
+  assert.deepEqual(backend.describeRaster({ columns: 4, rows: 3 }), {
+    width: 32,
+    height: 48,
+  });
+});
+
+test("native-rust honors custom terminal cell geometry through the engine", () => {
   const backend = createAsciiRendererBackend("native-rust", {
     cellGeometry: { pixelWidth: 1, pixelHeight: 3 },
   });
-  const ref = new HarriGeometry({
-    cellGeometry: { pixelWidth: 1, pixelHeight: 3 },
+  assert.deepEqual(backend.describeRaster({ columns: 2, rows: 2 }), {
+    width: 16,
+    height: 48,
   });
-  assert.deepEqual(
-    backend.describeRaster({ columns: 2, rows: 2 }),
-    ref.describeRaster({ columns: 2, rows: 2 }),
-  );
+});
+
+test("ts-half-block uses engine-backed half-block raster layout", () => {
+  const backend = createAsciiRendererBackend("ts-half-block");
+  assert.deepEqual(backend.describeRaster({ columns: 4, rows: 3 }), {
+    width: 4,
+    height: 6,
+  });
+  assert.deepEqual(backend.layoutForRaster({ width: 7, height: 9 }), {
+    columns: 7,
+    rows: 5,
+  });
 });
 
 test("nextAsciiRendererId cycles the available camera renderers", () => {
+  assert.equal(nextAsciiRendererId("native-rust"), "native-rust-color");
+  assert.equal(nextAsciiRendererId("native-rust-color"), "ts-half-block");
   assert.equal(nextAsciiRendererId("ts-half-block"), "native-rust");
-  assert.equal(nextAsciiRendererId("native-rust"), "ts-half-block");
 });
 
 test("prepareRendererRaster expands single-channel previews to RGB", async () => {

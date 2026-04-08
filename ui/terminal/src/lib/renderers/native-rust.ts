@@ -2,24 +2,26 @@ import { performance } from "node:perf_hooks";
 import { existsSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
+import { loadNativeAsciiAddon, type NativeAsciiAddonModule } from "./native-rust-addon.js";
 import {
+  DEFAULT_ASCII_CELL_GEOMETRY,
   assertExpectedRaster,
+  type AsciiCellGeometry,
   type AsciiRenderInput,
   type AsciiRenderLayout,
+  type AsciiPixelFormat,
   type AsciiRenderResult,
   type AsciiRendererBackend,
   type AsciiRendererOptions,
   type AsciiRasterDimensions,
 } from "./types.js";
-import { HarriGeometry } from "./harri-geometry.js";
 
 type NativeAsciiWorkerRequest =
   | {
       type: "init";
-      geometry: {
-        cellWidth: number;
-        cellHeight: number;
-      };
+      backendId: string;
+      algorithmId: string;
+      cellAspect: number;
     }
   | {
       type: "render";
@@ -43,6 +45,12 @@ interface PendingRenderRequest {
   startedAtMs: number;
 }
 
+export interface NativeAsciiRendererPreset {
+  id: string;
+  label: string;
+  algorithmId: string;
+}
+
 function nowMs(): number {
   return performance.now();
 }
@@ -61,6 +69,32 @@ function cloneTransferablePixels(pixels: Buffer | Uint8Array): Uint8Array {
   return copy;
 }
 
+let cachedAddon: NativeAsciiAddonModule | null = null;
+
+function getNativeAsciiAddon(): NativeAsciiAddonModule {
+  cachedAddon ??= loadNativeAsciiAddon();
+  return cachedAddon;
+}
+
+function normalizeCellGeometry(geometry?: AsciiCellGeometry): AsciiCellGeometry {
+  const candidate = geometry ?? DEFAULT_ASCII_CELL_GEOMETRY;
+  return {
+    pixelWidth:
+      Number.isFinite(candidate.pixelWidth) && candidate.pixelWidth > 0
+        ? candidate.pixelWidth
+        : DEFAULT_ASCII_CELL_GEOMETRY.pixelWidth,
+    pixelHeight:
+      Number.isFinite(candidate.pixelHeight) && candidate.pixelHeight > 0
+        ? candidate.pixelHeight
+        : DEFAULT_ASCII_CELL_GEOMETRY.pixelHeight,
+  };
+}
+
+function resolveCellAspect(geometry?: AsciiCellGeometry): number {
+  const normalized = normalizeCellGeometry(geometry);
+  return normalized.pixelHeight / normalized.pixelWidth;
+}
+
 function resolveWorkerModuleUrl(): URL {
   if (!import.meta.url.endsWith(".ts")) {
     return new URL("./native-rust.worker.js", import.meta.url);
@@ -75,13 +109,13 @@ function resolveWorkerModuleUrl(): URL {
 }
 
 export class WorkerThreadNativeRustRenderer implements AsciiRendererBackend {
-  readonly id = "native-rust";
-  readonly label = "Rust (Native)";
+  readonly id: string;
+  readonly label: string;
   readonly kind = "worker" as const;
-  readonly algorithm = "ascii-video-renderer-native";
-  readonly pixelFormat = "luma8" as const;
+  readonly algorithm: string;
+  readonly pixelFormat: AsciiPixelFormat;
 
-  private readonly geometry: HarriGeometry;
+  private readonly cellAspect: number;
   private worker: Worker | null = null;
   private readyPromise: Promise<void> | null = null;
   private readyResolver:
@@ -95,16 +129,33 @@ export class WorkerThreadNativeRustRenderer implements AsciiRendererBackend {
   private disposed = false;
   private terminatingWorker = false;
 
-  constructor(options: AsciiRendererOptions = {}) {
-    this.geometry = new HarriGeometry(options);
+  constructor(
+    preset: NativeAsciiRendererPreset,
+    options: AsciiRendererOptions = {},
+  ) {
+    this.id = preset.id;
+    this.label = preset.label;
+    this.algorithm = preset.algorithmId;
+    this.cellAspect = resolveCellAspect(options.cellGeometry);
+    this.pixelFormat = getNativeAsciiAddon().pixelFormatForAlgorithm(this.algorithm);
   }
 
   describeRaster(layout: AsciiRenderLayout): AsciiRasterDimensions {
-    return this.geometry.describeRaster(layout);
+    return getNativeAsciiAddon().describeRasterForAlgorithm(
+      this.algorithm,
+      this.cellAspect,
+      layout.columns,
+      layout.rows,
+    );
   }
 
   layoutForRaster(raster: AsciiRasterDimensions): AsciiRenderLayout {
-    return this.geometry.layoutForRaster(raster);
+    return getNativeAsciiAddon().layoutForRasterForAlgorithm(
+      this.algorithm,
+      this.cellAspect,
+      raster.width,
+      raster.height,
+    );
   }
 
   async prepare(): Promise<void> {
@@ -171,10 +222,9 @@ export class WorkerThreadNativeRustRenderer implements AsciiRendererBackend {
 
     const initMessage: NativeAsciiWorkerRequest = {
       type: "init",
-      geometry: {
-        cellWidth: this.geometry.cellWidth,
-        cellHeight: this.geometry.cellHeight,
-      },
+      backendId: this.id,
+      algorithmId: this.algorithm,
+      cellAspect: this.cellAspect,
     };
     worker.postMessage(initMessage);
     await readyPromise;

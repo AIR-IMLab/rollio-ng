@@ -5,10 +5,9 @@ import type { AsciiRenderLayout, AsciiRenderResult } from "./types.js";
 type NativeAsciiWorkerRequest =
   | {
       type: "init";
-      geometry: {
-        cellWidth: number;
-        cellHeight: number;
-      };
+      backendId: string;
+      algorithmId: string;
+      cellAspect: number;
     }
   | {
       type: "render";
@@ -42,12 +41,13 @@ function postError(requestId: number | undefined, error: unknown): void {
 
 function mapRenderResult(
   nativeResult: ReturnType<NativeAsciiRendererInstance["render"]>,
+  backendId: string,
   width: number,
   height: number,
   layout: AsciiRenderLayout,
 ): AsciiRenderResult {
   return {
-    backendId: "native-rust",
+    backendId,
     lines: nativeResult.lines,
     stats: {
       rasterWidth: width,
@@ -77,15 +77,14 @@ if (!parentPort) {
 
 const addon = loadNativeAsciiAddon();
 let renderer: NativeAsciiRendererInstance | null = null;
+let backendId = "native-rust";
 
 parentPort.on("message", (message: NativeAsciiWorkerRequest) => {
   try {
     switch (message.type) {
       case "init": {
-        renderer = new addon.NativeAsciiRenderer(
-          message.geometry.cellWidth,
-          message.geometry.cellHeight,
-        );
+        backendId = message.backendId;
+        renderer = new addon.NativeAsciiRenderer(message.algorithmId, message.cellAspect);
         const response: NativeAsciiWorkerResponse = { type: "ready" };
         parentPort?.postMessage(response);
         return;
@@ -110,6 +109,7 @@ parentPort.on("message", (message: NativeAsciiWorkerRequest) => {
               message.input.layout.columns,
               message.input.layout.rows,
             ),
+            backendId,
             message.input.width,
             message.input.height,
             message.input.layout,
