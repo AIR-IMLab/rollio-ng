@@ -177,8 +177,6 @@ fn build_device_spec(
                 current_exe_dir.join(&executable_name),
                 workspace_root.join("target/debug").join(&executable_name),
             ]);
-            let python_package_root = workspace_root.join("robots").join(&driver_dir);
-            let python_package_src = python_package_root.join("src");
 
             if let Some(local_binary) = local_binary {
                 (
@@ -186,22 +184,6 @@ fn build_device_spec(
                     ResolvedCommand {
                         program: local_binary.into_os_string(),
                         args: common_args,
-                    },
-                )
-            } else if python_package_root.join("pyproject.toml").exists()
-                && python_package_src.exists()
-            {
-                (
-                    python_package_src,
-                    ResolvedCommand {
-                        program: OsString::from("python3"),
-                        args: vec![
-                            OsString::from("-m"),
-                            OsString::from(format!("rollio_{driver_dir}")),
-                            OsString::from("run"),
-                            OsString::from("--config-inline"),
-                            OsString::from(toml::to_string(device)?),
-                        ],
                     },
                 )
             } else {

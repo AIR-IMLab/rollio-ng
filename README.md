@@ -18,7 +18,6 @@ See `design/` for architecture docs and sprint plans.
 | NASM       | recent          | `libjpeg-turbo` SIMD build used by `turbojpeg` |
 | Node.js    | 18+             | UI (TypeScript/Ink)  |
 | npm        | 9+              | UI dependency mgmt   |
-| Python     | 3.10+           | Robot drivers        |
 
 ### Optional (development)
 
@@ -37,8 +36,16 @@ git clone --recursive <repo-url>
 cd rollio-ng
 
 # Debian/Ubuntu build tools
+# `clang`/`libclang-dev`/`llvm-dev` are required for bindgen-based builds
+# such as `iceoryx2` 0.8.1+ and the AIRBOT driver stack.
 sudo apt-get update
-sudo apt-get install -y build-essential cmake nasm
+sudo apt-get install -y \
+  build-essential \
+  cmake \
+  nasm \
+  clang \
+  libclang-dev \
+  llvm-dev
 
 # Rust
 cargo build --workspace
@@ -51,12 +58,25 @@ ctest --test-dir cameras/build --output-on-failure
 # UI
 cd ui/terminal && npm install && npm run build && cd ../..
 
-# Python AIRBOT driver tests
-PYTHONPATH="$PWD/robots/airbot_play/src" python3 -m pytest robots/airbot_play/tests
+# AIRBOT wrapper + transport validation
+cargo test -p rollio-robot-airbot-play
+cargo test --offline --manifest-path third_party/airbot-play-rust/Cargo.toml transport::iceoryx2::tests --lib
+cargo run --manifest-path third_party/airbot-play-rust/Cargo.toml --bin airbot-play-iceoryx2 -- --interface can0
+
+# AIRBOT hardware smoke (requires a configured CAN-connected arm)
+cargo run -p rollio -- collect --config config/config.hardware.example.toml
 ```
 
 If `cargo build --workspace` or `make` fails while compiling `turbojpeg-sys`
 with `No CMAKE_ASM_NASM_COMPILER could be found`, install `nasm` and retry.
+
+If an `iceoryx2` or `airbot-play-rust` build fails during bindgen with errors
+like `fatal error: 'stddef.h' file not found`, install:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y clang libclang-dev llvm-dev
+```
 
 ## Pre-commit hooks (optional)
 

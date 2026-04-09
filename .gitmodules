@@ -10,3 +10,6 @@
 [submodule "third_party/airbot-play-rust"]
 	path = third_party/airbot-play-rust
 	url = https://github.com/tb5z035i/airbot-play-rust.git
+[submodule "third_party/rvl-rust"]
+	path = third_party/rvl-rust
+	url = git@github.com:tb5z035i/rvl-rust.git

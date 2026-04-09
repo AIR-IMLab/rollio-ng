@@ -25,7 +25,7 @@ wheels = [
 
 [[package]]
 name = "iceoryx2"
-version = "0.8.999"
+version = "0.8.1"
 source = { editable = "../../third_party/iceoryx2/iceoryx2-ffi/python" }
 
 [package.metadata]
