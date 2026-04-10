@@ -16,6 +16,7 @@ See `design/` for architecture docs and sprint plans.
 | CMake      | 3.22+           | C++ modules          |
 | g++ / clang| C++17 support   | C++ modules          |
 | NASM       | recent          | `libjpeg-turbo` SIMD build used by `turbojpeg` |
+| pkg-config | recent          | native `libav*` discovery for `rollio-encoder` |
 | Node.js    | 18+             | UI (TypeScript/Ink)  |
 | npm        | 9+              | UI dependency mgmt   |
 
@@ -43,9 +44,14 @@ sudo apt-get install -y \
   build-essential \
   cmake \
   nasm \
+  pkg-config \
   clang \
   libclang-dev \
-  llvm-dev
+  llvm-dev \
+  libavcodec-dev \
+  libavformat-dev \
+  libavutil-dev \
+  libswscale-dev
 
 # Rust
 cargo build --workspace
@@ -78,6 +84,14 @@ sudo apt-get update
 sudo apt-get install -y clang libclang-dev llvm-dev
 ```
 
+If `rollio-encoder` fails to compile with missing `libav*` pkg-config metadata, install the
+development libraries instead of the full `ffmpeg` package:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y pkg-config libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+```
+
 ## Pre-commit hooks (optional)
 
 ```bash
@@ -103,6 +117,37 @@ make smoke-pseudo
 entrypoint using `config/config.example.toml`. The expected checkpoint is that
 the pseudo camera previews and robot status appear in the TUI, and the stack
 shuts down cleanly when you press `Ctrl+C`.
+
+## Sprint 4 Encoder Validation
+
+`rollio-encoder` now supports:
+
+- human-friendly `probe`, with structured output available from `probe --json`
+- CPU-backed `h264`, `h265`, and `av1` video encoding/decoding through native `libav`
+- `rvl` as the one-channel lossless `depth16` backend via `third_party/rvl-rust`
+- bounded queue backpressure reporting on iceoryx2
+
+Focused validation commands:
+
+```bash
+# Human-friendly capability summary
+cargo run -p rollio-encoder -- probe
+
+# Machine-readable capability report
+cargo run -p rollio-encoder -- probe --json
+
+# Encoder tests, including report-only throughput/resource output
+cargo test -p rollio-encoder -- --nocapture
+
+# Optional hardware-specific round-trip tests
+cargo test -p rollio-encoder nvidia_video_codecs_round_trip_when_available -- --ignored --nocapture
+cargo test -p rollio-encoder vaapi_video_codecs_round_trip_when_available -- --ignored --nocapture
+```
+
+The encoder test suite reports benchmark-style metrics such as elapsed time,
+compression ratio, and resident memory. GPU/video-engine metrics remain
+best-effort and host-dependent; the CPU path is always validated, while the
+NVIDIA and VAAPI round-trip tests are capability-gated and ignored by default.
 
 ## Project layout
 

@@ -6,6 +6,8 @@
 namespace rollio {
 
 inline constexpr const char* CONTROL_EVENTS_SERVICE = "control/events";
+inline constexpr const char* VIDEO_READY_SERVICE = "encoder/video-ready";
+inline constexpr const char* BACKPRESSURE_SERVICE = "encoder/backpressure";
 
 inline auto camera_frames_service_name(const std::string& device_name) -> std::string {
     return "camera/" + device_name + "/frames";

@@ -550,9 +550,107 @@ pub enum MappingStrategy {
 // Encoder
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncoderCodec {
+    #[serde(alias = "libx264", alias = "h264_nvenc", alias = "h264_vaapi")]
+    H264,
+    #[serde(alias = "libx265", alias = "hevc_nvenc", alias = "hevc_vaapi")]
+    H265,
+    #[serde(
+        alias = "libsvtav1",
+        alias = "librav1e",
+        alias = "av1_nvenc",
+        alias = "av1_vaapi"
+    )]
+    Av1,
+    Rvl,
+}
+
+impl EncoderCodec {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::H265 => "h265",
+            Self::Av1 => "av1",
+            Self::Rvl => "rvl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncoderBackend {
+    #[default]
+    Auto,
+    Cpu,
+    Nvidia,
+    Vaapi,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncoderArtifactFormat {
+    #[default]
+    Auto,
+    Mp4,
+    Mkv,
+    Rvl,
+}
+
+impl EncoderArtifactFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Auto => "bin",
+            Self::Mp4 => "mp4",
+            Self::Mkv => "mkv",
+            Self::Rvl => "rvl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncoderImplementationFamily {
+    Libav,
+    Rvl,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncoderCapabilityDirection {
+    Encode,
+    Decode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncoderCapability {
+    pub codec: EncoderCodec,
+    pub implementation: EncoderImplementationFamily,
+    pub direction: EncoderCapabilityDirection,
+    pub backend: EncoderBackend,
+    pub pixel_formats: Vec<PixelFormat>,
+    pub artifact_formats: Vec<EncoderArtifactFormat>,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EncoderCapabilityReport {
+    #[serde(default)]
+    pub codecs: Vec<EncoderCapability>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderConfig {
-    pub codec: String,
+    pub codec: EncoderCodec,
+    #[serde(default)]
+    pub backend: EncoderBackend,
+    #[serde(default)]
+    pub artifact_format: EncoderArtifactFormat,
     #[serde(default = "default_queue_size")]
     pub queue_size: u32,
 }
@@ -562,28 +660,164 @@ fn default_queue_size() -> u32 {
 }
 
 impl EncoderConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
-        const KNOWN_CODECS: &[&str] = &[
-            "libx264",
-            "libx265",
-            "h264_nvenc",
-            "hevc_nvenc",
-            "ffv1",
-            "mjpeg",
-        ];
-        if !KNOWN_CODECS.contains(&self.codec.as_str()) {
-            return Err(ConfigError::Validation(format!(
-                "encoder: unknown codec \"{}\", expected one of: {}",
-                self.codec,
-                KNOWN_CODECS.join(", ")
-            )));
+    pub fn resolved_artifact_format(&self) -> EncoderArtifactFormat {
+        if self.artifact_format != EncoderArtifactFormat::Auto {
+            return self.artifact_format;
         }
+
+        match self.codec {
+            EncoderCodec::H264 | EncoderCodec::H265 => EncoderArtifactFormat::Mp4,
+            EncoderCodec::Av1 => EncoderArtifactFormat::Mkv,
+            EncoderCodec::Rvl => EncoderArtifactFormat::Rvl,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
         if self.queue_size == 0 {
             return Err(ConfigError::Validation(
                 "encoder: queue_size must be > 0".into(),
             ));
         }
+        if self.codec == EncoderCodec::Rvl && self.backend == EncoderBackend::Vaapi {
+            return Err(ConfigError::Validation(
+                "encoder: rvl only supports cpu or auto backends".into(),
+            ));
+        }
+        if self.codec == EncoderCodec::Rvl && self.backend == EncoderBackend::Nvidia {
+            return Err(ConfigError::Validation(
+                "encoder: rvl only supports cpu or auto backends".into(),
+            ));
+        }
+
+        match (self.codec, self.resolved_artifact_format()) {
+            (EncoderCodec::Rvl, EncoderArtifactFormat::Rvl)
+            | (EncoderCodec::H264, EncoderArtifactFormat::Mp4)
+            | (EncoderCodec::H265, EncoderArtifactFormat::Mp4)
+            | (EncoderCodec::Av1, EncoderArtifactFormat::Mkv) => {}
+            (EncoderCodec::Rvl, other) => {
+                return Err(ConfigError::Validation(format!(
+                    "encoder: rvl requires artifact_format=rvl, got {:?}",
+                    other
+                )));
+            }
+            (_, EncoderArtifactFormat::Rvl) => {
+                return Err(ConfigError::Validation(
+                    "encoder: artifact_format=rvl requires codec=rvl".into(),
+                ));
+            }
+            (codec, other) => {
+                return Err(ConfigError::Validation(format!(
+                    "encoder: codec {} does not support artifact_format {:?}",
+                    codec.as_str(),
+                    other
+                )));
+            }
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncoderRuntimeConfig {
+    pub process_id: String,
+    #[serde(default)]
+    pub camera_name: Option<String>,
+    #[serde(default)]
+    pub frame_topic: Option<String>,
+    pub output_dir: String,
+    pub codec: EncoderCodec,
+    #[serde(default)]
+    pub backend: EncoderBackend,
+    #[serde(default)]
+    pub artifact_format: EncoderArtifactFormat,
+    #[serde(default = "default_queue_size")]
+    pub queue_size: u32,
+    pub fps: u32,
+}
+
+impl EncoderRuntimeConfig {
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        text.parse()
+    }
+
+    pub fn resolved_artifact_format(&self) -> EncoderArtifactFormat {
+        EncoderConfig {
+            codec: self.codec,
+            backend: self.backend,
+            artifact_format: self.artifact_format,
+            queue_size: self.queue_size,
+        }
+        .resolved_artifact_format()
+    }
+
+    pub fn output_extension(&self) -> &'static str {
+        self.resolved_artifact_format().extension()
+    }
+
+    pub fn output_file_name(&self, episode_index: u32) -> String {
+        let stem = self
+            .process_id
+            .chars()
+            .map(|ch| match ch {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+                _ => '_',
+            })
+            .collect::<String>();
+        format!(
+            "{stem}_episode_{episode_index:06}.{}",
+            self.output_extension()
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.process_id.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "encoder runtime: process_id must not be empty".into(),
+            ));
+        }
+        if self
+            .camera_name
+            .as_deref()
+            .is_none_or(|camera_name| camera_name.trim().is_empty())
+            && self
+                .frame_topic
+                .as_deref()
+                .is_none_or(|frame_topic| frame_topic.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "encoder runtime: either camera_name or frame_topic is required".into(),
+            ));
+        }
+        if self.output_dir.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "encoder runtime: output_dir must not be empty".into(),
+            ));
+        }
+        if self.fps == 0 || self.fps > 1000 {
+            return Err(ConfigError::Validation(format!(
+                "encoder runtime: fps must be 1..1000, got {}",
+                self.fps
+            )));
+        }
+
+        EncoderConfig {
+            codec: self.codec,
+            backend: self.backend,
+            artifact_format: self.artifact_format,
+            queue_size: self.queue_size,
+        }
+        .validate()
+    }
+}
+
+impl FromStr for EncoderRuntimeConfig {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: EncoderRuntimeConfig = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
     }
 }
 

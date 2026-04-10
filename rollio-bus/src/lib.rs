@@ -1,4 +1,6 @@
 pub const CONTROL_EVENTS_SERVICE: &str = "control/events";
+pub const VIDEO_READY_SERVICE: &str = "encoder/video-ready";
+pub const BACKPRESSURE_SERVICE: &str = "encoder/backpressure";
 
 pub fn camera_frames_service_name(device_name: &str) -> String {
     format!("camera/{device_name}/frames")

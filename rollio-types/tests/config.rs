@@ -10,7 +10,12 @@ fn parse_example_config() {
     assert_eq!(config.pairing.len(), 1);
     assert_eq!(config.episode.fps, 30);
     assert_eq!(config.episode.format, EpisodeFormat::LeRobotV2_1);
-    assert_eq!(config.encoder.codec, "libx264");
+    assert_eq!(config.encoder.codec, EncoderCodec::H264);
+    assert_eq!(config.encoder.backend, EncoderBackend::Auto);
+    assert_eq!(
+        config.encoder.resolved_artifact_format(),
+        EncoderArtifactFormat::Mp4
+    );
     assert_eq!(config.storage.backend, StorageBackend::Local);
     assert_eq!(config.visualizer.port, 9090);
     assert_eq!(config.controller.shutdown_timeout_ms, 3000);
@@ -45,7 +50,7 @@ fn parse_hardware_example_config() {
 
     let robot = config.device_named("airbot_leader").unwrap();
     assert_eq!(robot.driver, "airbot-play");
-    assert_eq!(robot.id, "airbot_sn_here");
+    assert_eq!(robot.id, "PZ25C02402000244");
     assert_eq!(robot.mode, Some(RobotMode::FreeDrive));
     assert_eq!(robot.transport.as_deref(), Some("can"));
     assert_eq!(robot.interface.as_deref(), Some("can0"));
@@ -231,6 +236,75 @@ metrics_frequency_hz = 1.0
     assert!(
         msg.contains("nonexistent"),
         "error should name the bad codec: {msg}"
+    );
+}
+
+#[test]
+fn encoder_runtime_config_accepts_camera_name_only() {
+    let toml_text = r#"
+process_id = "encoder.camera_top"
+camera_name = "camera_top"
+output_dir = "./out"
+codec = "rvl"
+fps = 30
+"#;
+    let config = EncoderRuntimeConfig::from_str(toml_text).expect("runtime config should parse");
+    assert_eq!(config.codec, EncoderCodec::Rvl);
+    assert_eq!(config.backend, EncoderBackend::Auto);
+    assert_eq!(
+        config.resolved_artifact_format(),
+        EncoderArtifactFormat::Rvl
+    );
+    assert_eq!(
+        config.output_file_name(7),
+        "encoder_camera_top_episode_000007.rvl"
+    );
+}
+
+#[test]
+fn encoder_runtime_config_requires_camera_or_topic() {
+    let toml_text = r#"
+process_id = "encoder.camera_top"
+output_dir = "./out"
+codec = "h264"
+fps = 30
+"#;
+    let err = EncoderRuntimeConfig::from_str(toml_text).expect_err("config should be rejected");
+    assert!(
+        err.to_string().contains("camera_name or frame_topic"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn encoder_config_rejects_rvl_with_mp4_artifact_format() {
+    let toml_text = r#"
+[episode]
+format = "lerobot-v2.1"
+fps = 30
+
+[[devices]]
+name = "cam"
+type = "camera"
+driver = "pseudo"
+id = "c0"
+width = 640
+height = 480
+fps = 30
+pixel_format = "depth16"
+
+[encoder]
+codec = "rvl"
+artifact_format = "mp4"
+
+[storage]
+backend = "local"
+output_path = "./out"
+"#;
+    let err = Config::from_str(toml_text).expect_err("rvl+mp4 should be rejected");
+    assert!(
+        err.to_string().contains("rvl requires artifact_format=rvl"),
+        "unexpected error: {err}"
     );
 }
 
