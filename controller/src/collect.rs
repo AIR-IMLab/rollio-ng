@@ -1,14 +1,13 @@
 use crate::cli::CollectArgs;
 use crate::episode::EpisodeLifecycle;
 use crate::process::{
-    poll_children_once, spawn_child, terminate_children, ChildSpec, ManagedChild, ResolvedCommand,
-    ShutdownTrigger,
+    ChildSpec, ManagedChild, ResolvedCommand, ShutdownTrigger, poll_children_once, spawn_child,
+    terminate_children,
 };
 use iceoryx2::prelude::*;
 use rollio_bus::{
-    robot_command_service_name, robot_state_service_name, BACKPRESSURE_SERVICE,
-    CONTROL_EVENTS_SERVICE, EPISODE_COMMAND_SERVICE, EPISODE_STATUS_SERVICE,
-    EPISODE_STORED_SERVICE,
+    BACKPRESSURE_SERVICE, CONTROL_EVENTS_SERVICE, EPISODE_COMMAND_SERVICE, EPISODE_STATUS_SERVICE,
+    EPISODE_STORED_SERVICE, robot_command_service_name, robot_state_service_name,
 };
 use rollio_types::config::{
     AssemblerRuntimeConfig, Config, DeviceConfig, DeviceType, EncoderRuntimeConfig,
@@ -21,8 +20,8 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::error::Error;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -229,38 +228,37 @@ fn build_collect_specs(
     )?);
 
     let ui_runtime_config = config.ui_runtime_config();
-    let ui_entrypoint = workspace_root.join("ui/terminal/dist/index.js");
-    if !ui_entrypoint.exists() {
+    let web_bundle_dir = workspace_root.join("ui/web/dist");
+    let web_index = web_bundle_dir.join("index.html");
+    if !web_index.exists() {
         return Err(format!(
-            "UI bundle not found at {}. Run `cd ui/terminal && npm run build` first.",
-            ui_entrypoint.display()
+            "Web UI bundle not found at {}. Run `cd ui/web && npm run build` first.",
+            web_index.display()
         )
         .into());
     }
 
-    let websocket_url = ui_runtime_config
+    ui_runtime_config
         .websocket_url
+        .as_ref()
         .ok_or("ui runtime config did not produce a websocket url")?;
+    eprintln!(
+        "rollio: web ui available at {}",
+        ui_browser_url(&ui_runtime_config.http_host, ui_runtime_config.http_port)
+    );
     specs.push(ChildSpec {
         id: "ui".into(),
         command: ResolvedCommand {
-            program: OsString::from("node"),
+            program: resolve_program(current_exe_dir.join("rollio-ui-server"), "rollio-ui-server"),
             args: vec![
-                ui_entrypoint.into_os_string(),
-                OsString::from("--ws"),
-                OsString::from(websocket_url),
-                OsString::from("--start-key"),
-                OsString::from(ui_runtime_config.start_key),
-                OsString::from("--stop-key"),
-                OsString::from(ui_runtime_config.stop_key),
-                OsString::from("--keep-key"),
-                OsString::from(ui_runtime_config.keep_key),
-                OsString::from("--discard-key"),
-                OsString::from(ui_runtime_config.discard_key),
+                OsString::from("--config-inline"),
+                OsString::from(toml::to_string(&ui_runtime_config)?),
+                OsString::from("--asset-dir"),
+                web_bundle_dir.into_os_string(),
             ],
         },
         working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: true,
+        inherit_stdio: false,
     });
 
     Ok(specs)
@@ -509,6 +507,14 @@ fn resolve_program(local_candidate: PathBuf, fallback_name: &str) -> OsString {
     }
 }
 
+fn ui_browser_url(host: &str, port: u16) -> String {
+    let display_host = match host {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        _ => host,
+    };
+    format!("http://{display_host}:{port}")
+}
+
 fn driver_dir_name(driver: &str) -> String {
     driver.replace('-', "_")
 }
@@ -654,7 +660,7 @@ impl ControllerIpc {
 mod tests {
     use super::*;
     use rollio_types::config::Config;
-    use rollio_types::messages::{FixedString256, FixedString64};
+    use rollio_types::messages::{FixedString64, FixedString256};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -767,12 +773,15 @@ mod tests {
         let workspace_root = temp_workspace_root();
         let staging_root = workspace_root.join("staging");
         config.assembler.staging_dir = staging_root.to_string_lossy().into_owned();
-        create_fake_ui_bundle(&workspace_root);
+        create_fake_web_bundle(&workspace_root);
 
-        let specs =
-            build_collect_specs(&config, &workspace_root, Path::new(".")).expect("specs should build");
+        let specs = build_collect_specs(&config, &workspace_root, Path::new("."))
+            .expect("specs should build");
 
-        let ids = specs.iter().map(|spec| spec.id.as_str()).collect::<Vec<_>>();
+        let ids = specs
+            .iter()
+            .map(|spec| spec.id.as_str())
+            .collect::<Vec<_>>();
         assert!(ids.contains(&"encoder-camera_top"));
         assert!(ids.contains(&"encoder-camera_side"));
         assert!(ids.contains(&"assembler"));
@@ -810,6 +819,18 @@ mod tests {
         let storage_inline = storage_spec.command.args[2].to_string_lossy();
         assert!(storage_inline.contains("process_id = \"storage\""));
 
+        let ui_spec = specs
+            .iter()
+            .find(|spec| spec.id == "ui")
+            .expect("ui spec should exist");
+        assert_eq!(ui_spec.command.program, OsString::from("rollio-ui-server"));
+        assert_eq!(ui_spec.command.args[0], OsString::from("--config-inline"));
+        assert_eq!(ui_spec.command.args[2], OsString::from("--asset-dir"));
+        assert_eq!(
+            ui_spec.command.args[3],
+            workspace_root.join("ui/web/dist").into_os_string()
+        );
+
         let _ = fs::remove_dir_all(workspace_root);
     }
 
@@ -820,7 +841,11 @@ mod tests {
         let mut start_blocked = false;
         let (start_events, changed) = collect_control_events(
             &mut lifecycle,
-            vec![EpisodeCommand::Start, EpisodeCommand::Stop, EpisodeCommand::Keep],
+            vec![
+                EpisodeCommand::Start,
+                EpisodeCommand::Stop,
+                EpisodeCommand::Keep,
+            ],
             &mut start_blocked,
             now,
         );
@@ -883,10 +908,13 @@ mod tests {
         root
     }
 
-    fn create_fake_ui_bundle(workspace_root: &Path) {
-        let ui_dir = workspace_root.join("ui/terminal/dist");
+    fn create_fake_web_bundle(workspace_root: &Path) {
+        let ui_dir = workspace_root.join("ui/web/dist");
         fs::create_dir_all(&ui_dir).expect("ui dist dir should exist");
-        fs::write(ui_dir.join("index.js"), "process.exit(0);\n")
-            .expect("fake ui bundle should be written");
+        fs::write(
+            ui_dir.join("index.html"),
+            "<!doctype html>\n<title>Rollio UI</title>\n",
+        )
+        .expect("fake ui bundle should be written");
     }
 }

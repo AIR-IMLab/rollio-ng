@@ -659,7 +659,10 @@ mod tests {
                 .await?;
 
                 let targets = client.targets.lock().expect("targets lock poisoned");
-                assert!(targets.is_empty(), "cartesian commands should not use joint API");
+                assert!(
+                    targets.is_empty(),
+                    "cartesian commands should not use joint API"
+                );
                 drop(targets);
 
                 let task_targets = client

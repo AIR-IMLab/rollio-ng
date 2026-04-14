@@ -5,7 +5,8 @@ use std::str::FromStr;
 #[test]
 fn parse_d435i_v4l2_airbot_play_eef_sprint5_config() {
     let toml_text = include_str!("../../config/config.d435i-v4l2-airbot-play-eef.sprint5.toml");
-    let config = Config::from_str(toml_text).expect("mixed d435i + v4l2 sprint5 config should parse");
+    let config =
+        Config::from_str(toml_text).expect("mixed d435i + v4l2 sprint5 config should parse");
 
     assert_eq!(config.devices.len(), 6);
     assert_eq!(config.pairing.len(), 2);

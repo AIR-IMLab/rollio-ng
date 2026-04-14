@@ -11,6 +11,8 @@ ui/terminal/node_modules/
 ui/terminal/dist/
 ui/terminal/wasm/
 ui/terminal/native/
+ui/web/node_modules/
+ui/web/dist/
 
 # Editor
 .vscode/
@@ -23,3 +25,4 @@ external/reference
 .understand-anything/
 *.STL
 logs/
+output/

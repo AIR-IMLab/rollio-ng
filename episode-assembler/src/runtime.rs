@@ -86,7 +86,12 @@ impl EpisodeManager {
         let camera_by_process_id = config
             .cameras
             .iter()
-            .map(|camera| (camera.encoder_process_id.clone(), camera.camera_name.clone()))
+            .map(|camera| {
+                (
+                    camera.encoder_process_id.clone(),
+                    camera.camera_name.clone(),
+                )
+            })
             .collect();
         Self {
             config,
@@ -209,7 +214,10 @@ impl EpisodeManager {
     fn ready_and_timed_out_episode_indices(&self, now_ns: u64) -> (Vec<u32>, Vec<u32>) {
         let mut ready = Vec::new();
         let mut timed_out = Vec::new();
-        let timeout_ns = self.config.missing_video_timeout_ms.saturating_mul(1_000_000);
+        let timeout_ns = self
+            .config
+            .missing_video_timeout_ms
+            .saturating_mul(1_000_000);
 
         for (episode_index, episode) in &self.episodes {
             if !episode.keep_requested || episode.stop_time_ns.is_none() {
@@ -341,8 +349,7 @@ fn create_control_subscriber(
 
 fn create_video_ready_subscriber(
     node: &Node<ipc::Service>,
-) -> Result<iceoryx2::port::subscriber::Subscriber<ipc::Service, VideoReady, ()>, Box<dyn Error>>
-{
+) -> Result<iceoryx2::port::subscriber::Subscriber<ipc::Service, VideoReady, ()>, Box<dyn Error>> {
     let service_name: ServiceName = VIDEO_READY_SERVICE.try_into()?;
     let service = node
         .service_builder(&service_name)
@@ -353,8 +360,7 @@ fn create_video_ready_subscriber(
 
 fn create_episode_ready_publisher(
     node: &Node<ipc::Service>,
-) -> Result<iceoryx2::port::publisher::Publisher<ipc::Service, EpisodeReady, ()>, Box<dyn Error>>
-{
+) -> Result<iceoryx2::port::publisher::Publisher<ipc::Service, EpisodeReady, ()>, Box<dyn Error>> {
     let service_name: ServiceName = EPISODE_READY_SERVICE.try_into()?;
     let service = node
         .service_builder(&service_name)
@@ -443,7 +449,11 @@ fn drain_robot_states(
             let Some(sample) = robot.subscriber.receive()? else {
                 break;
             };
-            manager.on_robot_state(&robot.config.robot_name, robot.config.dof, *sample.payload());
+            manager.on_robot_state(
+                &robot.config.robot_name,
+                robot.config.dof,
+                *sample.payload(),
+            );
             changed = true;
         }
     }
@@ -460,7 +470,11 @@ fn drain_action_commands(
             let Some(sample) = action.subscriber.receive()? else {
                 break;
             };
-            manager.on_action_command(&action.config.source_name, action.config.dof, *sample.payload());
+            manager.on_action_command(
+                &action.config.source_name,
+                action.config.dof,
+                *sample.payload(),
+            );
             changed = true;
         }
     }
@@ -495,7 +509,9 @@ mod tests {
             RobotState {
                 timestamp_ns: 10,
                 num_joints: 6,
-                positions: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                positions: [
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
                 velocities: [0.1; 16],
                 efforts: [0.2; 16],
                 ..RobotState::default()
@@ -508,7 +524,9 @@ mod tests {
                 timestamp_ns: 12,
                 mode: CommandMode::Joint,
                 num_joints: 6,
-                joint_targets: [0.5, 0.4, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                joint_targets: [
+                    0.5, 0.4, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
                 ..RobotCommand::default()
             },
         );
@@ -523,7 +541,10 @@ mod tests {
     #[test]
     fn manager_discards_episode_and_artifacts() {
         let mut manager = EpisodeManager::new(test_config());
-        let temp_file = std::env::temp_dir().join(format!("rollio-assembler-runtime-{}.mp4", unix_timestamp_ns()));
+        let temp_file = std::env::temp_dir().join(format!(
+            "rollio-assembler-runtime-{}.mp4",
+            unix_timestamp_ns()
+        ));
         fs::write(&temp_file, b"video").expect("temp video should exist");
 
         manager.on_control_event(ControlEvent::RecordingStart { episode_index: 2 });

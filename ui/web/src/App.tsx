@@ -1,0 +1,308 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CameraGrid } from "./components/CameraGrid";
+import { DebugPanel } from "./components/DebugPanel";
+import { InfoPanel } from "./components/InfoPanel";
+import { RobotStatePanel } from "./components/RobotStatePanel";
+import { StatusBar } from "./components/StatusBar";
+import { TitleBar } from "./components/TitleBar";
+import { resolveCameraNames } from "./lib/camera-layout";
+import { actionForInput } from "./lib/controls";
+import {
+  nowMs,
+  recordTiming,
+  setGauge,
+  snapshotDebugMetrics,
+  type DebugSnapshot,
+} from "./lib/debug-metrics";
+import {
+  buildPreviewNegotiationKey,
+  isWideLayout,
+  negotiatePreviewDimensions,
+  type PreviewDimensions,
+} from "./lib/layout";
+import { encodeEpisodeCommand, encodeSetPreviewSize } from "./lib/protocol";
+import type { UiRuntimeConfig } from "./lib/runtime-config";
+import { useWebSocket, type UseWebSocketOptions } from "./lib/websocket";
+
+type AppProps = {
+  runtimeConfig: UiRuntimeConfig;
+  webSocketOptions?: UseWebSocketOptions;
+};
+
+type ViewportSize = {
+  width: number;
+  height: number;
+};
+
+function useViewportSize(): ViewportSize {
+  const [size, setSize] = useState<ViewportSize>(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  }));
+
+  useEffect(() => {
+    const onResize = () => {
+      setSize({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      });
+    };
+
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+    };
+  }, []);
+
+  return size;
+}
+
+function shouldIgnoreKeydown(event: KeyboardEvent): boolean {
+  if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) {
+    return true;
+  }
+
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  const tagName = target.tagName.toLowerCase();
+  return (
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select" ||
+    target.isContentEditable
+  );
+}
+
+function fallbackPreviewTileSize(
+  viewport: ViewportSize,
+  cameraCount: number,
+  wideLayout: boolean,
+): PreviewDimensions {
+  const safeCameraCount = Math.max(1, cameraCount);
+  const horizontalPadding = wideLayout ? 420 : 64;
+  const verticalBudget = wideLayout ? viewport.height * 0.28 : viewport.height * 0.22;
+  return {
+    width: Math.max(160, Math.floor((viewport.width - horizontalPadding) / safeCameraCount)),
+    height: Math.max(120, Math.floor(verticalBudget)),
+  };
+}
+
+export default function App({ runtimeConfig, webSocketOptions }: AppProps) {
+  const renderStartMs = nowMs();
+  const viewport = useViewportSize();
+  const wideLayout = isWideLayout(viewport.width);
+  const { frames, robotStates, streamInfo, episodeStatus, connected, send } = useWebSocket(
+    runtimeConfig.websocketUrl,
+    webSocketOptions,
+  );
+  const [showDebug, setShowDebug] = useState(false);
+  const [previewTileSize, setPreviewTileSize] = useState<PreviewDimensions | null>(null);
+  const lastPreviewNegotiationKeyRef = useRef<string | null>(null);
+  const [debugSnapshot, setDebugSnapshot] = useState<DebugSnapshot>(() =>
+    snapshotDebugMetrics(),
+  );
+
+  const cameraNames = Array.from(frames.keys());
+  const configuredCameraNames = streamInfo?.cameras.map((camera) => camera.name) ?? [];
+  const resolvedCameraNames = useMemo(
+    () => resolveCameraNames(configuredCameraNames, cameraNames),
+    [cameraNames, configuredCameraNames],
+  );
+  const cameraData = useMemo(
+    () => resolvedCameraNames.map((name) => ({ name, frame: frames.get(name) })),
+    [frames, resolvedCameraNames],
+  );
+  const robotEntries = Array.from(robotStates.entries());
+  const effectiveEpisodeStatus = episodeStatus ?? {
+    type: "episode_status" as const,
+    state: "idle" as const,
+    episode_count: 0,
+    elapsed_ms: 0,
+  };
+  const health = connected ? ("normal" as const) : ("degraded" as const);
+  const requestedPreviewTileSize =
+    previewTileSize ??
+    fallbackPreviewTileSize(viewport, resolvedCameraNames.length, wideLayout);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (shouldIgnoreKeydown(event) || event.key.length !== 1) {
+        return;
+      }
+
+      const action = actionForInput(event.key, runtimeConfig.episodeKeyBindings);
+      if (action == null) {
+        return;
+      }
+
+      event.preventDefault();
+      if (action === "toggle_debug") {
+        setShowDebug((previous) => !previous);
+        return;
+      }
+
+      send(encodeEpisodeCommand(action));
+      setGauge("ui.last_episode_command", action);
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [runtimeConfig.episodeKeyBindings, send]);
+
+  const handlePreviewSizeChange = useCallback((size: PreviewDimensions) => {
+    setPreviewTileSize(size);
+  }, []);
+
+  useEffect(() => {
+    if (!connected) {
+      lastPreviewNegotiationKeyRef.current = null;
+      return;
+    }
+
+    const negotiatedSize = negotiatePreviewDimensions(
+      requestedPreviewTileSize,
+      window.devicePixelRatio || 1,
+    );
+    const negotiationKey = buildPreviewNegotiationKey(
+      viewport.width,
+      viewport.height,
+      negotiatedSize,
+    );
+    if (lastPreviewNegotiationKeyRef.current === negotiationKey) {
+      return;
+    }
+
+    const delayMs = lastPreviewNegotiationKeyRef.current === null ? 0 : 75;
+    const timer = window.setTimeout(() => {
+      send(encodeSetPreviewSize(negotiatedSize.width, negotiatedSize.height));
+      lastPreviewNegotiationKeyRef.current = negotiationKey;
+      setGauge("ui.preview_request", `${negotiatedSize.width}x${negotiatedSize.height}`);
+      setGauge("ui.preview_target", `${negotiatedSize.width}x${negotiatedSize.height}`);
+    }, delayMs);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [connected, requestedPreviewTileSize, send, viewport.height, viewport.width]);
+
+  useEffect(() => {
+    setGauge(
+      "ui.layout",
+      `${viewport.width}x${viewport.height} ${wideLayout ? "wide" : "narrow"}`,
+    );
+    setGauge("ui.robot_count", robotStates.size);
+    setGauge("ui.debug_enabled", showDebug ? "On" : "Off");
+    setGauge("ui.episode_state", effectiveEpisodeStatus.state);
+    setGauge("ui.episode_count", effectiveEpisodeStatus.episode_count);
+    setGauge("ui.episode_elapsed_ms", effectiveEpisodeStatus.elapsed_ms);
+    setGauge("ui.stream_info_available", streamInfo ? "Ready" : "Waiting");
+    setGauge(
+      "ui.preview_active",
+      streamInfo
+        ? `${streamInfo.active_preview_width}x${streamInfo.active_preview_height}`
+        : "Waiting",
+    );
+  }, [
+    effectiveEpisodeStatus.elapsed_ms,
+    effectiveEpisodeStatus.episode_count,
+    effectiveEpisodeStatus.state,
+    robotStates.size,
+    showDebug,
+    streamInfo,
+    viewport.height,
+    viewport.width,
+    wideLayout,
+  ]);
+
+  useEffect(() => {
+    if (!showDebug) {
+      return;
+    }
+    setDebugSnapshot(snapshotDebugMetrics());
+    const interval = window.setInterval(() => {
+      setDebugSnapshot(snapshotDebugMetrics());
+    }, 250);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [showDebug]);
+
+  const renderDurationMs = nowMs() - renderStartMs;
+  useEffect(() => {
+    recordTiming("app.render", renderDurationMs);
+  });
+
+  return (
+    <div className="app-shell">
+      <TitleBar mode="Collect" />
+
+      <main className="app-main">
+        <section
+          className={`camera-layout ${wideLayout ? "camera-layout--wide" : "camera-layout--narrow"}`}
+        >
+          <div className="camera-layout__primary">
+            <CameraGrid cameras={cameraData} onPreviewSizeChange={handlePreviewSizeChange} />
+          </div>
+          {wideLayout ? (
+            <div className="camera-layout__sidebar">
+              <InfoPanel
+                connected={connected}
+                frames={frames}
+                orientation="vertical"
+                robotStates={robotStates}
+                streamInfo={streamInfo}
+              />
+            </div>
+          ) : null}
+        </section>
+
+        <section className="robot-panels">
+          {robotEntries.length > 0 ? (
+            robotEntries.map(([name, state]) => (
+              <RobotStatePanel
+                key={name}
+                endEffectorFeedbackValid={state.end_effector_feedback_valid}
+                endEffectorStatus={state.end_effector_status}
+                name={name}
+                numJoints={state.num_joints}
+                positions={state.positions}
+              />
+            ))
+          ) : (
+            <RobotStatePanel name="robot_0" numJoints={0} positions={[]} />
+          )}
+        </section>
+
+        {!wideLayout ? (
+          <InfoPanel
+            connected={connected}
+            frames={frames}
+            orientation="horizontal"
+            robotStates={robotStates}
+            streamInfo={streamInfo}
+          />
+        ) : null}
+
+        {showDebug ? (
+          <DebugPanel snapshot={debugSnapshot} streamInfo={streamInfo} />
+        ) : null}
+      </main>
+
+      <StatusBar
+        connected={connected}
+        debugEnabled={showDebug}
+        elapsedMs={effectiveEpisodeStatus.elapsed_ms}
+        episodeCount={effectiveEpisodeStatus.episode_count}
+        episodeKeyBindings={runtimeConfig.episodeKeyBindings}
+        health={health}
+        mode="Collect"
+        state={effectiveEpisodeStatus.state}
+      />
+    </div>
+  );
+}

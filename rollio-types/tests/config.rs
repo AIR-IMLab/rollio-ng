@@ -35,11 +35,16 @@ fn parse_example_config() {
     assert_eq!(config.ui.stop_key, "e");
     assert_eq!(config.ui.keep_key, "k");
     assert_eq!(config.ui.discard_key, "x");
+    assert_eq!(config.ui.http_host, "127.0.0.1");
+    assert_eq!(config.ui.http_port, 3000);
 
     let encoder_configs = config.encoder_runtime_configs();
     assert_eq!(encoder_configs.len(), 2);
     assert_eq!(encoder_configs[0].process_id, "encoder.camera_top");
-    assert_eq!(encoder_configs[0].camera_name.as_deref(), Some("camera_top"));
+    assert_eq!(
+        encoder_configs[0].camera_name.as_deref(),
+        Some("camera_top")
+    );
     assert_eq!(
         encoder_configs[0].frame_topic.as_deref(),
         Some("camera/camera_top/frames")
@@ -107,8 +112,14 @@ fn parse_airbot_pseudo_direct_joint_config() {
     let config = Config::from_str(toml_text).expect("airbot pseudo config should parse");
     assert_eq!(config.devices.len(), 3);
     assert_eq!(config.pairing.len(), 1);
-    assert_eq!(config.device_named("airbot_leader").unwrap().driver, "airbot-play");
-    assert_eq!(config.device_named("pseudo_follower").unwrap().driver, "pseudo");
+    assert_eq!(
+        config.device_named("airbot_leader").unwrap().driver,
+        "airbot-play"
+    );
+    assert_eq!(
+        config.device_named("pseudo_follower").unwrap().driver,
+        "pseudo"
+    );
 }
 
 #[test]
@@ -612,9 +623,7 @@ fn airbot_family_direct_joint_pairing_accepts_supported_matrix_entries() {
             follower_dof,
         );
         Config::from_str(&toml_text).unwrap_or_else(|err| {
-            panic!(
-                "expected {leader_driver} -> {follower_driver} to be accepted, got {err}"
-            )
+            panic!("expected {leader_driver} -> {follower_driver} to be accepted, got {err}")
         });
     }
 }
@@ -633,7 +642,8 @@ fn airbot_family_direct_joint_pairing_rejects_unsupported_matrix_entries() {
         );
         let err = Config::from_str(&toml_text).expect_err("pairing should be rejected");
         assert!(
-            err.to_string().contains("direct-joint mapping is not supported"),
+            err.to_string()
+                .contains("direct-joint mapping is not supported"),
             "unexpected error for {leader_driver} -> {follower_driver}: {err}"
         );
     }
@@ -651,6 +661,25 @@ discard_key = "x"
     let err = UiRuntimeConfig::from_str(toml_text).expect_err("reserved UI key should fail");
     assert!(
         err.to_string().contains("reserved UI shortcut"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn ui_http_port_must_be_positive() {
+    let toml_text = r#"
+websocket_url = "ws://127.0.0.1:9090"
+http_host = "127.0.0.1"
+http_port = 0
+start_key = "s"
+stop_key = "e"
+keep_key = "k"
+discard_key = "x"
+"#;
+    let err = UiRuntimeConfig::from_str(toml_text).expect_err("invalid http port should fail");
+    assert!(
+        err.to_string()
+            .contains("http_port must be greater than zero"),
         "unexpected error: {err}"
     );
 }

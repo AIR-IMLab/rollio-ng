@@ -1,4 +1,4 @@
-use crate::messages::{PixelFormat, MAX_JOINTS};
+use crate::messages::{MAX_JOINTS, PixelFormat};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -1658,6 +1658,10 @@ impl FromStr for VisualizerRuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiRuntimeConfig {
     pub websocket_url: Option<String>,
+    #[serde(default = "default_ui_http_host")]
+    pub http_host: String,
+    #[serde(default = "default_ui_http_port")]
+    pub http_port: u16,
     #[serde(default = "default_ui_start_key")]
     pub start_key: String,
     #[serde(default = "default_ui_stop_key")]
@@ -1666,6 +1670,14 @@ pub struct UiRuntimeConfig {
     pub keep_key: String,
     #[serde(default = "default_ui_discard_key")]
     pub discard_key: String,
+}
+
+fn default_ui_http_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_ui_http_port() -> u16 {
+    3000
 }
 
 fn default_ui_start_key() -> String {
@@ -1688,6 +1700,8 @@ impl Default for UiRuntimeConfig {
     fn default() -> Self {
         Self {
             websocket_url: None,
+            http_host: default_ui_http_host(),
+            http_port: default_ui_http_port(),
             start_key: default_ui_start_key(),
             stop_key: default_ui_stop_key(),
             keep_key: default_ui_keep_key(),
@@ -1704,6 +1718,17 @@ impl UiRuntimeConfig {
                     "ui: websocket_url must not be empty".into(),
                 ));
             }
+        }
+
+        if self.http_host.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "ui: http_host must not be empty".into(),
+            ));
+        }
+        if self.http_port == 0 {
+            return Err(ConfigError::Validation(
+                "ui: http_port must be greater than zero".into(),
+            ));
         }
 
         let mut seen = HashSet::new();

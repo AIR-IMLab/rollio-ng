@@ -21,6 +21,7 @@ clean:
 	rm -rf cameras/build
 	rm -rf ui/terminal/dist
 	rm -rf ui/terminal/native
+	rm -rf ui/web/dist
 
 fmt: rust-fmt
 
@@ -59,12 +60,15 @@ ui: ui-build
 
 ui-install:
 	cd ui/terminal && npm install
+	cd ui/web && npm install
 
 ui-build: ui-install
 	cd ui/terminal && npm run build
+	cd ui/web && npm run build
 
 ui-test: ui-install
 	cd ui/terminal && npm test
+	cd ui/web && npm test
 
 ui-bench-ascii: ui-install
 	cd ui/terminal && npm run bench:ascii

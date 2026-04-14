@@ -195,8 +195,7 @@ fn create_episode_ready_subscriber(
 
 fn create_episode_stored_publisher(
     node: &Node<ipc::Service>,
-) -> Result<iceoryx2::port::publisher::Publisher<ipc::Service, EpisodeStored, ()>, Box<dyn Error>>
-{
+) -> Result<iceoryx2::port::publisher::Publisher<ipc::Service, EpisodeStored, ()>, Box<dyn Error>> {
     let service_name: ServiceName = EPISODE_STORED_SERVICE.try_into()?;
     let service = node
         .service_builder(&service_name)
@@ -281,7 +280,10 @@ fn store_episode_local(
 
     let staged_info = read_dataset_info(&request.staging_dir.join("meta/info.json"))?;
     merge_tree_if_present(&request.staging_dir.join("data"), &output_root.join("data"))?;
-    merge_tree_if_present(&request.staging_dir.join("videos"), &output_root.join("videos"))?;
+    merge_tree_if_present(
+        &request.staging_dir.join("videos"),
+        &output_root.join("videos"),
+    )?;
     merge_meta_jsonl_if_present(
         &request.staging_dir.join("meta/tasks.jsonl"),
         &output_root.join("meta/tasks.jsonl"),
@@ -395,7 +397,10 @@ fn merge_meta_jsonl_if_present(
         fs::write(destination, contents)?;
         return Ok(());
     }
-    let mut output = File::options().create(true).append(true).open(destination)?;
+    let mut output = File::options()
+        .create(true)
+        .append(true)
+        .open(destination)?;
     output.write_all(&contents)?;
     Ok(())
 }
@@ -429,12 +434,14 @@ mod tests {
         let output = store_episode_local(&config, &request).expect("episode should store");
         assert_eq!(output, root);
         assert!(root.join("data/chunk-000/episode_000000.parquet").exists());
-        assert!(
-            root.join("videos/chunk-000/camera_top/episode_000000.mp4")
-                .exists()
-        );
+        assert!(root
+            .join("videos/chunk-000/camera_top/episode_000000.mp4")
+            .exists());
         assert!(root.join("meta/info.json").exists());
-        assert!(!staging.exists(), "staging dir should be removed after store");
+        assert!(
+            !staging.exists(),
+            "staging dir should be removed after store"
+        );
 
         let info = read_dataset_info(&root.join("meta/info.json")).expect("info should parse");
         assert_eq!(info.total_episodes, 1);
@@ -475,7 +482,9 @@ mod tests {
         };
 
         assert!(try_enqueue_request(&sender, first).expect("first request should queue"));
-        assert!(!try_enqueue_request(&sender, second).expect("second request should hit backpressure"));
+        assert!(
+            !try_enqueue_request(&sender, second).expect("second request should hit backpressure")
+        );
         drop(receiver);
     }
 
@@ -491,7 +500,9 @@ mod tests {
 
     fn write_staged_episode(root: PathBuf, episode_index: u32, frame_count: u64) -> PathBuf {
         let data_path = root.join(format!("data/chunk-000/episode_{episode_index:06}.parquet"));
-        let video_path = root.join(format!("videos/chunk-000/camera_top/episode_{episode_index:06}.mp4"));
+        let video_path = root.join(format!(
+            "videos/chunk-000/camera_top/episode_{episode_index:06}.mp4"
+        ));
         let meta_path = root.join("meta");
         fs::create_dir_all(data_path.parent().unwrap()).expect("data dir should exist");
         fs::create_dir_all(video_path.parent().unwrap()).expect("video dir should exist");

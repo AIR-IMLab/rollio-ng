@@ -4,7 +4,7 @@ use rollio_types::config::Config;
 use rollio_types::messages::EpisodeCommand;
 use std::error::Error;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -17,7 +17,7 @@ struct EpisodeCommandPublisher {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "requires built workspace binaries, cameras/build pseudo driver, and ui/terminal/dist"]
+#[ignore = "requires built workspace binaries, cameras/build pseudo driver, and ui/web/dist"]
 fn collect_pseudo_pipeline_smoke() -> Result<(), Box<dyn Error>> {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -29,9 +29,6 @@ fn collect_pseudo_pipeline_smoke() -> Result<(), Box<dyn Error>> {
     let temp_root = unique_temp_dir("rollio-collect-smoke");
     let output_root = temp_root.join("output");
     let staging_root = temp_root.join("staging");
-    let fake_bin_dir = temp_root.join("fake-bin");
-    fs::create_dir_all(&fake_bin_dir)?;
-    write_fake_node(&fake_bin_dir.join("node"))?;
 
     let mut config = include_str!("../../config/config.pseudo-teleop.toml")
         .parse::<Config>()
@@ -39,24 +36,22 @@ fn collect_pseudo_pipeline_smoke() -> Result<(), Box<dyn Error>> {
     config.storage.output_path = Some(output_root.to_string_lossy().into_owned());
     config.assembler.staging_dir = staging_root.to_string_lossy().into_owned();
     config.visualizer.port = reserve_port()?;
+    config.ui.http_host = "127.0.0.1".into();
+    config.ui.http_port = reserve_port()?;
+    let ui_runtime = config.ui_runtime_config();
     let config_inline = toml::to_string(&config)?;
-
-    let path_env = format!(
-        "{}:{}",
-        fake_bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_rollio"))
         .arg("collect")
         .arg("--config-inline")
         .arg(config_inline)
         .current_dir(&workspace_root)
-        .env("PATH", path_env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    wait_for_ui_runtime_config(ui_runtime.http_port, Duration::from_secs(10))?;
 
     let publisher = create_episode_command_publisher()?;
     thread::sleep(Duration::from_secs(2));
@@ -82,7 +77,10 @@ fn collect_pseudo_pipeline_smoke() -> Result<(), Box<dyn Error>> {
 
     send_sigint(child.id());
     let status = child.wait()?;
-    assert!(status.success(), "controller should exit cleanly, got {status}");
+    assert!(
+        status.success(),
+        "controller should exit cleanly, got {status}"
+    );
 
     let _ = fs::remove_dir_all(&temp_root);
     Ok(())
@@ -97,6 +95,7 @@ fn ensure_prerequisites(workspace_root: &Path, target_dir: &Path) -> Result<(), 
         "rollio-episode-assembler",
         "rollio-storage",
         "rollio-robot-pseudo",
+        "rollio-ui-server",
     ] {
         let path = target_dir.join(binary);
         if !path.exists() {
@@ -118,16 +117,36 @@ fn ensure_prerequisites(workspace_root: &Path, target_dir: &Path) -> Result<(), 
         .into());
     }
 
-    let ui_bundle = workspace_root.join("ui/terminal/dist/index.js");
+    let ui_bundle = workspace_root.join("ui/web/dist/index.html");
     if !ui_bundle.exists() {
         return Err(format!(
-            "missing UI bundle at {}. Run `cd ui/terminal && npm install && npm run build` first.",
+            "missing UI bundle at {}. Run `cd ui/web && npm install && npm run build` first.",
             ui_bundle.display()
         )
         .into());
     }
 
     Ok(())
+}
+
+fn wait_for_ui_runtime_config(port: u16, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    let started = Instant::now();
+    loop {
+        match fetch_http_body(port, "/api/runtime-config") {
+            Ok(body) => {
+                let payload: serde_json::Value = serde_json::from_str(&body)?;
+                assert_eq!(payload["episodeKeyBindings"]["startKey"], "s");
+                return Ok(());
+            }
+            Err(error) if started.elapsed() <= timeout => {
+                let _ = error;
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(format!("timed out waiting for UI server: {error}").into());
+            }
+        }
+    }
 }
 
 fn create_episode_command_publisher() -> Result<EpisodeCommandPublisher, Box<dyn Error>> {
@@ -179,7 +198,8 @@ fn wait_for_paths(
         if started.elapsed() > timeout {
             return Err(format!(
                 "timed out waiting for expected output files: {}",
-                paths.iter()
+                paths
+                    .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -201,15 +221,23 @@ fn reserve_port() -> Result<u16, Box<dyn Error>> {
     Ok(listener.local_addr()?.port())
 }
 
-fn write_fake_node(path: &Path) -> Result<(), Box<dyn Error>> {
-    fs::write(
-        path,
-        "#!/bin/sh\ntrap 'exit 0' INT TERM\nwhile true; do sleep 1; done\n",
-    )?;
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
+fn fetch_http_body(port: u16, path: &str) -> Result<String, Box<dyn Error>> {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        return Err(format!("unexpected response: {response}").into());
+    }
+
+    Ok(response
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string())
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {

@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub use runtime::{RollioRuntimeConfig, RollioRuntimeError, run_rollio_runtime};
+pub use runtime::{run_rollio_runtime, RollioRuntimeConfig, RollioRuntimeError};
 
 const DEFAULT_DOF: u32 = 1;
 const DEFAULT_CONTROL_FREQUENCY_HZ: f64 = 250.0;
@@ -173,10 +173,7 @@ pub async fn execute_command<W: Write>(
                 id,
                 driver: profile.driver_name().to_owned(),
                 dof: DEFAULT_DOF,
-                supported_modes: [
-                    "free-drive".to_owned(),
-                    "command-following".to_owned(),
-                ],
+                supported_modes: ["free-drive".to_owned(), "command-following".to_owned()],
                 transport: "can".to_owned(),
                 interface,
                 product_variant: profile.label().to_owned(),

@@ -1,10 +1,13 @@
 use crate::DriverProfile;
 use airbot_play_rust::can::router::CanFrameRouter;
 use airbot_play_rust::can::worker::{CanTxPriority, CanWorker, CanWorkerBackend, CanWorkerConfig};
-use airbot_play_rust::eef::{EefRuntime, EefRuntimeError, EefState, SingleEefCommand, SingleEefFeedback, spawn_eef_runtime_task};
+use airbot_play_rust::eef::{
+    spawn_eef_runtime_task, EefRuntime, EefRuntimeError, EefState, SingleEefCommand,
+    SingleEefFeedback,
+};
 use async_trait::async_trait;
 use iceoryx2::prelude::*;
-use rollio_bus::{CONTROL_EVENTS_SERVICE, robot_command_service_name, robot_state_service_name};
+use rollio_bus::{robot_command_service_name, robot_state_service_name, CONTROL_EVENTS_SERVICE};
 use rollio_types::config::RobotMode;
 use rollio_types::messages::{
     CommandMode, ControlEvent, EndEffectorStatus, RobotCommand, RobotState,
@@ -13,7 +16,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{interval, MissedTickBehavior};
 
 type StatePublisher = iceoryx2::port::publisher::Publisher<ipc::Service, RobotState, ()>;
 type CommandSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::Service, RobotCommand, ()>;
@@ -78,11 +81,8 @@ impl StandaloneEefClient {
         })?;
 
         let eef = Arc::new(EefRuntime::new(config.profile.mounted_eef()));
-        let (frame_router, routes) = CanFrameRouter::new(
-            Arc::clone(&worker),
-            std::iter::empty::<u16>(),
-            Some(7),
-        );
+        let (frame_router, routes) =
+            CanFrameRouter::new(Arc::clone(&worker), std::iter::empty::<u16>(), Some(7));
         frame_router
             .start()
             .map_err(|err| RollioRuntimeError::TransportSetup(err.to_string()))?;
@@ -104,8 +104,10 @@ trait RuntimeTransport: Send + Sync {
     fn latest_feedback(&self) -> Option<SingleEefFeedback>;
     fn current_status(&self) -> EndEffectorStatus;
     async fn set_state(&self, state: EefState) -> Result<(), RollioRuntimeError>;
-    async fn submit_e2_command(&self, command: &SingleEefCommand) -> Result<(), RollioRuntimeError>;
-    async fn submit_g2_command(&self, command: &SingleEefCommand) -> Result<(), RollioRuntimeError>;
+    async fn submit_e2_command(&self, command: &SingleEefCommand)
+        -> Result<(), RollioRuntimeError>;
+    async fn submit_g2_command(&self, command: &SingleEefCommand)
+        -> Result<(), RollioRuntimeError>;
     async fn shutdown_gracefully(&self) -> Result<(), RollioRuntimeError>;
 }
 
@@ -140,7 +142,9 @@ impl RuntimeTransport for StandaloneEefClient {
     ) -> Result<(), RollioRuntimeError> {
         let frames = self.eef.build_e2_command(command)?;
         if !frames.is_empty() {
-            self.worker.send_frames(CanTxPriority::Control, frames).await?;
+            self.worker
+                .send_frames(CanTxPriority::Control, frames)
+                .await?;
         }
         Ok(())
     }
@@ -519,7 +523,11 @@ mod tests {
         }
     }
 
-    fn runtime_config(profile: DriverProfile, device_name: &str, mode: RobotMode) -> RollioRuntimeConfig {
+    fn runtime_config(
+        profile: DriverProfile,
+        device_name: &str,
+        mode: RobotMode,
+    ) -> RollioRuntimeConfig {
         RollioRuntimeConfig {
             device_name: device_name.to_owned(),
             interface: "can0".to_owned(),
@@ -546,7 +554,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn publishes_robot_state_with_end_effector_status() -> Result<(), Box<dyn std::error::Error>> {
+    async fn publishes_robot_state_with_end_effector_status(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -554,7 +563,8 @@ mod tests {
                 let device_name = unique_name("eef_state");
                 let ports = create_test_ports(&device_name)?;
                 let transport = Arc::new(FakeTransport::default());
-                *transport.feedback.write().expect("feedback lock poisoned") = Some(fake_feedback());
+                *transport.feedback.write().expect("feedback lock poisoned") =
+                    Some(fake_feedback());
 
                 let task = tokio::task::spawn_local(run_rollio_runtime_with_transport(
                     runtime_config(DriverProfile::G2, &device_name, RobotMode::FreeDrive),
@@ -587,7 +597,8 @@ mod tests {
                 let device_name = unique_name("eef_e2");
                 let ports = create_test_ports(&device_name)?;
                 let transport = Arc::new(FakeTransport::default());
-                *transport.feedback.write().expect("feedback lock poisoned") = Some(fake_feedback());
+                *transport.feedback.write().expect("feedback lock poisoned") =
+                    Some(fake_feedback());
 
                 let task = tokio::task::spawn_local(run_rollio_runtime_with_transport(
                     runtime_config(DriverProfile::E2, &device_name, RobotMode::FreeDrive),
@@ -628,13 +639,11 @@ mod tests {
                         .position,
                     0.018
                 );
-                assert!(
-                    transport
-                        .g2_commands
-                        .lock()
-                        .expect("g2 commands lock poisoned")
-                        .is_empty()
-                );
+                assert!(transport
+                    .g2_commands
+                    .lock()
+                    .expect("g2 commands lock poisoned")
+                    .is_empty());
 
                 send_control_event(&ports.control_publisher, ControlEvent::Shutdown)?;
                 task.await??;
@@ -652,7 +661,8 @@ mod tests {
                 let device_name = unique_name("eef_g2");
                 let ports = create_test_ports(&device_name)?;
                 let transport = Arc::new(FakeTransport::default());
-                *transport.feedback.write().expect("feedback lock poisoned") = Some(fake_feedback());
+                *transport.feedback.write().expect("feedback lock poisoned") =
+                    Some(fake_feedback());
 
                 let task = tokio::task::spawn_local(run_rollio_runtime_with_transport(
                     runtime_config(DriverProfile::G2, &device_name, RobotMode::FreeDrive),
@@ -693,13 +703,11 @@ mod tests {
                         .position,
                     0.057
                 );
-                assert!(
-                    transport
-                        .e2_commands
-                        .lock()
-                        .expect("e2 commands lock poisoned")
-                        .is_empty()
-                );
+                assert!(transport
+                    .e2_commands
+                    .lock()
+                    .expect("e2 commands lock poisoned")
+                    .is_empty());
 
                 send_control_event(&ports.control_publisher, ControlEvent::Shutdown)?;
                 task.await??;

@@ -100,7 +100,8 @@ pub(crate) fn stage_episode(
     config: &AssemblerRuntimeConfig,
     episode: &EpisodeAssemblyInput,
 ) -> Result<StagedEpisode, Box<dyn Error>> {
-    let staging_dir = Path::new(&config.staging_dir).join(format!("episode_{:06}", episode.episode_index));
+    let staging_dir =
+        Path::new(&config.staging_dir).join(format!("episode_{:06}", episode.episode_index));
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)?;
     }
@@ -145,7 +146,10 @@ pub(crate) fn stage_episode(
     })
 }
 
-fn build_episode_rows(config: &AssemblerRuntimeConfig, episode: &EpisodeAssemblyInput) -> EpisodeRows {
+fn build_episode_rows(
+    config: &AssemblerRuntimeConfig,
+    episode: &EpisodeAssemblyInput,
+) -> EpisodeRows {
     let frame_timestamps_ns = build_frame_timestamps(config.fps, episode);
     let row_count = frame_timestamps_ns.len();
 
@@ -190,7 +194,11 @@ fn build_episode_rows(config: &AssemblerRuntimeConfig, episode: &EpisodeAssembly
                 .get(&source.source_name)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            row.extend(interpolate_action_sample(samples, *timestamp_ns, source.dof as usize));
+            row.extend(interpolate_action_sample(
+                samples,
+                *timestamp_ns,
+                source.dof as usize,
+            ));
         }
         action_rows.push(row);
     }
@@ -226,14 +234,22 @@ fn infer_sample_duration_ns(episode: &EpisodeAssemblyInput) -> u64 {
     let mut max_timestamp = None;
     for samples in episode.robot_samples.values() {
         for sample in samples {
-            min_timestamp = Some(min_timestamp.map_or(sample.timestamp_ns, |value: u64| value.min(sample.timestamp_ns)));
-            max_timestamp = Some(max_timestamp.map_or(sample.timestamp_ns, |value: u64| value.max(sample.timestamp_ns)));
+            min_timestamp = Some(min_timestamp.map_or(sample.timestamp_ns, |value: u64| {
+                value.min(sample.timestamp_ns)
+            }));
+            max_timestamp = Some(max_timestamp.map_or(sample.timestamp_ns, |value: u64| {
+                value.max(sample.timestamp_ns)
+            }));
         }
     }
     for samples in episode.action_samples.values() {
         for sample in samples {
-            min_timestamp = Some(min_timestamp.map_or(sample.timestamp_ns, |value: u64| value.min(sample.timestamp_ns)));
-            max_timestamp = Some(max_timestamp.map_or(sample.timestamp_ns, |value: u64| value.max(sample.timestamp_ns)));
+            min_timestamp = Some(min_timestamp.map_or(sample.timestamp_ns, |value: u64| {
+                value.min(sample.timestamp_ns)
+            }));
+            max_timestamp = Some(max_timestamp.map_or(sample.timestamp_ns, |value: u64| {
+                value.max(sample.timestamp_ns)
+            }));
         }
     }
     match (min_timestamp, max_timestamp) {
@@ -307,7 +323,11 @@ fn interpolate_robot_sample(
     }
 }
 
-fn interpolate_action_sample(samples: &[ActionSample], timestamp_ns: u64, width: usize) -> Vec<f64> {
+fn interpolate_action_sample(
+    samples: &[ActionSample],
+    timestamp_ns: u64,
+    width: usize,
+) -> Vec<f64> {
     if samples.is_empty() {
         return vec![0.0; width];
     }
@@ -603,15 +623,12 @@ fn build_dataset_info(config: &AssemblerRuntimeConfig, frame_count: usize) -> Da
         fps: config.fps,
         splits: BTreeMap::new(),
         data_path: "data/chunk-{chunk_index:03d}/episode_{episode_index:06d}.parquet".into(),
-        video_path: config
-            .cameras
-            .first()
-            .map(|camera| {
-                format!(
-                    "videos/chunk-{{chunk_index:03d}}/{{video_key}}/episode_{{episode_index:06d}}.{}",
-                    camera.artifact_format.extension()
-                )
-            }),
+        video_path: config.cameras.first().map(|camera| {
+            format!(
+                "videos/chunk-{{chunk_index:03d}}/{{video_key}}/episode_{{episode_index:06d}}.{}",
+                camera.artifact_format.extension()
+            )
+        }),
         features,
         embedded_config_toml: config.embedded_config_toml.clone(),
     }
@@ -680,7 +697,9 @@ fn camera_shape(width: u32, height: u32, pixel_format: PixelFormat) -> Vec<usize
 
 fn camera_axis_names(pixel_format: PixelFormat) -> Vec<String> {
     match pixel_format {
-        PixelFormat::Depth16 | PixelFormat::Gray8 => vec!["height".into(), "width".into(), "channel".into()],
+        PixelFormat::Depth16 | PixelFormat::Gray8 => {
+            vec!["height".into(), "width".into(), "channel".into()]
+        }
         _ => vec!["height".into(), "width".into(), "channel".into()],
     }
 }
@@ -690,8 +709,8 @@ mod tests {
     use super::*;
     use rollio_types::config::{
         AssemblerActionRuntimeConfig, AssemblerCameraRuntimeConfig, AssemblerRobotRuntimeConfig,
-        AssemblerRuntimeConfig, EncodedHandoffMode, EpisodeFormat, EncoderArtifactFormat,
-        EncoderCodec,
+        AssemblerRuntimeConfig, EncodedHandoffMode, EncoderArtifactFormat, EncoderCodec,
+        EpisodeFormat,
     };
     use rollio_types::messages::PixelFormat;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -723,7 +742,10 @@ mod tests {
                     })
                     .collect(),
             )]),
-            video_paths: BTreeMap::from([("camera_top".into(), temp_dir().join("episode_000000.mp4"))]),
+            video_paths: BTreeMap::from([(
+                "camera_top".into(),
+                temp_dir().join("episode_000000.mp4"),
+            )]),
         };
 
         let rows = build_episode_rows(&config, &episode);
@@ -731,7 +753,11 @@ mod tests {
         assert_eq!(rows.frame_indices.len(), 90);
         assert_eq!(rows.action_rows.len(), 90);
         assert_eq!(
-            rows.robot_columns["leader_arm"].positions.first().unwrap().len(),
+            rows.robot_columns["leader_arm"]
+                .positions
+                .first()
+                .unwrap()
+                .len(),
             6
         );
     }
@@ -785,19 +811,18 @@ mod tests {
         assert_eq!(staged.episode_index, 0);
         assert!(staged.frame_count > 0);
         assert!(staged.staging_dir.join("meta/info.json").exists());
+        assert!(staged
+            .staging_dir
+            .join("data/chunk-000/episode_000000.parquet")
+            .exists());
+        assert!(staged
+            .staging_dir
+            .join("videos/chunk-000/camera_top/episode_000000.mp4")
+            .exists());
         assert!(
-            staged
-                .staging_dir
-                .join("data/chunk-000/episode_000000.parquet")
-                .exists()
+            !source_video.exists(),
+            "source video should be moved into staging"
         );
-        assert!(
-            staged
-                .staging_dir
-                .join("videos/chunk-000/camera_top/episode_000000.mp4")
-                .exists()
-        );
-        assert!(!source_video.exists(), "source video should be moved into staging");
 
         let info: serde_json::Value = serde_json::from_slice(
             &fs::read(staged.staging_dir.join("meta/info.json"))

@@ -1,4 +1,4 @@
-use rollio_robot_airbot_eef::{DriverProfile, run_with_profile};
+use rollio_robot_airbot_eef::{run_with_profile, DriverProfile};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
