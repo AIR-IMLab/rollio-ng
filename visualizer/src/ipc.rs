@@ -5,15 +5,12 @@
 /// of shared memory once (unavoidable since we release the sample), while
 /// robot state is a small fixed-size Copy type.
 use iceoryx2::prelude::*;
-use rollio_bus::{
-    EPISODE_COMMAND_SERVICE, EPISODE_STATUS_SERVICE, SETUP_COMMAND_SERVICE, SETUP_STATE_SERVICE,
-};
+use rollio_bus::CONTROL_EVENTS_SERVICE;
 use rollio_types::config::{
     RobotStateKind, VisualizerCameraSourceConfig, VisualizerRobotSourceConfig,
 };
 use rollio_types::messages::{
-    CameraFrameHeader, EpisodeCommand, EpisodeStatus, JointVector15, ParallelVector2, Pose7,
-    SetupCommandMessage, SetupStateMessage,
+    CameraFrameHeader, ControlEvent, JointVector15, ParallelVector2, Pose7,
 };
 
 /// A message received from iceoryx2.
@@ -29,12 +26,6 @@ pub enum IpcMessage {
         timestamp_ms: u64,
         values: Vec<f64>,
     },
-    EpisodeStatusMsg {
-        status: Box<EpisodeStatus>,
-    },
-    SetupStateMsg {
-        payload_json: String,
-    },
 }
 
 /// Manages iceoryx2 subscribers for camera and robot topics.
@@ -42,14 +33,7 @@ pub struct IpcPoller {
     node: Node<ipc::Service>,
     camera_subs: Vec<CameraSubscriber>,
     robot_subs: Vec<RobotSubscriber>,
-    episode_status_subscriber:
-        iceoryx2::port::subscriber::Subscriber<ipc::Service, EpisodeStatus, ()>,
-    episode_command_publisher:
-        iceoryx2::port::publisher::Publisher<ipc::Service, EpisodeCommand, ()>,
-    setup_state_subscriber:
-        iceoryx2::port::subscriber::Subscriber<ipc::Service, SetupStateMessage, ()>,
-    setup_command_publisher:
-        iceoryx2::port::publisher::Publisher<ipc::Service, SetupCommandMessage, ()>,
+    control_subscriber: iceoryx2::port::subscriber::Subscriber<ipc::Service, ControlEvent, ()>,
 }
 
 struct CameraSubscriber {
@@ -143,42 +127,21 @@ impl IpcPoller {
             });
         }
 
-        let episode_status_service_name: ServiceName = EPISODE_STATUS_SERVICE.try_into()?;
-        let episode_status_service = node
-            .service_builder(&episode_status_service_name)
-            .publish_subscribe::<EpisodeStatus>()
+        // Listen for ControlEvent::Shutdown so the controller can stop us
+        // promptly during a preview-runtime swap. Without this, identify
+        // would block on `terminate_children` for the full 30 s timeout.
+        let control_service_name: ServiceName = CONTROL_EVENTS_SERVICE.try_into()?;
+        let control_service = node
+            .service_builder(&control_service_name)
+            .publish_subscribe::<ControlEvent>()
             .open_or_create()?;
-        let episode_status_subscriber = episode_status_service.subscriber_builder().create()?;
-
-        let episode_command_service_name: ServiceName = EPISODE_COMMAND_SERVICE.try_into()?;
-        let episode_command_service = node
-            .service_builder(&episode_command_service_name)
-            .publish_subscribe::<EpisodeCommand>()
-            .open_or_create()?;
-        let episode_command_publisher = episode_command_service.publisher_builder().create()?;
-
-        let setup_state_service_name: ServiceName = SETUP_STATE_SERVICE.try_into()?;
-        let setup_state_service = node
-            .service_builder(&setup_state_service_name)
-            .publish_subscribe::<SetupStateMessage>()
-            .open_or_create()?;
-        let setup_state_subscriber = setup_state_service.subscriber_builder().create()?;
-
-        let setup_command_service_name: ServiceName = SETUP_COMMAND_SERVICE.try_into()?;
-        let setup_command_service = node
-            .service_builder(&setup_command_service_name)
-            .publish_subscribe::<SetupCommandMessage>()
-            .open_or_create()?;
-        let setup_command_publisher = setup_command_service.publisher_builder().create()?;
+        let control_subscriber = control_service.subscriber_builder().create()?;
 
         Ok(Self {
             node,
             camera_subs,
             robot_subs,
-            episode_status_subscriber,
-            episode_command_publisher,
-            setup_state_subscriber,
-            setup_command_publisher,
+            control_subscriber,
         })
     }
 
@@ -275,61 +238,27 @@ impl IpcPoller {
             }
         }
 
-        let mut latest_episode_status: Option<IpcMessage> = None;
-        loop {
-            match self.episode_status_subscriber.receive() {
-                Ok(Some(sample)) => {
-                    latest_episode_status = Some(IpcMessage::EpisodeStatusMsg {
-                        status: Box::new(*sample.payload()),
-                    });
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    log::warn!("episode status receive error: {e}");
-                    break;
-                }
-            }
-        }
-        if let Some(msg) = latest_episode_status {
-            messages.push(msg);
-        }
-
-        let mut latest_setup_state: Option<IpcMessage> = None;
-        loop {
-            match self.setup_state_subscriber.receive() {
-                Ok(Some(sample)) => {
-                    latest_setup_state = Some(IpcMessage::SetupStateMsg {
-                        payload_json: sample.payload().as_str().to_owned(),
-                    });
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    log::warn!("setup state receive error: {e}");
-                    break;
-                }
-            }
-        }
-        if let Some(msg) = latest_setup_state {
-            messages.push(msg);
-        }
-
         messages
     }
 
-    pub fn publish_episode_command(
-        &self,
-        command: EpisodeCommand,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.episode_command_publisher.send_copy(command)?;
-        Ok(())
-    }
-
-    pub fn publish_setup_command(
-        &self,
-        command: SetupCommandMessage,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.setup_command_publisher.send_copy(command)?;
-        Ok(())
+    /// Drain pending control events. Returns `true` if a `Shutdown` event
+    /// was observed.
+    pub fn poll_shutdown(&self) -> bool {
+        let mut shutdown = false;
+        loop {
+            match self.control_subscriber.receive() {
+                Ok(Some(sample)) => {
+                    if matches!(*sample.payload(), ControlEvent::Shutdown) {
+                        shutdown = true;
+                    }
+                }
+                Ok(None) => return shutdown,
+                Err(e) => {
+                    log::warn!("control events receive error: {e}");
+                    return shutdown;
+                }
+            }
+        }
     }
 
     /// Access the iceoryx2 node (for `node.wait()` in the poll loop).

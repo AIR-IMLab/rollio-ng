@@ -22,11 +22,17 @@ import {
 } from "./lib/layout";
 import { encodeEpisodeCommand, encodeSetPreviewSize } from "./lib/protocol";
 import type { UiRuntimeConfig } from "./lib/runtime-config";
-import { useWebSocket, type UseWebSocketOptions } from "./lib/websocket";
+import {
+  useControlSocket,
+  usePreviewSocket,
+  type UseControlSocketOptions,
+  type UsePreviewSocketOptions,
+} from "./lib/websocket";
 
 type AppProps = {
   runtimeConfig: UiRuntimeConfig;
-  webSocketOptions?: UseWebSocketOptions;
+  controlSocketOptions?: UseControlSocketOptions;
+  previewSocketOptions?: UsePreviewSocketOptions;
 };
 
 type ViewportSize = {
@@ -90,14 +96,30 @@ function fallbackPreviewTileSize(
   };
 }
 
-export default function App({ runtimeConfig, webSocketOptions }: AppProps) {
+export default function App({
+  runtimeConfig,
+  controlSocketOptions,
+  previewSocketOptions,
+}: AppProps) {
   const renderStartMs = nowMs();
   const viewport = useViewportSize();
   const wideLayout = isWideLayout(viewport.width);
-  const { frames, robotStates, streamInfo, episodeStatus, connected, send } = useWebSocket(
-    runtimeConfig.websocketUrl,
-    webSocketOptions,
-  );
+  const {
+    episodeStatus,
+    connected: controlConnected,
+    send: sendControl,
+  } = useControlSocket(runtimeConfig.controlWebsocketUrl, controlSocketOptions);
+  const {
+    frames,
+    robotStates,
+    streamInfo,
+    connected: previewConnected,
+    send: sendPreview,
+  } = usePreviewSocket(runtimeConfig.previewWebsocketUrl, previewSocketOptions);
+  // Episode status drives the visible "connected" indicator since that's the
+  // socket the user actually depends on for control. Preview-only outages
+  // surface as missing frames.
+  const connected = controlConnected;
   const [showDebug, setShowDebug] = useState(false);
   const [previewTileSize, setPreviewTileSize] = useState<PreviewDimensions | null>(null);
   const lastPreviewNegotiationKeyRef = useRef<string | null>(null);
@@ -144,7 +166,7 @@ export default function App({ runtimeConfig, webSocketOptions }: AppProps) {
         return;
       }
 
-      send(encodeEpisodeCommand(action));
+      sendControl(encodeEpisodeCommand(action));
       setGauge("ui.last_episode_command", action);
     };
 
@@ -152,14 +174,14 @@ export default function App({ runtimeConfig, webSocketOptions }: AppProps) {
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [runtimeConfig.episodeKeyBindings, send]);
+  }, [runtimeConfig.episodeKeyBindings, sendControl]);
 
   const handlePreviewSizeChange = useCallback((size: PreviewDimensions) => {
     setPreviewTileSize(size);
   }, []);
 
   useEffect(() => {
-    if (!connected) {
+    if (!previewConnected) {
       lastPreviewNegotiationKeyRef.current = null;
       return;
     }
@@ -179,7 +201,7 @@ export default function App({ runtimeConfig, webSocketOptions }: AppProps) {
 
     const delayMs = lastPreviewNegotiationKeyRef.current === null ? 0 : 75;
     const timer = window.setTimeout(() => {
-      send(encodeSetPreviewSize(negotiatedSize.width, negotiatedSize.height));
+      sendPreview(encodeSetPreviewSize(negotiatedSize.width, negotiatedSize.height));
       lastPreviewNegotiationKeyRef.current = negotiationKey;
       setGauge("ui.preview_request", `${negotiatedSize.width}x${negotiatedSize.height}`);
       setGauge("ui.preview_target", `${negotiatedSize.width}x${negotiatedSize.height}`);
@@ -188,7 +210,13 @@ export default function App({ runtimeConfig, webSocketOptions }: AppProps) {
     return () => {
       window.clearTimeout(timer);
     };
-  }, [connected, requestedPreviewTileSize, send, viewport.height, viewport.width]);
+  }, [
+    previewConnected,
+    requestedPreviewTileSize,
+    sendPreview,
+    viewport.height,
+    viewport.width,
+  ]);
 
   useEffect(() => {
     setGauge(

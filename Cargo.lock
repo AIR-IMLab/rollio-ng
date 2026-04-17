@@ -2245,6 +2245,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rollio-control-server"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "futures-util",
+ "iceoryx2",
+ "log",
+ "rollio-bus",
+ "rollio-types",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "rollio-encoder"
 version = "0.1.0"
 dependencies = [

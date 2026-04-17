@@ -243,8 +243,9 @@ impl Config {
 
     pub fn ui_runtime_config(&self) -> UiRuntimeConfig {
         let mut config = self.ui.clone();
-        if config.websocket_url.is_none() {
-            config.websocket_url = Some(format!("ws://127.0.0.1:{}", self.visualizer.port));
+        if config.preview_websocket_url.is_none() {
+            config.preview_websocket_url =
+                Some(format!("ws://127.0.0.1:{}", self.visualizer.port));
         }
         config
     }
@@ -1923,7 +1924,16 @@ impl FromStr for VisualizerRuntimeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiRuntimeConfig {
-    pub websocket_url: Option<String>,
+    /// Optional explicit upstream URL for the control plane WebSocket
+    /// (proxied at `/ws/control`). Defaults to
+    /// `ws://127.0.0.1:<controller-control-port>` when the controller
+    /// derives the runtime config; runtime callers must populate it before
+    /// passing into the UI server.
+    pub control_websocket_url: Option<String>,
+    /// Optional explicit upstream URL for the preview plane WebSocket
+    /// (proxied at `/ws/preview`). Defaults to
+    /// `ws://127.0.0.1:<visualizer-port>`.
+    pub preview_websocket_url: Option<String>,
     #[serde(default = "default_ui_http_host")]
     pub http_host: String,
     #[serde(default = "default_ui_http_port")]
@@ -1965,7 +1975,8 @@ fn default_ui_discard_key() -> String {
 impl Default for UiRuntimeConfig {
     fn default() -> Self {
         Self {
-            websocket_url: None,
+            control_websocket_url: None,
+            preview_websocket_url: None,
             http_host: default_ui_http_host(),
             http_port: default_ui_http_port(),
             start_key: default_ui_start_key(),
@@ -1978,11 +1989,16 @@ impl Default for UiRuntimeConfig {
 
 impl UiRuntimeConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(websocket_url) = &self.websocket_url {
-            if websocket_url.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "ui: websocket_url must not be empty".into(),
-                ));
+        for (label, url) in [
+            ("control_websocket_url", &self.control_websocket_url),
+            ("preview_websocket_url", &self.preview_websocket_url),
+        ] {
+            if let Some(url) = url {
+                if url.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "ui: {label} must not be empty"
+                    )));
+                }
             }
         }
 
@@ -2368,6 +2384,18 @@ pub struct DeviceChannelConfigV2 {
     pub kind: DeviceType,
     #[serde(default = "default_enabled_true")]
     pub enabled: bool,
+    /// User-facing name for this channel (independent per channel even when
+    /// multiple channels share one device process / bus_root). Defaults to
+    /// the device-supplied `default_name` when present, otherwise the
+    /// channel_type. Renaming a row in the wizard mutates *only* this field.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Human-readable label for this channel as reported by the device
+    /// executable's `query --json` response (e.g. "AIRBOT E2", "V4L2 Camera").
+    /// Used purely for display; the controller no longer derives this from
+    /// the driver name.
+    #[serde(default)]
+    pub channel_label: Option<String>,
     #[serde(default)]
     pub mode: Option<RobotMode>,
     #[serde(default)]
@@ -3123,6 +3151,16 @@ pub struct DeviceQueryChannel {
     pub channel_type: String,
     pub kind: DeviceType,
     pub available: bool,
+    /// Display label for this channel (e.g., "AIRBOT E2", "V4L2 Camera").
+    /// Falls back to the parent device's `device_label` when None.
+    #[serde(default)]
+    pub channel_label: Option<String>,
+    /// Default user-facing name to use when this channel is first added to
+    /// a project (e.g., "airbot_play_arm", "airbot_e2", "camera"). The
+    /// controller stores this in `DeviceChannelConfigV2.name`. Falls back
+    /// to channel_type when None.
+    #[serde(default)]
+    pub default_name: Option<String>,
     #[serde(default)]
     pub modes: Vec<String>,
     #[serde(default)]
@@ -3355,8 +3393,9 @@ impl ProjectConfig {
 
     pub fn ui_runtime_config(&self) -> UiRuntimeConfig {
         let mut config = self.ui.clone();
-        if config.websocket_url.is_none() {
-            config.websocket_url = Some(format!("ws://127.0.0.1:{}", self.visualizer.port));
+        if config.preview_websocket_url.is_none() {
+            config.preview_websocket_url =
+                Some(format!("ws://127.0.0.1:{}", self.visualizer.port));
         }
         config
     }

@@ -70,8 +70,11 @@ joint_index_map = [0, 1, 2, 3, 4, 5]
 joint_scales = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 [ui]
-# rollio-ui-server proxies browser /ws traffic to this upstream visualizer endpoint.
-websocket_url = "ws://127.0.0.1:9191"
+# rollio-ui-server proxies browser /ws/preview traffic to this upstream visualizer
+# endpoint. /ws/control proxies to the rollio-control-server, whose port is
+# allocated by the controller at runtime; leave control_websocket_url unset to
+# pick that up automatically.
+preview_websocket_url = "ws://127.0.0.1:9191"
 http_host = "0.0.0.0"
 http_port = 3000
 start_key = "s"

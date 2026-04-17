@@ -3,7 +3,7 @@ import { Box, Text, useInput, useStdin, useStdout } from "ink";
 import { TitleBar } from "./components/TitleBar.js";
 import { SetupStatusBar } from "./components/SetupStatusBar.js";
 import { LivePreviewPanels } from "./components/LivePreviewPanels.js";
-import { useWebSocket } from "./lib/websocket.js";
+import { useControlSocket, usePreviewSocket } from "./lib/websocket.js";
 import {
   encodeSetupCommand,
   type CommandAction,
@@ -79,25 +79,44 @@ function useTerminalMetrics() {
 }
 
 type SetupAppProps = {
-  websocketUrl: string;
+  controlWebsocketUrl: string;
+  previewWebsocketUrl: string;
   initialAsciiRendererId: AsciiRendererId;
 };
 
 export function SetupApp({
-  websocketUrl,
+  controlWebsocketUrl,
+  previewWebsocketUrl,
   initialAsciiRendererId,
 }: SetupAppProps) {
   const { columns, rows, cellGeometry } = useTerminalMetrics();
   const { isRawModeSupported } = useStdin();
   const supportsInteractiveInput = isRawModeSupported === true;
   const {
+    connected: controlConnected,
+    send: sendControl,
+    setupState,
+  } = useControlSocket(controlWebsocketUrl);
+  // Only attempt the preview socket while the controller is expected to have
+  // a visualizer running (identify on, or step Preview). This avoids the
+  // wizard escalating reconnect backoff for many seconds before identify is
+  // pressed (cf. debug session 8d351b H6).
+  const previewExpected = useMemo(
+    () =>
+      setupState?.step === "preview" ||
+      (setupState?.step === "devices" && setupState.identify_device != null),
+    [setupState],
+  );
+  const {
+    connected: previewConnected,
+    send: sendPreview,
     frames,
     robotStates,
     streamInfo,
-    connected,
-    send,
-    setupState,
-  } = useWebSocket(websocketUrl);
+  } = usePreviewSocket(previewWebsocketUrl, previewExpected);
+  // The wizard is "connected" in the user's eyes if the control plane is up;
+  // preview comes and goes with identify/preview steps.
+  const connected = controlConnected;
   const [cameraRendererId, setCameraRendererId] = useState<AsciiRendererId>(
     initialAsciiRendererId,
   );
@@ -109,14 +128,14 @@ export function SetupApp({
     if (!connected) {
       return;
     }
-    send(encodeSetupCommand("setup_get_state"));
+    sendControl(encodeSetupCommand("setup_get_state"));
     const interval = setInterval(() => {
-      send(encodeSetupCommand("setup_get_state"));
+      sendControl(encodeSetupCommand("setup_get_state"));
     }, 1000);
     return () => {
       clearInterval(interval);
     };
-  }, [connected, send]);
+  }, [connected, sendControl]);
 
   const selectedDevices = useMemo(
     () => setupState?.config.devices ?? [],
@@ -258,14 +277,14 @@ export function SetupApp({
         if (key.return) {
           const deviceNameKey = deviceNameFieldKey(editingField);
           if (deviceNameKey) {
-            send(
+            sendControl(
               encodeSetupCommand("setup_set_device_name", {
                 name: deviceNameKey,
                 value: draftValue,
               }),
             );
           } else {
-            send(
+            sendControl(
               encodeSetupCommand(
                 editCommandForField(editingField as StaticEditableFieldId),
                 {
@@ -294,7 +313,7 @@ export function SetupApp({
         return;
       }
       if (normalizedInput === "q") {
-        send(encodeSetupCommand("setup_cancel"));
+        sendControl(encodeSetupCommand("setup_cancel"));
         return;
       }
       if (key.upArrow || normalizedInput === "k") {
@@ -312,18 +331,18 @@ export function SetupApp({
         return;
       }
       if (key.leftArrow || normalizedInput === "b") {
-        send(encodeSetupCommand("setup_prev_step"));
+        sendControl(encodeSetupCommand("setup_prev_step"));
         return;
       }
       if (key.rightArrow || normalizedInput === "n") {
-        send(encodeSetupCommand("setup_next_step"));
+        sendControl(encodeSetupCommand("setup_next_step"));
         return;
       }
 
       if (setupState.step === "preview" && /^\d$/.test(input)) {
         const action = previewActions[Number(input) - 1];
         if (action) {
-          executePreviewAction(action, send);
+          executePreviewAction(action, sendControl);
         }
         return;
       }
@@ -331,7 +350,7 @@ export function SetupApp({
       if (normalizedInput === "i" && setupState.step === "devices") {
         const device = setupState.available_devices[focusedIndex];
         if (device && selectedDeviceKeys.has(deviceIdentityKey(device.current))) {
-          send(
+          sendControl(
             encodeSetupCommand("setup_toggle_identify", {
               name: device.name,
             }),
@@ -350,7 +369,7 @@ export function SetupApp({
             setEditingField(field.editableFieldId);
             setDraftValue(field.value);
           } else if (field.kind === "cycle" && field.action) {
-            send(encodeSetupCommand(field.action, { delta: 1 }));
+            sendControl(encodeSetupCommand(field.action, { delta: 1 }));
           }
           return;
         }
@@ -358,9 +377,9 @@ export function SetupApp({
         if (setupState.step === "preview") {
           const action = previewActions[focusedIndex];
           if (action) {
-            executePreviewAction(action, send);
+            executePreviewAction(action, sendControl);
           } else {
-            send(encodeSetupCommand("setup_save"));
+            sendControl(encodeSetupCommand("setup_save"));
           }
           return;
         }
@@ -368,8 +387,13 @@ export function SetupApp({
         if (setupState.step === "devices") {
           const device = setupState.available_devices[focusedIndex];
           if (device && selectedDeviceKeys.has(deviceIdentityKey(device.current))) {
+            const channel = device.current.channels[0];
+            const initialName =
+              channel?.name?.trim() ||
+              channel?.channel_type ||
+              device.current.name;
             setEditingField(deviceNameFieldId(device.name));
-            setDraftValue(device.current.name);
+            setDraftValue(initialName);
           }
           return;
         }
@@ -379,7 +403,7 @@ export function SetupApp({
       if (input === " " && setupState.step === "devices") {
         const device = setupState.available_devices[focusedIndex];
         if (device) {
-          send(encodeSetupCommand("setup_toggle_device", { name: device.name }));
+          sendControl(encodeSetupCommand("setup_toggle_device", { name: device.name }));
         }
         return;
       }
@@ -406,7 +430,7 @@ export function SetupApp({
         ) {
           return;
         }
-        send(
+        sendControl(
           encodeSetupCommand(
             device.device_type === "camera"
               ? "setup_cycle_camera_profile"
@@ -418,7 +442,7 @@ export function SetupApp({
       }
 
       if (setupState.step === "pairing") {
-        send(
+        sendControl(
           encodeSetupCommand("setup_cycle_pair_mapping", {
             index: focusedIndex,
             delta,
@@ -430,7 +454,7 @@ export function SetupApp({
       if (setupState.step === "storage") {
         const field = settingsFields[focusedIndex];
         if (field?.kind === "cycle" && field.action) {
-          send(encodeSetupCommand(field.action, { delta }));
+          sendControl(encodeSetupCommand(field.action, { delta }));
         }
       }
     },
@@ -453,13 +477,20 @@ export function SetupApp({
 
       {showLivePanels ? (
         <>
+          {!previewConnected ? (
+            <Box paddingX={1}>
+              <Text color="yellow" bold>
+                Launching preview...
+              </Text>
+            </Box>
+          ) : null}
           <LivePreviewPanels
             key={livePanelsKey}
             frames={frames}
             robotStates={robotStates}
             streamInfo={streamInfo}
-            connected={connected}
-            send={send}
+            connected={previewConnected}
+            send={sendPreview}
             width={columns}
             availableRows={livePanelRows}
             cellGeometry={cellGeometry}
@@ -952,7 +983,17 @@ function deviceRowLine(
 ): DetailLine {
   const rowDim = !selected;
   const isEditing = editingField === deviceNameFieldId(device.name);
-  const renderedName = isEditing ? `${draftValue}|` : device.current.name;
+  const channel = device.current.channels[0];
+  // Per-channel name (with fallback to channel_type) — separate from the
+  // parent BinaryDeviceConfig.name so renaming one row no longer mutates
+  // sibling channels' rows.
+  const channelName =
+    channel?.name?.trim() || channel?.channel_type || device.current.name;
+  const renderedName = isEditing ? `${draftValue}|` : channelName;
+  // Per-channel display label (e.g. "AIRBOT E2") provided by the device
+  // executable; fall back to device-level display_name when missing.
+  const rowLabel =
+    channel?.channel_label?.trim() || device.display_name;
   const channelSummary = configuredChannelSummary(device.current);
   return buildDetailLine(`device:${device.name}`, [
     focusPrefix(focused, rowDim),
@@ -962,7 +1003,7 @@ function deviceRowLine(
       bold: selected,
     }),
     textSegment("] ", { dimColor: rowDim }),
-    textSegment(device.display_name, {
+    textSegment(rowLabel, {
       bold: focused || selected,
       color: selected ? undefined : "gray",
       dimColor: rowDim,

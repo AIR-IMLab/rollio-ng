@@ -80,6 +80,14 @@ export interface SetupDeviceChannelV2 {
   channel_type: string;
   kind: "camera" | "robot";
   enabled?: boolean;
+  /** User-facing per-channel name. Editing the row mutates this field
+   * (instead of the parent device's `name`/`bus_root`). May be absent in
+   * very old configs. */
+  name?: string | null;
+  /** Display label provided by the device executable's query response
+   * (e.g., "AIRBOT E2", "V4L2 Camera"). Falls back to the device-level
+   * `display_name` when missing. */
+  channel_label?: string | null;
   mode?: "free-drive" | "command-following" | "identifying" | null;
   dof?: number | null;
   publish_states?: string[];

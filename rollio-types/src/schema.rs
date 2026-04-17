@@ -328,9 +328,18 @@ pub fn config_schema() -> ConfigSchema {
                 description: "Terminal and browser UI runtime settings.",
                 fields: vec![
                     SchemaField {
-                        name: "websocket_url",
+                        name: "control_websocket_url",
                         type_name: "string",
-                        description: "Optional explicit visualizer WebSocket URL.",
+                        description: "Optional explicit upstream URL for the control plane WebSocket (proxied at /ws/control).",
+                        required: false,
+                        default: None,
+                        enum_values: None,
+                        applies_to: None,
+                    },
+                    SchemaField {
+                        name: "preview_websocket_url",
+                        type_name: "string",
+                        description: "Optional explicit upstream URL for the preview plane WebSocket (proxied at /ws/preview).",
                         required: false,
                         default: None,
                         enum_values: None,

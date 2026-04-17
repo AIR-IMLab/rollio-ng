@@ -16,6 +16,19 @@ function setViewport(width: number, height: number) {
   });
 }
 
+function runtimeConfigStub() {
+  return {
+    controlWebsocketUrl: "ws://127.0.0.1:9091",
+    previewWebsocketUrl: "ws://127.0.0.1:9090",
+    episodeKeyBindings: {
+      startKey: "s",
+      stopKey: "e",
+      keepKey: "k",
+      discardKey: "x",
+    },
+  };
+}
+
 describe("App", () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -23,19 +36,14 @@ describe("App", () => {
 
   it("switches between wide and narrow layouts", () => {
     setViewport(1300, 900);
+    const control = createFakeWebSocketFactory();
+    const preview = createFakeWebSocketFactory();
     const { container } = render(
       <App
-        runtimeConfig={{
-          websocketUrl: "ws://127.0.0.1:9090",
-          episodeKeyBindings: {
-            startKey: "s",
-            stopKey: "e",
-            keepKey: "k",
-            discardKey: "x",
-          },
-        }}
-        webSocketOptions={{
-          websocketFactory: createFakeWebSocketFactory().factory,
+        runtimeConfig={runtimeConfigStub()}
+        controlSocketOptions={{ websocketFactory: control.factory }}
+        previewSocketOptions={{
+          websocketFactory: preview.factory,
           objectUrlFactory: () => "blob:mock",
           revokeObjectUrl: vi.fn(),
         }}
@@ -52,24 +60,18 @@ describe("App", () => {
     expect(container.querySelector(".camera-layout--narrow")).not.toBeNull();
   });
 
-  it("toggles debug mode and negotiates preview size over websocket", async () => {
+  it("episode keys go through the control socket and preview size goes through the preview socket", async () => {
     vi.useFakeTimers();
     setViewport(1300, 900);
-    const { sockets, factory } = createFakeWebSocketFactory();
+    const control = createFakeWebSocketFactory();
+    const preview = createFakeWebSocketFactory();
 
     render(
       <App
-        runtimeConfig={{
-          websocketUrl: "ws://127.0.0.1:9090",
-          episodeKeyBindings: {
-            startKey: "s",
-            stopKey: "e",
-            keepKey: "k",
-            discardKey: "x",
-          },
-        }}
-        webSocketOptions={{
-          websocketFactory: factory,
+        runtimeConfig={runtimeConfigStub()}
+        controlSocketOptions={{ websocketFactory: control.factory }}
+        previewSocketOptions={{
+          websocketFactory: preview.factory,
           objectUrlFactory: () => "blob:mock",
           revokeObjectUrl: vi.fn(),
         }}
@@ -77,16 +79,17 @@ describe("App", () => {
     );
 
     await act(async () => {
-      sockets[0].open();
+      preview.sockets[0].open();
+      control.sockets[0].open();
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(1);
     });
 
-    expect(sockets[0].sent).toContain(
+    expect(preview.sockets[0].sent).toContain(
       JSON.stringify({ type: "command", action: "get_stream_info" }),
     );
     expect(
-      sockets[0].sent.some((message) => {
+      preview.sockets[0].sent.some((message) => {
         const parsed = JSON.parse(message) as {
           type: string;
           action: string;
@@ -102,7 +105,7 @@ describe("App", () => {
           parsed.height > 0
         );
       }),
-    );
+    ).toBe(true);
 
     act(() => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "d" }));
@@ -112,8 +115,14 @@ describe("App", () => {
     act(() => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "s" }));
     });
-    expect(sockets[0].sent).toContain(
+    expect(control.sockets[0].sent).toContain(
       JSON.stringify({ type: "command", action: "episode_start" }),
     );
+    // Preview socket must not see episode commands.
+    expect(
+      preview.sockets[0].sent.find((message) =>
+        message.includes("episode_start"),
+      ),
+    ).toBeUndefined();
   });
 });

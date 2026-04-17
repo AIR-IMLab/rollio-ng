@@ -17,5 +17,6 @@ members = [
     "test/robot-keyboard",
     "test/bus-tap",
     "ui-server",
+    "control-server",
 ]
 exclude = ["third_party"]

@@ -6,14 +6,16 @@ export type EpisodeKeyBindings = {
 };
 
 export interface UiRuntimeConfig {
-  websocketUrl: string;
+  controlWebsocketUrl: string;
+  previewWebsocketUrl: string;
   episodeKeyBindings: EpisodeKeyBindings;
 }
 
 type LocationLike = Pick<Location, "protocol" | "host">;
 
 type RawUiRuntimeConfig = {
-  websocketUrl?: unknown;
+  controlWebsocketUrl?: unknown;
+  previewWebsocketUrl?: unknown;
   episodeKeyBindings?: Partial<Record<keyof EpisodeKeyBindings, unknown>>;
 };
 
@@ -56,14 +58,14 @@ export function resolveWebSocketUrl(
 ): string {
   const trimmed = websocketUrl.trim();
   if (trimmed === "") {
-    throw new Error('runtime config "websocketUrl" must be a non-empty string');
+    throw new Error('runtime config websocket url must be a non-empty string');
   }
 
   if (isAbsoluteUrl(trimmed)) {
     const resolved = new URL(trimmed);
     resolved.protocol = normalizeWebSocketProtocol(resolved.protocol);
     if (resolved.protocol !== "ws:" && resolved.protocol !== "wss:") {
-      throw new Error('runtime config "websocketUrl" must use ws:// or wss://');
+      throw new Error('runtime config websocket url must use ws:// or wss://');
     }
     return resolved.toString();
   }
@@ -71,13 +73,19 @@ export function resolveWebSocketUrl(
   return new URL(trimmed, browserWebSocketOrigin(location)).toString();
 }
 
+function requireString(label: string, value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`runtime config "${label}" must be a non-empty string`);
+  }
+  return value;
+}
+
 export function normalizeRuntimeConfig(
   config: RawUiRuntimeConfig,
   location: LocationLike = window.location,
 ): UiRuntimeConfig {
-  if (typeof config.websocketUrl !== "string" || config.websocketUrl.trim() === "") {
-    throw new Error('runtime config "websocketUrl" must be a non-empty string');
-  }
+  const controlRaw = requireString("controlWebsocketUrl", config.controlWebsocketUrl);
+  const previewRaw = requireString("previewWebsocketUrl", config.previewWebsocketUrl);
 
   const episodeKeyBindings = {
     startKey: normalizeKey("startKey", config.episodeKeyBindings?.startKey),
@@ -95,7 +103,8 @@ export function normalizeRuntimeConfig(
   }
 
   return {
-    websocketUrl: resolveWebSocketUrl(config.websocketUrl, location),
+    controlWebsocketUrl: resolveWebSocketUrl(controlRaw, location),
+    previewWebsocketUrl: resolveWebSocketUrl(previewRaw, location),
     episodeKeyBindings,
   };
 }

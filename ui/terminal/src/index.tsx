@@ -9,12 +9,14 @@ const runtimeConfig = resolveRuntimeConfig();
 const app = render(
   runtimeConfig.appMode === "setup" ? (
     <SetupApp
-      websocketUrl={runtimeConfig.websocketUrl}
+      controlWebsocketUrl={runtimeConfig.controlWebsocketUrl}
+      previewWebsocketUrl={runtimeConfig.previewWebsocketUrl}
       initialAsciiRendererId={runtimeConfig.asciiRendererId}
     />
   ) : (
     <App
-      websocketUrl={runtimeConfig.websocketUrl}
+      controlWebsocketUrl={runtimeConfig.controlWebsocketUrl}
+      previewWebsocketUrl={runtimeConfig.previewWebsocketUrl}
       initialAsciiRendererId={runtimeConfig.asciiRendererId}
       episodeKeyBindings={runtimeConfig.episodeKeyBindings}
     />

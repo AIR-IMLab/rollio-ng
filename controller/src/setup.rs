@@ -5,7 +5,7 @@ use crate::discovery::{
 use crate::process::{
     poll_children_once, spawn_child, terminate_children, ChildSpec, ManagedChild,
 };
-use crate::runtime_plan::{build_preview_specs, build_visualizer_spec};
+use crate::runtime_plan::{build_control_server_spec, build_preview_specs};
 use crate::runtime_paths::{
     current_executable_dir, default_device_executable_name, resolve_registered_program,
     workspace_root,
@@ -55,10 +55,12 @@ const IDENTIFY_ACTIVE_MESSAGE_PREFIX: &str = "Identify active for ";
 const SETUP_DEV_RUNTIME_PACKAGES: &[&str] = &[
     "rollio-ui-server",
     "rollio-visualizer",
+    "rollio-control-server",
     "rollio-camera-v4l2",
     "rollio-robot-airbot-play",
     "rollio-robot-pseudo",
 ];
+
 
 fn dev_build_profile(workspace_root: &Path, current_exe_dir: &Path) -> Option<&'static str> {
     let target_root = workspace_root.join("target");
@@ -108,9 +110,15 @@ struct DiscoveredDevice {
     device_type: DeviceType,
     driver: String,
     id: String,
+    /// Device-level display label provided by the executable (e.g.
+    /// "AIRBOT Play", or the V4L2 capabilities name). Used as the per-row
+    /// label fallback when a channel does not provide its own label.
     display_name: String,
     camera_profiles: Vec<CameraProfile>,
     supported_modes_by_channel: BTreeMap<String, Vec<RobotMode>>,
+    /// Per-channel display label and default name as reported by the
+    /// device executable's `query --json`. Indexed by `channel_type`.
+    channel_meta_by_channel: BTreeMap<String, DiscoveredChannelMeta>,
     dof: Option<u32>,
     supported_modes: Vec<RobotMode>,
     default_frequency_hz: Option<f64>,
@@ -118,6 +126,12 @@ struct DiscoveredDevice {
     interface: Option<String>,
     product_variant: Option<String>,
     end_effector: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DiscoveredChannelMeta {
+    channel_label: Option<String>,
+    default_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -495,57 +509,55 @@ impl SetupSession {
     }
 
     fn set_device_name(&mut self, name: &str, value: &str) -> Result<bool, Box<dyn Error>> {
-        let Some((selected_index, _channel_index)) = self.selected_device_index(name) else {
+        // The "rename" action now targets a single channel's user-facing
+        // name; the BinaryDeviceConfig.name (= bus_root, iceoryx2 service
+        // root, pairing key) is treated as an internal, immutable
+        // identifier. This avoids the previous behavior where renaming the
+        // arm row also renamed the e2 row because they shared the parent
+        // BinaryDeviceConfig.name.
+        let Some((selected_index, channel_index)) = self.selected_device_index(name) else {
             return Ok(false);
         };
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            self.message = Some("Device name must not be empty.".into());
+            self.message = Some("Channel name must not be empty.".into());
             return Ok(false);
         }
 
-        let Some((target_driver, target_id)) = self
-            .available_device(name)
-            .map(|device| (device.driver.clone(), device.id.clone()))
-        else {
-            return Ok(false);
-        };
+        // Uniqueness check: channel names must not collide across rows
+        // (whether on the same device or another), excluding the row we are
+        // editing.
         let duplicate_name = self.available_devices.iter().any(|device| {
-            device.current.name == trimmed
-                && device.name != name
-                && !(device.driver == target_driver && device.id == target_id)
+            device.name != name
+                && device
+                    .current
+                    .channels
+                    .first()
+                    .and_then(|channel| channel.name.as_deref())
+                    .is_some_and(|existing| existing == trimmed)
         });
         if duplicate_name {
-            self.message = Some(format!("Device name \"{trimmed}\" is already in use."));
+            self.message = Some(format!("Channel name \"{trimmed}\" is already in use."));
             return Ok(false);
         }
 
-        let current_name = self.config.devices[selected_index].name.clone();
-        if current_name == trimmed {
+        let current_name = self.config.devices[selected_index].channels[channel_index]
+            .name
+            .clone();
+        if current_name.as_deref() == Some(trimmed) {
             return Ok(false);
         }
-        let previous_name = current_name;
 
-        for available in self
-            .available_devices
-            .iter_mut()
-            .filter(|device| device.driver == target_driver && device.id == target_id)
-        {
-            available.current.name = trimmed.to_owned();
-            available.current.bus_root = trimmed.to_owned();
-        }
-
-        self.config.devices[selected_index].name = trimmed.to_owned();
-        self.config.devices[selected_index].bus_root = trimmed.to_owned();
-        for pair in &mut self.config.pairings {
-            if pair.leader_device == previous_name {
-                pair.leader_device = trimmed.to_owned();
-            }
-            if pair.follower_device == previous_name {
-                pair.follower_device = trimmed.to_owned();
+        // Mirror the rename into both the persisted project config and the
+        // matching available_device row's snapshot. We do NOT touch
+        // BinaryDeviceConfig.name / bus_root or pairings.
+        self.config.devices[selected_index].channels[channel_index].name =
+            Some(trimmed.to_owned());
+        if let Some(available) = self.available_device_mut(name) {
+            if let Some(channel) = available.current.channels.first_mut() {
+                channel.name = Some(trimmed.to_owned());
             }
         }
-        self.teleop_pairing_cache = self.config.pairings.clone();
         self.config.validate()?;
 
         Ok(true)
@@ -1146,8 +1158,15 @@ fn run_interactive_setup(
     workspace_root: &Path,
     current_exe_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let websocket_port = reserve_loopback_port()?;
-    let websocket_url = format!("ws://127.0.0.1:{websocket_port}");
+    // Reserve two distinct loopback ports up front:
+    // - control_port: long-lived `rollio-control-server` for setup_command/setup_state
+    // - preview_port: visualizer that comes and goes with `should_run_preview_runtime`
+    // The UI talks to both directly. Killing the visualizer no longer kills the
+    // control plane, so identify swaps don't freeze the wizard.
+    let control_port = reserve_loopback_port()?;
+    let preview_port = reserve_loopback_port()?;
+    let control_websocket_url = format!("ws://127.0.0.1:{control_port}");
+    let preview_websocket_url = format!("ws://127.0.0.1:{preview_port}");
 
     let ipc = SetupIpc::new()?;
     let mut session = SetupSession::new(
@@ -1164,19 +1183,24 @@ fn run_interactive_setup(
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
 
-    let mut bridge_runtime: Option<SetupRuntimeState> = None;
+    let mut control_children = Vec::new();
     let mut ui_children = Vec::new();
     let mut preview_runtime: Option<SetupRuntimeState> = None;
     let mut active_identify_target: Option<String> = None;
     let run_result = (|| -> Result<(), Box<dyn Error>> {
-        bridge_runtime = Some(start_setup_bridge_runtime(
-            &session,
-            websocket_port,
+        let control_spec = build_control_server_spec(
+            crate::runtime_plan::ControlServerRole::Setup,
+            control_port,
             workspace_root,
             current_exe_dir,
-            &log_dir,
-        )?);
-        let ui_spec = build_setup_ui_spec(workspace_root, &websocket_url)?;
+        )?;
+        control_children = spawn_setup_children(std::slice::from_ref(&control_spec), &log_dir)?;
+
+        let ui_spec = build_setup_ui_spec(
+            workspace_root,
+            &control_websocket_url,
+            &preview_websocket_url,
+        )?;
         ui_children = spawn_setup_children(std::slice::from_ref(&ui_spec), &log_dir)?;
 
         let mut last_state_publish: Option<Instant> = None;
@@ -1199,20 +1223,18 @@ fn run_interactive_setup(
                 return Err(setup_trigger_error(trigger).into());
             }
 
-            if let Some(runtime) = preview_runtime.as_mut() {
-                if let Some(trigger) = poll_children_once(&mut runtime.children)? {
-                    if should_treat_trigger_as_shutdown(
-                        &trigger,
-                        shutdown_requested.load(std::sync::atomic::Ordering::Relaxed),
-                        session.exit_kind.is_some(),
-                    ) {
-                        break;
-                    }
-                    return Err(setup_trigger_error(trigger).into());
+            if let Some(trigger) = poll_children_once(&mut control_children)? {
+                if should_treat_trigger_as_shutdown(
+                    &trigger,
+                    shutdown_requested.load(std::sync::atomic::Ordering::Relaxed),
+                    session.exit_kind.is_some(),
+                ) {
+                    break;
                 }
+                return Err(setup_trigger_error(trigger).into());
             }
 
-            if let Some(runtime) = bridge_runtime.as_mut() {
+            if let Some(runtime) = preview_runtime.as_mut() {
                 if let Some(trigger) = poll_children_once(&mut runtime.children)? {
                     if should_treat_trigger_as_shutdown(
                         &trigger,
@@ -1257,27 +1279,15 @@ fn run_interactive_setup(
             }
 
             if should_preview && preview_runtime.is_none() {
-                stop_setup_runtime(&mut bridge_runtime, &ipc)?;
                 preview_runtime = Some(start_preview_runtime(
                     &mut session,
-                    websocket_port,
-                    &websocket_url,
+                    preview_port,
+                    &preview_websocket_url,
                     workspace_root,
                     current_exe_dir,
                     &log_dir,
                 )?);
                 preview_runtime_restarted = true;
-                mutations.state_changed = true;
-            }
-
-            if !should_preview && bridge_runtime.is_none() {
-                bridge_runtime = Some(start_setup_bridge_runtime(
-                    &session,
-                    websocket_port,
-                    workspace_root,
-                    current_exe_dir,
-                    &log_dir,
-                )?);
                 mutations.state_changed = true;
             }
 
@@ -1312,14 +1322,21 @@ fn run_interactive_setup(
     })();
 
     let cleanup_result = stop_setup_runtime(&mut preview_runtime, &ipc)
-        .and_then(|_| stop_setup_runtime(&mut bridge_runtime, &ipc))
         .and_then(|_| {
-            terminate_children(
-                &mut ui_children,
-                SETUP_SHUTDOWN_TIMEOUT,
-                SETUP_POLL_INTERVAL,
-            )
-            .map_err(|error| -> Box<dyn Error> { Box::new(error) })
+            // Neither the control-server nor the UI subscribes to
+            // ControlEvent::Shutdown (the bus signal is a per-swap signal for
+            // preview-runtime children). Use a tiny grace window so SIGTERM
+            // fires almost immediately at session end. Without this the
+            // wizard appeared to hang for ~30 s after pressing `q` (debug
+            // session 8d351b confirmed the gap).
+            let quick_grace = Duration::from_millis(200);
+            terminate_children(&mut control_children, quick_grace, SETUP_POLL_INTERVAL)
+                .map_err(|error| -> Box<dyn Error> { Box::new(error) })
+        })
+        .and_then(|_| {
+            let quick_grace = Duration::from_millis(200);
+            terminate_children(&mut ui_children, quick_grace, SETUP_POLL_INTERVAL)
+                .map_err(|error| -> Box<dyn Error> { Box::new(error) })
         });
 
     if let Err(error) = run_result {
@@ -1484,17 +1501,18 @@ fn sync_identify_mode(
 
 fn start_preview_runtime(
     session: &mut SetupSession,
-    websocket_port: u16,
-    websocket_url: &str,
+    preview_port: u16,
+    preview_websocket_url: &str,
     workspace_root: &Path,
     current_exe_dir: &Path,
     log_dir: &Path,
 ) -> Result<SetupRuntimeState, Box<dyn Error>> {
-    let preview_config = build_preview_project_config(session, websocket_port, websocket_url)?;
+    let preview_config =
+        build_preview_project_config(session, preview_port, preview_websocket_url)?;
     let temp_config_path = write_setup_temp_config(
         &preview_config,
         log_dir,
-        &format!("setup-preview-{websocket_port}.toml"),
+        &format!("setup-preview-{preview_port}.toml"),
     )?;
     let specs = build_setup_preview_specs(&preview_config, workspace_root, current_exe_dir)?;
     let children = spawn_setup_children(&specs, log_dir)?;
@@ -1508,24 +1526,6 @@ fn start_preview_runtime(
         children,
         temp_config_path: Some(temp_config_path),
         preview_target_name: session.identify_device_name.clone(),
-    })
-}
-
-fn start_setup_bridge_runtime(
-    session: &SetupSession,
-    websocket_port: u16,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-    log_dir: &Path,
-) -> Result<SetupRuntimeState, Box<dyn Error>> {
-    let mut bridge_project_config = session.config.clone();
-    bridge_project_config.visualizer.port = websocket_port;
-    let spec = build_visualizer_spec(&bridge_project_config, workspace_root, current_exe_dir)?;
-    let children = spawn_setup_children(std::slice::from_ref(&spec), log_dir)?;
-    Ok(SetupRuntimeState {
-        children,
-        temp_config_path: None,
-        preview_target_name: None,
     })
 }
 
@@ -1579,7 +1579,20 @@ fn build_preview_project_config(
             let mut preview = session.config.clone();
             preview.mode = CollectionMode::Intervention;
             preview.pairings.clear();
-            preview.devices = vec![target.current.clone()];
+            // Boot the identify target's robot channels directly into
+            // RobotMode::Identifying so the device process never has the
+            // chance to start in FreeDrive and miss a late-arriving mode
+            // event from `sync_identify_mode` (race confirmed in debug
+            // session 8d351b: device booted ~21 ms AFTER controller
+            // published Identifying, so the publish landed before the
+            // subscriber existed).
+            let mut device = target.current.clone();
+            for channel in device.channels.iter_mut() {
+                if channel.kind == DeviceType::Robot && channel.enabled {
+                    channel.mode = Some(RobotMode::Identifying);
+                }
+            }
+            preview.devices = vec![device];
             preview
         } else {
             session.config.clone()
@@ -1588,7 +1601,7 @@ fn build_preview_project_config(
         session.config.clone()
     };
     preview.visualizer.port = websocket_port;
-    preview.ui.websocket_url = Some(websocket_url.into());
+    preview.ui.preview_websocket_url = Some(websocket_url.into());
     Ok(preview)
 }
 
@@ -1654,6 +1667,11 @@ fn binary_device_from_camera_discovery(
             toml::Value::String(end_effector.clone()),
         );
     }
+    let channel_meta = discovery
+        .channel_meta_by_channel
+        .get(&channel_type)
+        .cloned()
+        .unwrap_or_default();
     BinaryDeviceConfig {
         name: name.clone(),
         executable: Some(default_device_executable_name(&discovery.driver)),
@@ -1664,6 +1682,8 @@ fn binary_device_from_camera_discovery(
             channel_type,
             kind: DeviceType::Camera,
             enabled: true,
+            name: channel_meta.default_name,
+            channel_label: channel_meta.channel_label,
             mode: None,
             dof: None,
             publish_states: Vec::new(),
@@ -1722,10 +1742,18 @@ fn binary_device_from_robot_discovery(
             toml::Value::String(end_effector.clone()),
         );
     }
+    let arm_channel_type = robot_default_channel_type(&discovery.driver);
+    let arm_meta = discovery
+        .channel_meta_by_channel
+        .get(&arm_channel_type)
+        .cloned()
+        .unwrap_or_default();
     let mut channels = vec![DeviceChannelConfigV2 {
-        channel_type: robot_default_channel_type(&discovery.driver),
+        channel_type: arm_channel_type,
         kind: DeviceType::Robot,
         enabled: true,
+        name: arm_meta.default_name,
+        channel_label: arm_meta.channel_label,
         mode,
         dof: discovery.dof.or(Some(6)),
         publish_states,
@@ -1739,10 +1767,17 @@ fn binary_device_from_robot_discovery(
         if let Some((channel_type, eef_defaults)) =
             mounted_airbot_end_effector_channel(discovery.end_effector.as_deref())
         {
+            let eef_meta = discovery
+                .channel_meta_by_channel
+                .get(&channel_type)
+                .cloned()
+                .unwrap_or_default();
             channels.push(DeviceChannelConfigV2 {
                 channel_type,
                 kind: DeviceType::Robot,
                 enabled: true,
+                name: eef_meta.default_name,
+                channel_label: eef_meta.channel_label,
                 mode: Some(preferred_mode),
                 dof: Some(1),
                 publish_states: vec![
@@ -1867,7 +1902,8 @@ fn pair_robot_channels_by_order<'a>(
 
 fn build_setup_ui_spec(
     workspace_root: &Path,
-    websocket_url: &str,
+    control_websocket_url: &str,
+    preview_websocket_url: &str,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let ui_entry = workspace_root.join("ui/terminal/dist/index.js");
     if !ui_entry.exists() {
@@ -1886,8 +1922,10 @@ fn build_setup_ui_spec(
                 ui_entry.into_os_string(),
                 OsString::from("--mode"),
                 OsString::from("setup"),
-                OsString::from("--ws"),
-                OsString::from(websocket_url),
+                OsString::from("--control-ws"),
+                OsString::from(control_websocket_url),
+                OsString::from("--preview-ws"),
+                OsString::from(preview_websocket_url),
             ],
         },
         working_directory: workspace_root.to_path_buf(),
@@ -2206,9 +2244,16 @@ fn display_name_for_binary_channel(
     device: &BinaryDeviceConfig,
     channel: &DeviceChannelConfigV2,
 ) -> String {
+    // Prefer the device-provided per-channel label so the controller stays
+    // driver-agnostic. The hardcoded `canonical_device_display_name` is only
+    // a fallback for legacy configs / tests where the channel hasn't been
+    // populated by a recent device executable.
+    if let Some(label) = channel.channel_label.as_deref() {
+        if !label.trim().is_empty() {
+            return label.to_owned();
+        }
+    }
     match (channel.kind, device.driver.as_str(), channel.channel_type.as_str()) {
-        (DeviceType::Robot, "airbot-play", "e2") => "AIRBOT E2".into(),
-        (DeviceType::Robot, "airbot-play", "g2") => "AIRBOT G2".into(),
         (DeviceType::Camera, _, channel_type) => {
             let (stream, camera_channel) = split_camera_channel_type(channel_type);
             canonical_device_display_name(
@@ -2287,18 +2332,27 @@ fn build_discovered_device(
         })
         .ok_or_else(|| format!("query returned no devices for id {id}: {query}"))?;
 
+    let channel_meta_by_channel = parse_query_channel_meta(query_device);
+    // Prefer the device-supplied label; fall back to canonical display
+    // mapping only when the executable doesn't expose one. New device
+    // executables MUST set device_label or channel_label so the controller
+    // stays driver-agnostic.
+    let device_label = value_as_string(query_device.get("device_label"));
+
     match driver.device_type {
         DeviceType::Camera => {
             let camera_profiles = parse_query_camera_profiles(driver.driver, query_device);
-            let display_name = canonical_device_display_name(
-                DeviceType::Camera,
-                driver.driver,
-                None,
-                camera_profiles
-                    .first()
-                    .and_then(|profile| profile.stream.as_deref()),
-                camera_profiles.first().and_then(|profile| profile.channel),
-            );
+            let display_name = device_label.clone().unwrap_or_else(|| {
+                canonical_device_display_name(
+                    DeviceType::Camera,
+                    driver.driver,
+                    None,
+                    camera_profiles
+                        .first()
+                        .and_then(|profile| profile.stream.as_deref()),
+                    camera_profiles.first().and_then(|profile| profile.channel),
+                )
+            });
             Ok(DiscoveredDevice {
                 device_type: DeviceType::Camera,
                 driver: driver.driver.to_owned(),
@@ -2306,6 +2360,7 @@ fn build_discovered_device(
                 display_name,
                 camera_profiles,
                 supported_modes_by_channel: BTreeMap::new(),
+                channel_meta_by_channel,
                 dof: None,
                 supported_modes: Vec::new(),
                 default_frequency_hz: None,
@@ -2324,8 +2379,9 @@ fn build_discovered_device(
             let supported_modes_by_channel = parse_query_robot_modes_by_channel(query_device);
             let dof = value_as_u32(primary_channel.get("dof"))
                 .or_else(|| value_as_u32(probe_entry.get("dof")));
-            let display_name =
-                canonical_device_display_name(DeviceType::Robot, driver.driver, dof, None, None);
+            let display_name = device_label.clone().unwrap_or_else(|| {
+                canonical_device_display_name(DeviceType::Robot, driver.driver, dof, None, None)
+            });
             Ok(DiscoveredDevice {
                 device_type: DeviceType::Robot,
                 driver: driver.driver.to_owned(),
@@ -2333,6 +2389,7 @@ fn build_discovered_device(
                 display_name,
                 camera_profiles: Vec::new(),
                 supported_modes_by_channel,
+                channel_meta_by_channel,
                 dof,
                 supported_modes: parse_query_robot_modes(primary_channel),
                 default_frequency_hz: value_as_f64(primary_channel.get("default_control_frequency_hz"))
@@ -2602,6 +2659,27 @@ fn parse_query_robot_modes(channel: &Value) -> Vec<RobotMode> {
             "identifying" => Some(RobotMode::Identifying),
             "disabled" => Some(RobotMode::Disabled),
             _ => None,
+        })
+        .collect()
+}
+
+fn parse_query_channel_meta(device: &Value) -> BTreeMap<String, DiscoveredChannelMeta> {
+    device
+        .get("channels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|channel| {
+            let channel_type = value_as_string(channel.get("channel_type"))?;
+            let channel_label = value_as_string(channel.get("channel_label"));
+            let default_name = value_as_string(channel.get("default_name"));
+            Some((
+                channel_type,
+                DiscoveredChannelMeta {
+                    channel_label,
+                    default_name,
+                },
+            ))
         })
         .collect()
 }
@@ -2994,6 +3072,7 @@ mod tests {
                 channel: None,
             }],
             supported_modes_by_channel: BTreeMap::new(),
+            channel_meta_by_channel: BTreeMap::new(),
             dof: None,
             supported_modes: Vec::new(),
             default_frequency_hz: None,
@@ -3015,6 +3094,7 @@ mod tests {
                 "arm".into(),
                 default_supported_robot_modes(),
             )]),
+            channel_meta_by_channel: BTreeMap::new(),
             dof: Some(dof),
             supported_modes: default_supported_robot_modes(),
             default_frequency_hz: Some(60.0),
@@ -3030,10 +3110,29 @@ mod tests {
             "arm".into(),
             default_supported_robot_modes(),
         )]);
+        let mut channel_meta_by_channel = BTreeMap::from([(
+            "arm".into(),
+            DiscoveredChannelMeta {
+                channel_label: Some("AIRBOT Play".into()),
+                default_name: Some("airbot_play_arm".into()),
+            },
+        )]);
         if let Some(channel_type) = end_effector.map(|value| value.to_ascii_lowercase()) {
             supported_modes_by_channel.insert(
-                channel_type,
+                channel_type.clone(),
                 default_supported_robot_modes(),
+            );
+            let (label, name) = match channel_type.as_str() {
+                "e2" => ("AIRBOT E2", "airbot_e2"),
+                "g2" => ("AIRBOT G2", "airbot_g2"),
+                _ => ("AIRBOT EEF", "airbot_eef"),
+            };
+            channel_meta_by_channel.insert(
+                channel_type,
+                DiscoveredChannelMeta {
+                    channel_label: Some(label.into()),
+                    default_name: Some(name.into()),
+                },
             );
         }
         DiscoveredDevice {
@@ -3043,6 +3142,7 @@ mod tests {
             display_name: "AIRBOT Play".into(),
             camera_profiles: Vec::new(),
             supported_modes_by_channel,
+            channel_meta_by_channel,
             dof: Some(6),
             supported_modes: default_supported_robot_modes(),
             default_frequency_hz: Some(250.0),
@@ -3234,12 +3334,23 @@ mod tests {
 
         assert_eq!(available.len(), 2);
         assert_eq!(available[0].current.channels.len(), 1);
-        assert_eq!(available[0].current.channels[0].channel_type, "arm");
+        let arm_channel = &available[0].current.channels[0];
+        assert_eq!(arm_channel.channel_type, "arm");
         assert_eq!(available[0].display_name, "AIRBOT Play");
+        assert_eq!(arm_channel.channel_label.as_deref(), Some("AIRBOT Play"));
+        assert_eq!(arm_channel.name.as_deref(), Some("airbot_play_arm"));
+
         assert_eq!(available[1].current.channels.len(), 1);
-        assert_eq!(available[1].current.channels[0].channel_type, "e2");
+        let eef_channel = &available[1].current.channels[0];
+        assert_eq!(eef_channel.channel_type, "e2");
         assert_eq!(available[1].display_name, "AIRBOT E2");
+        assert_eq!(eef_channel.channel_label.as_deref(), Some("AIRBOT E2"));
+        assert_eq!(eef_channel.name.as_deref(), Some("airbot_e2"));
+        // The two rows share the same parent BinaryDeviceConfig.name (= bus
+        // root / iceoryx2 service root), but their per-channel `name` fields
+        // are independent so renaming one row no longer affects the other.
         assert_eq!(available[0].current.name, available[1].current.name);
+        assert_ne!(arm_channel.name, eef_channel.name);
     }
 
     #[test]
@@ -3268,7 +3379,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_bridge_project_overrides_visualizer_port() {
+    fn preview_runtime_project_overrides_visualizer_port() {
         let config = build_discovery_config(&[
             camera_discovery("cam0"),
             camera_discovery("cam1"),
@@ -3277,16 +3388,16 @@ mod tests {
         ])
         .expect("config should build");
 
-        let mut bridge = config.clone();
-        bridge.visualizer.port = 42424;
+        let mut preview = config.clone();
+        preview.visualizer.port = 42424;
 
-        assert_eq!(bridge.visualizer.port, 42424);
+        assert_eq!(preview.visualizer.port, 42424);
         assert_eq!(
-            project_camera_device_names(&bridge),
+            project_camera_device_names(&preview),
             project_camera_device_names(&config)
         );
         assert_eq!(
-            project_robot_device_names(&bridge),
+            project_robot_device_names(&preview),
             project_robot_device_names(&config)
         );
     }

@@ -419,6 +419,24 @@ mod tests {
         assert!(ids.contains(&"encoder-camera_side-color"));
         assert!(ids.contains(&"assembler"));
         assert!(ids.contains(&"storage"));
+        assert!(
+            ids.contains(&"control-server"),
+            "control-server child should be present: {ids:?}"
+        );
+
+        let control_spec = specs
+            .iter()
+            .find(|spec| spec.id == "control-server")
+            .expect("control-server spec should exist");
+        let control_inline = control_spec.command.args[1].to_string_lossy();
+        assert!(
+            control_inline.contains("role = \"collect\""),
+            "expected collect role: {control_inline}"
+        );
+        assert!(
+            control_inline.contains("port = "),
+            "expected control port: {control_inline}"
+        );
 
         let encoder_spec = specs
             .iter()
@@ -462,6 +480,15 @@ mod tests {
         assert_eq!(
             ui_spec.command.args[3],
             workspace_root.join("ui/web/dist").into_os_string()
+        );
+        let ui_inline = ui_spec.command.args[1].to_string_lossy();
+        assert!(
+            ui_inline.contains("control_websocket_url = "),
+            "ui spec should include control upstream URL: {ui_inline}"
+        );
+        assert!(
+            ui_inline.contains("preview_websocket_url = "),
+            "ui spec should include preview upstream URL: {ui_inline}"
         );
 
         let _ = fs::remove_dir_all(workspace_root);

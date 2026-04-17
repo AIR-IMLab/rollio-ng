@@ -19,7 +19,8 @@ describe("runtime config", () => {
   it("resolves same-origin websocket paths with ws on http pages", () => {
     const runtimeConfig = normalizeRuntimeConfig(
       {
-        websocketUrl: "/ws",
+        controlWebsocketUrl: "/ws/control",
+        previewWebsocketUrl: "/ws/preview",
         episodeKeyBindings: {
           startKey: "s",
           stopKey: "e",
@@ -30,24 +31,32 @@ describe("runtime config", () => {
       httpLocation,
     );
 
-    expect(runtimeConfig.websocketUrl).toBe("ws://rollio.local:3000/ws");
+    expect(runtimeConfig.controlWebsocketUrl).toBe(
+      "ws://rollio.local:3000/ws/control",
+    );
+    expect(runtimeConfig.previewWebsocketUrl).toBe(
+      "ws://rollio.local:3000/ws/preview",
+    );
   });
 
   it("resolves same-origin websocket paths with wss on https pages", () => {
-    expect(resolveWebSocketUrl("/ws", httpsLocation)).toBe("wss://rollio.example/ws");
+    expect(resolveWebSocketUrl("/ws/control", httpsLocation)).toBe(
+      "wss://rollio.example/ws/control",
+    );
   });
 
   it("normalizes absolute https websocket targets to wss", () => {
-    expect(resolveWebSocketUrl("https://rollio.example/ws", httpLocation)).toBe(
-      "wss://rollio.example/ws",
-    );
+    expect(
+      resolveWebSocketUrl("https://rollio.example/ws/preview", httpLocation),
+    ).toBe("wss://rollio.example/ws/preview");
   });
 
   it("loads runtime config from the backend endpoint", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(
         JSON.stringify({
-          websocketUrl: "/ws",
+          controlWebsocketUrl: "/ws/control",
+          previewWebsocketUrl: "/ws/preview",
           episodeKeyBindings: {
             startKey: "s",
             stopKey: "e",
@@ -72,6 +81,11 @@ describe("runtime config", () => {
         cache: "no-store",
       }),
     );
-    expect(runtimeConfig.websocketUrl).toBe("ws://rollio.local:3000/ws");
+    expect(runtimeConfig.controlWebsocketUrl).toBe(
+      "ws://rollio.local:3000/ws/control",
+    );
+    expect(runtimeConfig.previewWebsocketUrl).toBe(
+      "ws://rollio.local:3000/ws/preview",
+    );
   });
 });

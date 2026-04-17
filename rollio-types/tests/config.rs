@@ -19,8 +19,12 @@ fn parse_example_project_config() {
     assert_eq!(config.visualizer.port, 9090);
     assert_eq!(config.controller.shutdown_timeout_ms, 3000);
     assert_eq!(
-        config.ui_runtime_config().websocket_url.as_deref(),
+        config.ui_runtime_config().preview_websocket_url.as_deref(),
         Some("ws://127.0.0.1:9090")
+    );
+    assert!(
+        config.ui_runtime_config().control_websocket_url.is_none(),
+        "control_websocket_url is filled in by the controller at runtime"
     );
 
     let cameras = config.resolved_camera_channels();

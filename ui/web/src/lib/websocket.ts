@@ -25,11 +25,16 @@ export interface CameraFrame {
   jpegBytes: number;
 }
 
-export interface WebSocketState {
+export interface ControlSocketState {
+  episodeStatus: EpisodeStatusMessage | null;
+  connected: boolean;
+  send: (msg: string) => void;
+}
+
+export interface PreviewSocketState {
   frames: Map<string, CameraFrame>;
   robotStates: Map<string, RobotStateMessage>;
   streamInfo: StreamInfoMessage | null;
-  episodeStatus: EpisodeStatusMessage | null;
   connected: boolean;
   send: (msg: string) => void;
 }
@@ -43,7 +48,11 @@ export interface WebSocketLike extends EventTarget {
 
 export type WebSocketFactory = (url: string) => WebSocketLike;
 
-export interface UseWebSocketOptions {
+export interface UseControlSocketOptions {
+  websocketFactory?: WebSocketFactory;
+}
+
+export interface UsePreviewSocketOptions {
   websocketFactory?: WebSocketFactory;
   objectUrlFactory?: (jpegData: Uint8Array) => string;
   revokeObjectUrl?: (url: string) => void;
@@ -95,34 +104,26 @@ function revokeFrameUrls(
   }
 }
 
-export function useWebSocket(
-  url: string,
-  options: UseWebSocketOptions = {},
-): WebSocketState {
-  const websocketFactory = options.websocketFactory ?? defaultWebSocketFactory;
-  const objectUrlFactory = options.objectUrlFactory ?? defaultObjectUrlFactory;
-  const revokeObjectUrl = options.revokeObjectUrl ?? defaultRevokeObjectUrl;
+interface SocketHandlers {
+  onOpen?: (ws: WebSocketLike) => void;
+  onText?: (text: string) => void;
+  onArrayBuffer?: (buffer: ArrayBuffer) => void;
+  onConnectedChange?: (connected: boolean) => void;
+}
 
-  const [connected, setConnected] = useState(false);
-  const [frames, setFrames] = useState<Map<string, CameraFrame>>(() => new Map());
-  const [robotStates, setRobotStates] = useState<Map<string, RobotStateMessage>>(
-    () => new Map(),
-  );
-  const [streamInfo, setStreamInfo] = useState<StreamInfoMessage | null>(null);
-  const [episodeStatus, setEpisodeStatus] = useState<EpisodeStatusMessage | null>(
-    null,
-  );
+interface UseReconnectOptions {
+  websocketFactory: WebSocketFactory;
+  binaryType: BinaryType;
+  handlers: SocketHandlers;
+}
 
-  const framesRef = useRef<Map<string, CameraFrame>>(new Map());
-  const robotStatesRef = useRef<Map<string, RobotStateMessage>>(new Map());
-  const streamInfoRef = useRef<StreamInfoMessage | null>(null);
-  const episodeStatusRef = useRef<EpisodeStatusMessage | null>(null);
-  const dirtyRef = useRef(false);
+function useReconnectingSocket(url: string, options: UseReconnectOptions) {
   const wsRef = useRef<WebSocketLike | null>(null);
-  const frameSequenceRef = useRef(0);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
+  const handlersRef = useRef(options.handlers);
+  handlersRef.current = options.handlers;
 
   const send = useCallback((msg: string) => {
     if (wsRef.current?.readyState === WS_OPEN) {
@@ -132,35 +133,8 @@ export function useWebSocket(
 
   useEffect(() => {
     mountedRef.current = true;
-    setGauge("ws.connected", "Disconnected");
-    setGauge("ws.frames_received_total", 0);
-    setGauge("ws.robot_messages_total", 0);
-    setGauge("ws.frame_count", 0);
-    setGauge("ws.robot_state_count", 0);
-    setGauge("ws.stream_info_status", "Unavailable");
-    setGauge("ws.episode_status", "Unavailable");
-
-    const flushInterval = window.setInterval(() => {
-      if (!dirtyRef.current || !mountedRef.current) {
-        return;
-      }
-
-      const flushStartMs = nowMs();
-      dirtyRef.current = false;
-      setFrames(new Map(framesRef.current));
-      setRobotStates(new Map(robotStatesRef.current));
-      setStreamInfo(streamInfoRef.current);
-      setEpisodeStatus(episodeStatusRef.current);
-      recordTiming("ws.flush", nowMs() - flushStartMs);
-      setGauge("ws.frame_count", framesRef.current.size);
-      setGauge("ws.robot_state_count", robotStatesRef.current.size);
-    }, BATCH_INTERVAL_MS);
-
-    const streamInfoInterval = window.setInterval(() => {
-      if (wsRef.current?.readyState === WS_OPEN) {
-        wsRef.current.send(encodeCommand("get_stream_info"));
-      }
-    }, 1000);
+    const factory = options.websocketFactory;
+    const binaryType = options.binaryType;
 
     const scheduleReconnect = () => {
       if (!mountedRef.current) {
@@ -169,7 +143,6 @@ export function useWebSocket(
       const attempt = reconnectAttemptRef.current;
       const delay = reconnectDelayMs(attempt);
       reconnectAttemptRef.current = attempt + 1;
-      setGauge("ws.reconnect_attempt", reconnectAttemptRef.current);
       reconnectTimerRef.current = window.setTimeout(connect, delay);
     };
 
@@ -178,120 +151,40 @@ export function useWebSocket(
         return;
       }
 
-      const ws = websocketFactory(url);
+      const ws = factory(url);
       wsRef.current = ws;
-      ws.binaryType = "arraybuffer";
+      ws.binaryType = binaryType;
 
       const onOpen = () => {
-        if (!mountedRef.current) {
-          return;
-        }
+        if (!mountedRef.current) return;
         reconnectAttemptRef.current = 0;
-        setConnected(true);
-        setGauge("ws.connected", "Connected");
-        setGauge("ws.reconnect_attempt", 0);
-        ws.send(encodeCommand("get_stream_info"));
+        handlersRef.current.onConnectedChange?.(true);
+        handlersRef.current.onOpen?.(ws);
       };
 
       const onMessage = (event: Event) => {
+        if (!mountedRef.current) return;
+        const messageEvent = event as MessageEvent<unknown>;
+        if (typeof messageEvent.data === "string") {
+          handlersRef.current.onText?.(messageEvent.data);
+          return;
+        }
         void (async () => {
-          if (!mountedRef.current) {
-            return;
-          }
-
-          const messageEvent = event as MessageEvent<unknown>;
-          if (typeof messageEvent.data === "string") {
-            const parseStartMs = nowMs();
-            const msg = parseJsonMessage(messageEvent.data);
-            recordTiming("ws.parse.json", nowMs() - parseStartMs);
-            if (msg?.type === "robot_state") {
-              robotStatesRef.current.set(msg.name, msg);
-              dirtyRef.current = true;
-              incrementGauge("ws.robot_messages_total");
-              setGauge("ws.robot_state_count", robotStatesRef.current.size);
-            } else if (msg?.type === "stream_info") {
-              streamInfoRef.current = msg;
-              dirtyRef.current = true;
-              setGauge("ws.stream_info_status", "Ready");
-              setGauge("ws.preview_fps_config", msg.configured_preview_fps);
-              setGauge(
-                "ws.active_preview_size",
-                `${msg.active_preview_width}x${msg.active_preview_height}`,
-              );
-            } else if (msg?.type === "episode_status") {
-              episodeStatusRef.current = msg;
-              dirtyRef.current = true;
-              setGauge("ws.episode_status", msg.state);
-              setGauge("ws.episode_count", msg.episode_count);
-              setGauge("ws.episode_elapsed_ms", msg.elapsed_ms);
-            }
-            return;
-          }
-
           const buffer = await toArrayBuffer(messageEvent.data);
-          if (!buffer || !mountedRef.current) {
-            return;
-          }
-
-          const parseStartMs = nowMs();
-          const msg = parseBinaryMessage(buffer);
-          recordTiming("ws.parse.binary", nowMs() - parseStartMs);
-          if (!msg) {
-            return;
-          }
-
-          const previous = framesRef.current.get(msg.name);
-          if (previous) {
-            revokeObjectUrl(previous.objectUrl);
-          }
-
-          const receivedAtWallTimeMs = Date.now();
-          const receiveLatencyMs = Math.max(
-            0,
-            receivedAtWallTimeMs - msg.timestampNs / 1_000_000,
-          );
-          const sequence = ++frameSequenceRef.current;
-          const objectUrl = objectUrlFactory(msg.jpegData);
-
-          framesRef.current.set(msg.name, {
-            objectUrl,
-            previewWidth: msg.previewWidth,
-            previewHeight: msg.previewHeight,
-            timestampNs: msg.timestampNs,
-            frameIndex: msg.frameIndex,
-            receivedAtWallTimeMs,
-            sequence,
-            jpegBytes: msg.jpegData.byteLength,
-          });
-          dirtyRef.current = true;
-          incrementGauge("ws.frames_received_total");
-          incrementGauge(`ws.frames_received_total.${msg.name}`);
-          setGauge("ws.frame_count", framesRef.current.size);
-          setGauge(`ws.frame_latency_ms.${msg.name}`, receiveLatencyMs);
-          setGauge(`ws.frame_index.${msg.name}`, msg.frameIndex);
-          setGauge(`ws.jpeg_bytes.${msg.name}`, msg.jpegData.byteLength);
-          recordTiming("ws.frame_latency.receive", receiveLatencyMs);
+          if (!buffer || !mountedRef.current) return;
+          handlersRef.current.onArrayBuffer?.(buffer);
         })();
       };
 
       const onClose = () => {
-        if (!mountedRef.current) {
-          return;
-        }
-        setConnected(false);
-        setGauge("ws.connected", "Disconnected");
-        setGauge("ws.stream_info_status", "Unavailable");
-        setGauge("ws.active_preview_size", "Unavailable");
-        setGauge("ws.episode_status", "Unavailable");
-        streamInfoRef.current = null;
-        episodeStatusRef.current = null;
-        dirtyRef.current = true;
+        if (!mountedRef.current) return;
+        handlersRef.current.onConnectedChange?.(false);
         wsRef.current = null;
         scheduleReconnect();
       };
 
       const onError = () => {
-        // The close handler drives reconnect behavior.
+        // close handler drives reconnect behavior
       };
 
       ws.addEventListener("open", onOpen);
@@ -304,8 +197,6 @@ export function useWebSocket(
 
     return () => {
       mountedRef.current = false;
-      window.clearInterval(flushInterval);
-      window.clearInterval(streamInfoInterval);
       if (reconnectTimerRef.current != null) {
         window.clearTimeout(reconnectTimerRef.current);
       }
@@ -313,14 +204,224 @@ export function useWebSocket(
         wsRef.current.close();
         wsRef.current = null;
       }
+    };
+  }, [options.binaryType, options.websocketFactory, url]);
+
+  return { send };
+}
+
+// ---------------------------------------------------------------------------
+// Control socket — episode status + episode commands.
+// ---------------------------------------------------------------------------
+
+export function useControlSocket(
+  url: string,
+  options: UseControlSocketOptions = {},
+): ControlSocketState {
+  const websocketFactory = options.websocketFactory ?? defaultWebSocketFactory;
+
+  const [connected, setConnected] = useState(false);
+  const [episodeStatus, setEpisodeStatus] = useState<EpisodeStatusMessage | null>(
+    null,
+  );
+
+  const episodeStatusRef = useRef<EpisodeStatusMessage | null>(null);
+  const dirtyRef = useRef(false);
+
+  const handlers = useRef<SocketHandlers>({
+    onConnectedChange: (value) => {
+      if (value) {
+        setGauge("ws.control.connected", "Connected");
+      } else {
+        setGauge("ws.control.connected", "Disconnected");
+        setGauge("ws.episode_status", "Unavailable");
+      }
+      setConnected(value);
+    },
+    onText: (text) => {
+      const parseStartMs = nowMs();
+      const msg = parseJsonMessage(text);
+      recordTiming("ws.control.parse", nowMs() - parseStartMs);
+      if (msg?.type === "episode_status") {
+        episodeStatusRef.current = msg;
+        dirtyRef.current = true;
+        setGauge("ws.episode_status", msg.state);
+        setGauge("ws.episode_count", msg.episode_count);
+        setGauge("ws.episode_elapsed_ms", msg.elapsed_ms);
+      }
+    },
+  }).current;
+
+  const { send } = useReconnectingSocket(url, {
+    websocketFactory,
+    binaryType: "arraybuffer",
+    handlers,
+  });
+
+  useEffect(() => {
+    setGauge("ws.control.connected", "Disconnected");
+    const flushInterval = window.setInterval(() => {
+      if (!dirtyRef.current) return;
+      dirtyRef.current = false;
+      setEpisodeStatus(episodeStatusRef.current);
+    }, BATCH_INTERVAL_MS);
+    return () => window.clearInterval(flushInterval);
+  }, []);
+
+  return { episodeStatus, connected, send };
+}
+
+// ---------------------------------------------------------------------------
+// Preview socket — camera frames + robot state + set_preview_size.
+// ---------------------------------------------------------------------------
+
+export function usePreviewSocket(
+  url: string,
+  options: UsePreviewSocketOptions = {},
+): PreviewSocketState {
+  const websocketFactory = options.websocketFactory ?? defaultWebSocketFactory;
+  const objectUrlFactory = options.objectUrlFactory ?? defaultObjectUrlFactory;
+  const revokeObjectUrl = options.revokeObjectUrl ?? defaultRevokeObjectUrl;
+
+  const [connected, setConnected] = useState(false);
+  const [frames, setFrames] = useState<Map<string, CameraFrame>>(() => new Map());
+  const [robotStates, setRobotStates] = useState<Map<string, RobotStateMessage>>(
+    () => new Map(),
+  );
+  const [streamInfo, setStreamInfo] = useState<StreamInfoMessage | null>(null);
+
+  const framesRef = useRef<Map<string, CameraFrame>>(new Map());
+  const robotStatesRef = useRef<Map<string, RobotStateMessage>>(new Map());
+  const streamInfoRef = useRef<StreamInfoMessage | null>(null);
+  const dirtyRef = useRef(false);
+  const frameSequenceRef = useRef(0);
+  const wsRef = useRef<WebSocketLike | null>(null);
+
+  const handlers = useRef<SocketHandlers>({
+    onOpen: (ws) => {
+      wsRef.current = ws;
+      ws.send(encodeCommand("get_stream_info"));
+    },
+    onConnectedChange: (value) => {
+      if (value) {
+        setGauge("ws.preview.connected", "Connected");
+      } else {
+        setGauge("ws.preview.connected", "Disconnected");
+        setGauge("ws.stream_info_status", "Unavailable");
+        // Drop any cached preview-plane state when the socket flaps so the
+        // UI doesn't show stale frames or robot positions.
+        revokeFrameUrls(framesRef.current, revokeObjectUrl);
+        framesRef.current.clear();
+        robotStatesRef.current.clear();
+        streamInfoRef.current = null;
+        frameSequenceRef.current = 0;
+        dirtyRef.current = true;
+        wsRef.current = null;
+      }
+      setConnected(value);
+    },
+    onText: (text) => {
+      const parseStartMs = nowMs();
+      const msg = parseJsonMessage(text);
+      recordTiming("ws.parse.json", nowMs() - parseStartMs);
+      if (msg?.type === "robot_state") {
+        robotStatesRef.current.set(msg.name, msg);
+        dirtyRef.current = true;
+        incrementGauge("ws.robot_messages_total");
+        setGauge("ws.robot_state_count", robotStatesRef.current.size);
+      } else if (msg?.type === "stream_info") {
+        streamInfoRef.current = msg;
+        dirtyRef.current = true;
+        setGauge("ws.stream_info_status", "Ready");
+        setGauge("ws.preview_fps_config", msg.configured_preview_fps);
+        setGauge(
+          "ws.active_preview_size",
+          `${msg.active_preview_width}x${msg.active_preview_height}`,
+        );
+      }
+    },
+    onArrayBuffer: (buffer) => {
+      const parseStartMs = nowMs();
+      const msg = parseBinaryMessage(buffer);
+      recordTiming("ws.parse.binary", nowMs() - parseStartMs);
+      if (!msg) return;
+
+      const previous = framesRef.current.get(msg.name);
+      if (previous) {
+        revokeObjectUrl(previous.objectUrl);
+      }
+
+      const receivedAtWallTimeMs = Date.now();
+      const receiveLatencyMs = Math.max(
+        0,
+        receivedAtWallTimeMs - msg.timestampNs / 1_000_000,
+      );
+      const sequence = ++frameSequenceRef.current;
+      const objectUrl = objectUrlFactory(msg.jpegData);
+
+      framesRef.current.set(msg.name, {
+        objectUrl,
+        previewWidth: msg.previewWidth,
+        previewHeight: msg.previewHeight,
+        timestampNs: msg.timestampNs,
+        frameIndex: msg.frameIndex,
+        receivedAtWallTimeMs,
+        sequence,
+        jpegBytes: msg.jpegData.byteLength,
+      });
+      dirtyRef.current = true;
+      incrementGauge("ws.frames_received_total");
+      incrementGauge(`ws.frames_received_total.${msg.name}`);
+      setGauge("ws.frame_count", framesRef.current.size);
+      setGauge(`ws.frame_latency_ms.${msg.name}`, receiveLatencyMs);
+      setGauge(`ws.frame_index.${msg.name}`, msg.frameIndex);
+      setGauge(`ws.jpeg_bytes.${msg.name}`, msg.jpegData.byteLength);
+      recordTiming("ws.frame_latency.receive", receiveLatencyMs);
+    },
+  }).current;
+
+  const { send } = useReconnectingSocket(url, {
+    websocketFactory,
+    binaryType: "arraybuffer",
+    handlers,
+  });
+
+  useEffect(() => {
+    setGauge("ws.preview.connected", "Disconnected");
+    setGauge("ws.frames_received_total", 0);
+    setGauge("ws.robot_messages_total", 0);
+    setGauge("ws.frame_count", 0);
+    setGauge("ws.robot_state_count", 0);
+    setGauge("ws.stream_info_status", "Unavailable");
+
+    const flushInterval = window.setInterval(() => {
+      if (!dirtyRef.current) return;
+      const flushStartMs = nowMs();
+      dirtyRef.current = false;
+      setFrames(new Map(framesRef.current));
+      setRobotStates(new Map(robotStatesRef.current));
+      setStreamInfo(streamInfoRef.current);
+      recordTiming("ws.flush", nowMs() - flushStartMs);
+      setGauge("ws.frame_count", framesRef.current.size);
+      setGauge("ws.robot_state_count", robotStatesRef.current.size);
+    }, BATCH_INTERVAL_MS);
+
+    const streamInfoInterval = window.setInterval(() => {
+      const ws = wsRef.current;
+      if (ws?.readyState === WS_OPEN) {
+        ws.send(encodeCommand("get_stream_info"));
+      }
+    }, 1000);
+
+    return () => {
+      window.clearInterval(flushInterval);
+      window.clearInterval(streamInfoInterval);
       revokeFrameUrls(framesRef.current, revokeObjectUrl);
       framesRef.current.clear();
       robotStatesRef.current.clear();
       streamInfoRef.current = null;
-      episodeStatusRef.current = null;
-      setGauge("ws.connected", "Disconnected");
     };
-  }, [objectUrlFactory, revokeObjectUrl, url, websocketFactory]);
+  }, [revokeObjectUrl]);
 
-  return { frames, robotStates, streamInfo, episodeStatus, connected, send };
+  return { frames, robotStates, streamInfo, connected, send };
 }

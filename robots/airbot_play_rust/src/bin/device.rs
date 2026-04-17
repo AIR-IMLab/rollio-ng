@@ -254,6 +254,8 @@ async fn probe_devices(timeout: Duration) -> Result<Vec<DeviceQueryDevice>, Box<
             channel_type: "arm".into(),
             kind: DeviceType::Robot,
             available: true,
+            channel_label: Some("AIRBOT Play".into()),
+            default_name: Some("airbot_play_arm".into()),
             modes: vec![
                 "free-drive".into(),
                 "command-following".into(),
@@ -294,10 +296,20 @@ async fn probe_devices(timeout: Duration) -> Result<Vec<DeviceQueryDevice>, Box<
             .as_deref()
             .map(MountedEefType::from_label);
         if let Some((eef_channel_type, defaults)) = mounted_eef_channel(mounted.as_ref()) {
+            let (channel_label, default_name) = match eef_channel_type.as_str() {
+                "e2" => ("AIRBOT E2".to_string(), "airbot_e2".to_string()),
+                "g2" => ("AIRBOT G2".to_string(), "airbot_g2".to_string()),
+                other => (
+                    format!("AIRBOT {}", other.to_uppercase()),
+                    format!("airbot_{other}"),
+                ),
+            };
             channels.push(DeviceQueryChannel {
                 channel_type: eef_channel_type,
                 kind: DeviceType::Robot,
                 available: true,
+                channel_label: Some(channel_label),
+                default_name: Some(default_name),
                 modes: vec![
                     "free-drive".into(),
                     "command-following".into(),

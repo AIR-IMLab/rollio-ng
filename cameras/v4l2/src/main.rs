@@ -522,6 +522,8 @@ fn query_device(path: &str) -> Result<DeviceQueryResponse, DynError> {
                 channel_type: "color".into(),
                 kind: DeviceType::Camera,
                 available: true,
+                channel_label: Some("V4L2 Camera".into()),
+                default_name: Some("camera".into()),
                 modes: vec!["enabled".into(), "disabled".into()],
                 profiles,
                 supported_states: Vec::new(),

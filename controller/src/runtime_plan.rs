@@ -8,7 +8,13 @@ use rollio_types::config::{
 };
 use std::error::Error;
 use std::ffi::OsString;
+use std::net::TcpListener;
 use std::path::Path;
+
+fn reserve_loopback_port() -> Result<u16, Box<dyn Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    Ok(listener.local_addr()?.port())
+}
 
 pub(crate) fn build_collect_specs(
     config: &ProjectConfig,
@@ -16,6 +22,17 @@ pub(crate) fn build_collect_specs(
     current_exe_dir: &Path,
 ) -> Result<Vec<ChildSpec>, Box<dyn Error>> {
     let mut specs = build_preview_specs(config, workspace_root, current_exe_dir)?;
+
+    // The control server hosts the long-lived control plane WebSocket and
+    // forwards episode commands / status / backpressure via iceoryx2. The
+    // visualizer is now read-only.
+    let control_port = reserve_loopback_port()?;
+    specs.push(build_control_server_spec(
+        ControlServerRole::Collect,
+        control_port,
+        workspace_root,
+        current_exe_dir,
+    )?);
 
     for encoder_config in config.encoder_runtime_configs_v2() {
         specs.push(build_encoder_spec(
@@ -40,7 +57,11 @@ pub(crate) fn build_collect_specs(
         current_exe_dir,
     )?);
 
-    let ui_runtime_config = config.ui_runtime_config();
+    let mut ui_runtime_config = config.ui_runtime_config();
+    if ui_runtime_config.control_websocket_url.is_none() {
+        ui_runtime_config.control_websocket_url =
+            Some(format!("ws://127.0.0.1:{control_port}"));
+    }
     let web_bundle_dir = workspace_root.join("ui/web/dist");
     let web_index = web_bundle_dir.join("index.html");
     if !web_index.exists() {
@@ -52,9 +73,13 @@ pub(crate) fn build_collect_specs(
     }
 
     ui_runtime_config
-        .websocket_url
+        .preview_websocket_url
         .as_ref()
-        .ok_or("ui runtime config did not produce an upstream websocket url")?;
+        .ok_or("ui runtime config did not produce an upstream preview websocket url")?;
+    ui_runtime_config
+        .control_websocket_url
+        .as_ref()
+        .ok_or("ui runtime config did not produce an upstream control websocket url")?;
     eprintln!(
         "rollio: web ui available at {}",
         ui_browser_url(&ui_runtime_config.http_host, ui_runtime_config.http_port)
@@ -123,6 +148,50 @@ pub(crate) fn build_visualizer_spec(
             args: vec![
                 OsString::from("--config-inline"),
                 OsString::from(visualizer_config),
+            ],
+        },
+        working_directory: workspace_root.to_path_buf(),
+        inherit_stdio: false,
+    })
+}
+
+/// Role that the control server plays in the lifecycle.
+///
+/// The control server forwards UI commands and state for either the setup
+/// wizard or the collect session. Both roles share the same binary, but
+/// subscribe to/publish on different iceoryx2 services.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ControlServerRole {
+    Setup,
+    Collect,
+}
+
+impl ControlServerRole {
+    fn as_toml_value(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Collect => "collect",
+        }
+    }
+}
+
+pub(crate) fn build_control_server_spec(
+    role: ControlServerRole,
+    port: u16,
+    workspace_root: &Path,
+    current_exe_dir: &Path,
+) -> Result<ChildSpec, Box<dyn Error>> {
+    let inline_config = format!("port = {port}\nrole = \"{}\"\n", role.as_toml_value());
+    Ok(ChildSpec {
+        id: "control-server".into(),
+        command: ResolvedCommand {
+            program: resolve_program(
+                current_exe_dir.join("rollio-control-server"),
+                "rollio-control-server",
+            ),
+            args: vec![
+                OsString::from("--config-inline"),
+                OsString::from(inline_config),
             ],
         },
         working_directory: workspace_root.to_path_buf(),

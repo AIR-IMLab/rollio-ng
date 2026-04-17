@@ -706,6 +706,8 @@ fn query_pseudo_device(id: &str) -> Option<DeviceQueryDevice> {
                 channel_type: "color".into(),
                 kind: DeviceType::Camera,
                 available: true,
+                channel_label: Some("Pseudo Camera".into()),
+                default_name: Some("pseudo_camera".into()),
                 modes: vec!["enabled".into(), "disabled".into()],
                 profiles: vec![
                     CameraChannelProfile {
@@ -744,6 +746,16 @@ fn query_pseudo_device(id: &str) -> Option<DeviceQueryDevice> {
                 channel_type: "arm".into(),
                 kind: DeviceType::Robot,
                 available: true,
+                channel_label: Some(if dof == 1 {
+                    "Pseudo End Effector".into()
+                } else {
+                    "Pseudo Arm".into()
+                }),
+                default_name: Some(if dof == 1 {
+                    "pseudo_eef".into()
+                } else {
+                    "pseudo_arm".into()
+                }),
                 modes: vec![
                     "free-drive".into(),
                     "command-following".into(),

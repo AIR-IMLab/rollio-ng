@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { Box, useInput, useStdin, useStdout } from "ink";
-import { useWebSocket } from "./lib/websocket.js";
+import { useControlSocket, usePreviewSocket } from "./lib/websocket.js";
 import { encodeEpisodeCommand } from "./lib/protocol.js";
 import { getTerminalMetrics } from "./lib/terminal-geometry.js";
 import { TitleBar } from "./components/TitleBar.js";
@@ -38,13 +38,15 @@ function useTerminalMetrics() {
 }
 
 type AppProps = {
-  websocketUrl: string;
+  controlWebsocketUrl: string;
+  previewWebsocketUrl: string;
   initialAsciiRendererId: AsciiRendererId;
   episodeKeyBindings: EpisodeKeyBindings;
 };
 
 export function App({
-  websocketUrl,
+  controlWebsocketUrl,
+  previewWebsocketUrl,
   initialAsciiRendererId,
   episodeKeyBindings,
 }: AppProps) {
@@ -52,9 +54,22 @@ export function App({
   const { columns, rows, cellGeometry } = useTerminalMetrics();
   const { isRawModeSupported } = useStdin();
   const supportsInteractiveInput = isRawModeSupported === true;
-  const { frames, robotStates, streamInfo, episodeStatus, connected, send } = useWebSocket(
-    websocketUrl,
-  );
+  const {
+    connected: controlConnected,
+    send: sendControl,
+    episodeStatus,
+  } = useControlSocket(controlWebsocketUrl);
+  const {
+    connected: previewConnected,
+    send: sendPreview,
+    frames,
+    robotStates,
+    streamInfo,
+  } = usePreviewSocket(previewWebsocketUrl);
+  // Surface "fully connected" only when both planes are up. The episode
+  // command path lives on the control socket; previews lighting up second
+  // shouldn't degrade the indicator alone.
+  const connected = controlConnected;
   const [showDebug, setShowDebug] = useState(false);
   const [cameraRendererId, setCameraRendererId] = useState<AsciiRendererId>(
     initialAsciiRendererId,
@@ -78,7 +93,9 @@ export function App({
       } else if (action === "cycle_renderer") {
         setCameraRendererId((previous) => nextAsciiRendererId(previous));
       } else if (action != null) {
-        send(encodeEpisodeCommand(action));
+        // Episode commands are control plane traffic — route via the
+        // control socket, not the preview socket.
+        sendControl(encodeEpisodeCommand(action));
         setGauge("ui.last_episode_command", action);
       }
     },
@@ -161,8 +178,8 @@ export function App({
         frames={frames}
         robotStates={robotStates}
         streamInfo={streamInfo}
-        connected={connected}
-        send={send}
+        connected={previewConnected}
+        send={sendPreview}
         width={columns}
         availableRows={contentHeight}
         cellGeometry={cellGeometry}
