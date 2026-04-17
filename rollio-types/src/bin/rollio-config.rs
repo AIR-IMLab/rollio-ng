@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use rollio_types::config::Config;
+use rollio_types::config::ProjectConfig;
 use rollio_types::schema::build_config_schema;
 use std::error::Error;
 use std::path::PathBuf;
@@ -44,10 +44,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn validate(args: ValidateArgs) -> Result<(), Box<dyn Error>> {
     if let Some(path) = args.config {
-        Config::from_file(&path)?;
+        ProjectConfig::from_file(&path)?;
         println!("config is valid: {}", path.display());
     } else if let Some(inline) = args.config_inline {
-        inline.parse::<Config>()?;
+        inline.parse::<ProjectConfig>()?;
         println!("config is valid");
     } else {
         return Err("validate requires either --config or --config-inline".into());

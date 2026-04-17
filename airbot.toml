@@ -1,0 +1,20 @@
+name = "airbot_play"
+driver = "airbot-play"
+id = "PZ60C02603000894"
+bus_root = "airbot_play"
+interface = "can0"
+end_effector = "e2"
+
+[[channels]]
+channel_type = "arm"
+kind = "robot"
+mode = "free-drive"
+dof = 6
+publish_states = ["joint_position", "joint_velocity", "joint_effort", "end_effector_pose"]
+
+[[channels]]
+channel_type = "e2"
+kind = "robot"
+mode = "free-drive"
+dof = 1
+publish_states = ["parallel_position", "parallel_velocity", "parallel_effort"]

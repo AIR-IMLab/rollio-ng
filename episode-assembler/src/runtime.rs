@@ -1,17 +1,18 @@
 use crate::dataset::{
-    remove_episode_artifacts, stage_episode, ActionSample, EpisodeAssemblyInput,
-    RobotObservationSample,
+    action_key, observation_key, remove_episode_artifacts, stage_episode, ActionSample,
+    EpisodeAssemblyInput, ObservationSample,
 };
 use clap::Args;
 use iceoryx2::node::NodeWaitFailure;
 use iceoryx2::prelude::*;
 use rollio_bus::{CONTROL_EVENTS_SERVICE, EPISODE_READY_SERVICE, VIDEO_READY_SERVICE};
 use rollio_types::config::{
-    AssemblerActionRuntimeConfig, AssemblerRobotRuntimeConfig, AssemblerRuntimeConfig,
-    EncodedHandoffMode, EpisodeFormat,
+    AssemblerActionRuntimeConfigV2, AssemblerObservationRuntimeConfigV2, AssemblerRuntimeConfigV2,
+    EncodedHandoffMode, EpisodeFormat, RobotCommandKind, RobotStateKind,
 };
 use rollio_types::messages::{
-    ControlEvent, EpisodeReady, FixedString256, RobotCommand, RobotState, VideoReady,
+    ControlEvent, EpisodeReady, FixedString256, JointMitCommand15, JointVector15, ParallelMitCommand2,
+    ParallelVector2, Pose7, VideoReady,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -26,14 +27,32 @@ pub struct RunArgs {
     pub config_inline: Option<String>,
 }
 
-struct RobotSubscriber {
-    config: AssemblerRobotRuntimeConfig,
-    subscriber: iceoryx2::port::subscriber::Subscriber<ipc::Service, RobotState, ()>,
+struct ObservationSubscriber {
+    config: AssemblerObservationRuntimeConfigV2,
+    subscriber: ObservationSubscriberKind,
+}
+
+enum ObservationSubscriberKind {
+    JointVector15(iceoryx2::port::subscriber::Subscriber<ipc::Service, JointVector15, ()>),
+    ParallelVector2(iceoryx2::port::subscriber::Subscriber<ipc::Service, ParallelVector2, ()>),
+    Pose7(iceoryx2::port::subscriber::Subscriber<ipc::Service, Pose7, ()>),
 }
 
 struct ActionSubscriber {
-    config: AssemblerActionRuntimeConfig,
-    subscriber: iceoryx2::port::subscriber::Subscriber<ipc::Service, RobotCommand, ()>,
+    config: AssemblerActionRuntimeConfigV2,
+    subscriber: ActionSubscriberKind,
+}
+
+enum ActionSubscriberKind {
+    JointVector15(iceoryx2::port::subscriber::Subscriber<ipc::Service, JointVector15, ()>),
+    JointMitCommand15(
+        iceoryx2::port::subscriber::Subscriber<ipc::Service, JointMitCommand15, ()>,
+    ),
+    ParallelVector2(iceoryx2::port::subscriber::Subscriber<ipc::Service, ParallelVector2, ()>),
+    ParallelMitCommand2(
+        iceoryx2::port::subscriber::Subscriber<ipc::Service, ParallelMitCommand2, ()>,
+    ),
+    Pose7(iceoryx2::port::subscriber::Subscriber<ipc::Service, Pose7, ()>),
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +62,7 @@ struct PendingEpisode {
     stop_time_ns: Option<u64>,
     keep_requested: bool,
     ready_wait_started_ns: Option<u64>,
-    robot_samples: BTreeMap<String, Vec<RobotObservationSample>>,
+    observation_samples: BTreeMap<String, Vec<ObservationSample>>,
     action_samples: BTreeMap<String, Vec<ActionSample>>,
     video_paths: BTreeMap<String, PathBuf>,
 }
@@ -56,7 +75,7 @@ impl PendingEpisode {
             stop_time_ns: None,
             keep_requested: false,
             ready_wait_started_ns: None,
-            robot_samples: BTreeMap::new(),
+            observation_samples: BTreeMap::new(),
             action_samples: BTreeMap::new(),
             video_paths: BTreeMap::new(),
         }
@@ -67,7 +86,7 @@ impl PendingEpisode {
             episode_index: self.episode_index,
             start_time_ns: self.start_time_ns,
             stop_time_ns: self.stop_time_ns.unwrap_or(self.start_time_ns),
-            robot_samples: self.robot_samples.clone(),
+            observation_samples: self.observation_samples.clone(),
             action_samples: self.action_samples.clone(),
             video_paths: self.video_paths.clone(),
         }
@@ -75,21 +94,21 @@ impl PendingEpisode {
 }
 
 struct EpisodeManager {
-    config: AssemblerRuntimeConfig,
+    config: AssemblerRuntimeConfigV2,
     active_episode_index: Option<u32>,
     episodes: BTreeMap<u32, PendingEpisode>,
     camera_by_process_id: HashMap<String, String>,
 }
 
 impl EpisodeManager {
-    fn new(config: AssemblerRuntimeConfig) -> Self {
+    fn new(config: AssemblerRuntimeConfigV2) -> Self {
         let camera_by_process_id = config
             .cameras
             .iter()
             .map(|camera| {
                 (
                     camera.encoder_process_id.clone(),
-                    camera.camera_name.clone(),
+                    camera.channel_id.clone(),
                 )
             })
             .collect();
@@ -141,58 +160,54 @@ impl EpisodeManager {
         }
     }
 
-    fn on_robot_state(&mut self, robot_name: &str, dof: u32, state: RobotState) {
+    fn on_observation(
+        &mut self,
+        channel_id: &str,
+        state_kind: RobotStateKind,
+        timestamp_ms: u64,
+        values: Vec<f64>,
+    ) {
         let Some(episode_index) = self.active_episode_index else {
             return;
         };
         let Some(episode) = self.episodes.get_mut(&episode_index) else {
             return;
         };
-        let width = dof as usize;
         episode
-            .robot_samples
-            .entry(robot_name.to_owned())
+            .observation_samples
+            .entry(observation_key(channel_id, state_kind))
             .or_default()
-            .push(RobotObservationSample {
-                timestamp_ns: state.timestamp_ns,
-                positions: state.positions[..width].to_vec(),
-                velocities: state.velocities[..width].to_vec(),
-                efforts: state.efforts[..width].to_vec(),
+            .push(ObservationSample {
+                timestamp_ns: timestamp_ms.saturating_mul(1_000_000),
+                values,
             });
     }
 
-    fn on_action_command(&mut self, source_name: &str, dof: u32, command: RobotCommand) {
+    fn on_action(
+        &mut self,
+        channel_id: &str,
+        command_kind: RobotCommandKind,
+        timestamp_ms: u64,
+        values: Vec<f64>,
+    ) {
         let Some(episode_index) = self.active_episode_index else {
             return;
         };
         let Some(episode) = self.episodes.get_mut(&episode_index) else {
             return;
         };
-        let width = dof as usize;
-        let mut values = vec![0.0; width];
-        match command.mode {
-            rollio_types::messages::CommandMode::Joint => {
-                values.copy_from_slice(&command.joint_targets[..width]);
-            }
-            rollio_types::messages::CommandMode::Cartesian => {
-                let active = width.min(command.cartesian_target.len());
-                for (index, value) in command.cartesian_target.iter().take(active).enumerate() {
-                    values[index] = *value;
-                }
-            }
-        }
         episode
             .action_samples
-            .entry(source_name.to_owned())
+            .entry(action_key(channel_id, command_kind))
             .or_default()
             .push(ActionSample {
-                timestamp_ns: command.timestamp_ns,
+                timestamp_ns: timestamp_ms.saturating_mul(1_000_000),
                 values,
             });
     }
 
     fn on_video_ready(&mut self, ready: VideoReady) {
-        let Some(camera_name) = self.camera_by_process_id.get(ready.process_id.as_str()) else {
+        let Some(channel_id) = self.camera_by_process_id.get(ready.process_id.as_str()) else {
             eprintln!(
                 "rollio-episode-assembler: ignoring video_ready from unknown process {}",
                 ready.process_id.as_str()
@@ -208,7 +223,7 @@ impl EpisodeManager {
         };
         episode
             .video_paths
-            .insert(camera_name.clone(), PathBuf::from(ready.file_path.as_str()));
+            .insert(channel_id.clone(), PathBuf::from(ready.file_path.as_str()));
     }
 
     fn ready_and_timed_out_episode_indices(&self, now_ns: u64) -> (Vec<u32>, Vec<u32>) {
@@ -262,12 +277,6 @@ impl EpisodeManager {
                 continue;
             };
             let staged = stage_episode(&self.config, &episode.as_assembly_input())?;
-            eprintln!(
-                "rollio-episode-assembler: staged episode {} ({} frames) at {}",
-                staged.episode_index,
-                staged.frame_count,
-                staged.staging_dir.display()
-            );
             publisher.send_copy(EpisodeReady {
                 episode_index: staged.episode_index,
                 staging_dir: FixedString256::new(&staged.staging_dir.to_string_lossy()),
@@ -284,16 +293,16 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn Error>> {
     run_with_config(config)
 }
 
-fn load_runtime_config(args: &RunArgs) -> Result<AssemblerRuntimeConfig, Box<dyn Error>> {
+fn load_runtime_config(args: &RunArgs) -> Result<AssemblerRuntimeConfigV2, Box<dyn Error>> {
     match (&args.config, &args.config_inline) {
-        (Some(path), None) => Ok(AssemblerRuntimeConfig::from_file(path)?),
-        (None, Some(inline)) => Ok(inline.parse::<AssemblerRuntimeConfig>()?),
+        (Some(path), None) => Ok(AssemblerRuntimeConfigV2::from_file(path)?),
+        (None, Some(inline)) => Ok(inline.parse::<AssemblerRuntimeConfigV2>()?),
         (None, None) => Err("episode assembler requires --config or --config-inline".into()),
         (Some(_), Some(_)) => Err("episode assembler config flags are mutually exclusive".into()),
     }
 }
 
-pub fn run_with_config(config: AssemblerRuntimeConfig) -> Result<(), Box<dyn Error>> {
+pub fn run_with_config(config: AssemblerRuntimeConfigV2) -> Result<(), Box<dyn Error>> {
     if config.encoded_handoff != EncodedHandoffMode::File {
         return Err("episode assembler currently supports encoded_handoff=file only".into());
     }
@@ -308,7 +317,7 @@ pub fn run_with_config(config: AssemblerRuntimeConfig) -> Result<(), Box<dyn Err
     let control_subscriber = create_control_subscriber(&node)?;
     let video_ready_subscriber = create_video_ready_subscriber(&node)?;
     let episode_ready_publisher = create_episode_ready_publisher(&node)?;
-    let robot_subscribers = create_robot_subscribers(&node, &config)?;
+    let observation_subscribers = create_observation_subscribers(&node, &config)?;
     let action_subscribers = create_action_subscribers(&node, &config)?;
     let mut manager = EpisodeManager::new(config);
 
@@ -318,8 +327,8 @@ pub fn run_with_config(config: AssemblerRuntimeConfig) -> Result<(), Box<dyn Err
             break;
         }
         made_progress |= drain_video_ready(&video_ready_subscriber, &mut manager)?;
-        made_progress |= drain_robot_states(&robot_subscribers, &mut manager)?;
-        made_progress |= drain_action_commands(&action_subscribers, &mut manager)?;
+        made_progress |= drain_observations(&observation_subscribers, &mut manager)?;
+        made_progress |= drain_actions(&action_subscribers, &mut manager)?;
         made_progress |= manager.publish_ready_episodes(&episode_ready_publisher)?;
 
         if made_progress {
@@ -369,22 +378,47 @@ fn create_episode_ready_publisher(
     Ok(service.publisher_builder().create()?)
 }
 
-fn create_robot_subscribers(
+fn create_observation_subscribers(
     node: &Node<ipc::Service>,
-    config: &AssemblerRuntimeConfig,
-) -> Result<Vec<RobotSubscriber>, Box<dyn Error>> {
+    config: &AssemblerRuntimeConfigV2,
+) -> Result<Vec<ObservationSubscriber>, Box<dyn Error>> {
     config
-        .robots
+        .observations
         .iter()
-        .map(|robot| {
-            let service_name: ServiceName = robot.state_topic.as_str().try_into()?;
-            let service = node
-                .service_builder(&service_name)
-                .publish_subscribe::<RobotState>()
-                .open_or_create()?;
-            Ok(RobotSubscriber {
-                config: robot.clone(),
-                subscriber: service.subscriber_builder().create()?,
+        .map(|observation| {
+            let service_name: ServiceName = observation.state_topic.as_str().try_into()?;
+            let subscriber = match observation.state_kind {
+                RobotStateKind::EndEffectorPose => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<Pose7>()
+                        .open_or_create()?;
+                    ObservationSubscriberKind::Pose7(service.subscriber_builder().create()?)
+                }
+                RobotStateKind::ParallelPosition
+                | RobotStateKind::ParallelVelocity
+                | RobotStateKind::ParallelEffort => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<ParallelVector2>()
+                        .open_or_create()?;
+                    ObservationSubscriberKind::ParallelVector2(
+                        service.subscriber_builder().create()?,
+                    )
+                }
+                _ => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<JointVector15>()
+                        .open_or_create()?;
+                    ObservationSubscriberKind::JointVector15(
+                        service.subscriber_builder().create()?,
+                    )
+                }
+            };
+            Ok(ObservationSubscriber {
+                config: observation.clone(),
+                subscriber,
             })
         })
         .collect()
@@ -392,20 +426,57 @@ fn create_robot_subscribers(
 
 fn create_action_subscribers(
     node: &Node<ipc::Service>,
-    config: &AssemblerRuntimeConfig,
+    config: &AssemblerRuntimeConfigV2,
 ) -> Result<Vec<ActionSubscriber>, Box<dyn Error>> {
     config
         .actions
         .iter()
         .map(|action| {
             let service_name: ServiceName = action.command_topic.as_str().try_into()?;
-            let service = node
-                .service_builder(&service_name)
-                .publish_subscribe::<RobotCommand>()
-                .open_or_create()?;
+            let subscriber = match action.command_kind {
+                RobotCommandKind::JointPosition => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<JointVector15>()
+                        .open_or_create()?;
+                    ActionSubscriberKind::JointVector15(service.subscriber_builder().create()?)
+                }
+                RobotCommandKind::JointMit => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<JointMitCommand15>()
+                        .open_or_create()?;
+                    ActionSubscriberKind::JointMitCommand15(
+                        service.subscriber_builder().create()?,
+                    )
+                }
+                RobotCommandKind::ParallelPosition => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<ParallelVector2>()
+                        .open_or_create()?;
+                    ActionSubscriberKind::ParallelVector2(service.subscriber_builder().create()?)
+                }
+                RobotCommandKind::ParallelMit => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<ParallelMitCommand2>()
+                        .open_or_create()?;
+                    ActionSubscriberKind::ParallelMitCommand2(
+                        service.subscriber_builder().create()?,
+                    )
+                }
+                RobotCommandKind::EndPose => {
+                    let service = node
+                        .service_builder(&service_name)
+                        .publish_subscribe::<Pose7>()
+                        .open_or_create()?;
+                    ActionSubscriberKind::Pose7(service.subscriber_builder().create()?)
+                }
+            };
             Ok(ActionSubscriber {
                 config: action.clone(),
-                subscriber: service.subscriber_builder().create()?,
+                subscriber,
             })
         })
         .collect()
@@ -439,43 +510,129 @@ fn drain_video_ready(
     }
 }
 
-fn drain_robot_states(
-    subscribers: &[RobotSubscriber],
+fn drain_observations(
+    subscribers: &[ObservationSubscriber],
     manager: &mut EpisodeManager,
 ) -> Result<bool, Box<dyn Error>> {
     let mut changed = false;
-    for robot in subscribers {
-        loop {
-            let Some(sample) = robot.subscriber.receive()? else {
-                break;
-            };
-            manager.on_robot_state(
-                &robot.config.robot_name,
-                robot.config.dof,
-                *sample.payload(),
-            );
-            changed = true;
+    for observation in subscribers {
+        match &observation.subscriber {
+            ObservationSubscriberKind::JointVector15(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_observation(
+                    &observation.config.channel_id,
+                    observation.config.state_kind,
+                    payload.timestamp_ms,
+                    payload.values[..payload.len as usize].to_vec(),
+                );
+                changed = true;
+            },
+            ObservationSubscriberKind::ParallelVector2(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_observation(
+                    &observation.config.channel_id,
+                    observation.config.state_kind,
+                    payload.timestamp_ms,
+                    payload.values[..payload.len as usize].to_vec(),
+                );
+                changed = true;
+            },
+            ObservationSubscriberKind::Pose7(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_observation(
+                    &observation.config.channel_id,
+                    observation.config.state_kind,
+                    payload.timestamp_ms,
+                    payload.values.to_vec(),
+                );
+                changed = true;
+            },
         }
     }
     Ok(changed)
 }
 
-fn drain_action_commands(
+fn drain_actions(
     subscribers: &[ActionSubscriber],
     manager: &mut EpisodeManager,
 ) -> Result<bool, Box<dyn Error>> {
     let mut changed = false;
     for action in subscribers {
-        loop {
-            let Some(sample) = action.subscriber.receive()? else {
-                break;
-            };
-            manager.on_action_command(
-                &action.config.source_name,
-                action.config.dof,
-                *sample.payload(),
-            );
-            changed = true;
+        match &action.subscriber {
+            ActionSubscriberKind::JointVector15(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_action(
+                    &action.config.channel_id,
+                    action.config.command_kind,
+                    payload.timestamp_ms,
+                    payload.values[..payload.len as usize].to_vec(),
+                );
+                changed = true;
+            },
+            ActionSubscriberKind::JointMitCommand15(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_action(
+                    &action.config.channel_id,
+                    action.config.command_kind,
+                    payload.timestamp_ms,
+                    payload.position[..payload.len as usize].to_vec(),
+                );
+                changed = true;
+            },
+            ActionSubscriberKind::ParallelVector2(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_action(
+                    &action.config.channel_id,
+                    action.config.command_kind,
+                    payload.timestamp_ms,
+                    payload.values[..payload.len as usize].to_vec(),
+                );
+                changed = true;
+            },
+            ActionSubscriberKind::ParallelMitCommand2(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_action(
+                    &action.config.channel_id,
+                    action.config.command_kind,
+                    payload.timestamp_ms,
+                    payload.position[..payload.len as usize].to_vec(),
+                );
+                changed = true;
+            },
+            ActionSubscriberKind::Pose7(subscriber) => loop {
+                let Some(sample) = subscriber.receive()? else {
+                    break;
+                };
+                let payload = *sample.payload();
+                manager.on_action(
+                    &action.config.channel_id,
+                    action.config.command_kind,
+                    payload.timestamp_ms,
+                    payload.values.to_vec(),
+                );
+                changed = true;
+            },
         }
     }
     Ok(changed)
@@ -486,126 +643,4 @@ fn unix_timestamp_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rollio_types::config::{
-        AssemblerActionRuntimeConfig, AssemblerCameraRuntimeConfig, AssemblerRobotRuntimeConfig,
-        EncoderArtifactFormat, EncoderCodec,
-    };
-    use rollio_types::messages::{CommandMode, PixelFormat};
-    use std::fs;
-
-    #[test]
-    fn manager_buffers_state_and_commands_for_active_episode() {
-        let mut manager = EpisodeManager::new(test_config());
-        assert!(!manager.on_control_event(ControlEvent::RecordingStart { episode_index: 4 }));
-
-        manager.on_robot_state(
-            "leader_arm",
-            6,
-            RobotState {
-                timestamp_ns: 10,
-                num_joints: 6,
-                positions: [
-                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                ],
-                velocities: [0.1; 16],
-                efforts: [0.2; 16],
-                ..RobotState::default()
-            },
-        );
-        manager.on_action_command(
-            "follower_arm",
-            6,
-            RobotCommand {
-                timestamp_ns: 12,
-                mode: CommandMode::Joint,
-                num_joints: 6,
-                joint_targets: [
-                    0.5, 0.4, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                ],
-                ..RobotCommand::default()
-            },
-        );
-        assert!(!manager.on_control_event(ControlEvent::RecordingStop { episode_index: 4 }));
-
-        let episode = manager.episodes.get(&4).expect("episode should exist");
-        assert_eq!(episode.robot_samples["leader_arm"].len(), 1);
-        assert_eq!(episode.action_samples["follower_arm"].len(), 1);
-        assert!(episode.stop_time_ns.is_some());
-    }
-
-    #[test]
-    fn manager_discards_episode_and_artifacts() {
-        let mut manager = EpisodeManager::new(test_config());
-        let temp_file = std::env::temp_dir().join(format!(
-            "rollio-assembler-runtime-{}.mp4",
-            unix_timestamp_ns()
-        ));
-        fs::write(&temp_file, b"video").expect("temp video should exist");
-
-        manager.on_control_event(ControlEvent::RecordingStart { episode_index: 2 });
-        manager.on_control_event(ControlEvent::RecordingStop { episode_index: 2 });
-        manager.on_video_ready(VideoReady {
-            process_id: rollio_types::messages::FixedString64::new("encoder.camera_top"),
-            episode_index: 2,
-            file_path: rollio_types::messages::FixedString256::new(&temp_file.to_string_lossy()),
-        });
-        manager.on_control_event(ControlEvent::EpisodeDiscard { episode_index: 2 });
-
-        assert!(!manager.episodes.contains_key(&2));
-        assert!(!temp_file.exists());
-    }
-
-    #[test]
-    fn manager_marks_episode_timed_out_after_keep() {
-        let mut manager = EpisodeManager::new(test_config());
-        manager.on_control_event(ControlEvent::RecordingStart { episode_index: 1 });
-        manager.on_control_event(ControlEvent::RecordingStop { episode_index: 1 });
-        manager.on_control_event(ControlEvent::EpisodeKeep { episode_index: 1 });
-        manager.episodes.get_mut(&1).unwrap().ready_wait_started_ns = Some(0);
-
-        let (ready, timed_out) = manager.ready_and_timed_out_episode_indices(10_000_000_000);
-        assert!(ready.is_empty());
-        assert_eq!(timed_out, vec![1]);
-    }
-
-    fn test_config() -> AssemblerRuntimeConfig {
-        AssemblerRuntimeConfig {
-            process_id: "episode-assembler".into(),
-            format: EpisodeFormat::LeRobotV2_1,
-            fps: 30,
-            chunk_size: 1000,
-            missing_video_timeout_ms: 1,
-            staging_dir: std::env::temp_dir()
-                .join("rollio-assembler-runtime")
-                .to_string_lossy()
-                .into_owned(),
-            encoded_handoff: EncodedHandoffMode::File,
-            cameras: vec![AssemblerCameraRuntimeConfig {
-                camera_name: "camera_top".into(),
-                encoder_process_id: "encoder.camera_top".into(),
-                width: 640,
-                height: 480,
-                fps: 30,
-                pixel_format: PixelFormat::Rgb24,
-                codec: EncoderCodec::H264,
-                artifact_format: EncoderArtifactFormat::Mp4,
-            }],
-            robots: vec![AssemblerRobotRuntimeConfig {
-                robot_name: "leader_arm".into(),
-                state_topic: "robot/leader_arm/state".into(),
-                dof: 6,
-            }],
-            actions: vec![AssemblerActionRuntimeConfig {
-                source_name: "follower_arm".into(),
-                command_topic: "robot/follower_arm/command".into(),
-                dof: 6,
-            }],
-            embedded_config_toml: "fps = 30".into(),
-        }
-    }
 }

@@ -3,6 +3,10 @@ name = "rollio-robot-pseudo"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rollio-device-pseudo"
+path = "src/bin/device.rs"
+
 [dependencies]
 rollio-bus = { path = "../../rollio-bus" }
 rollio-types = { path = "../../rollio-types" }

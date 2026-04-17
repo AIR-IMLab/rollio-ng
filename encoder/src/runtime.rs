@@ -2,10 +2,8 @@ use crate::error::{map_iceoryx_error, EncoderError, Result};
 use crate::media::{self, EncodedArtifact, OwnedFrame};
 use clap::Args;
 use iceoryx2::prelude::*;
-use rollio_bus::{
-    camera_frames_service_name, BACKPRESSURE_SERVICE, CONTROL_EVENTS_SERVICE, VIDEO_READY_SERVICE,
-};
-use rollio_types::config::EncoderRuntimeConfig;
+use rollio_bus::{BACKPRESSURE_SERVICE, CONTROL_EVENTS_SERVICE, VIDEO_READY_SERVICE};
+use rollio_types::config::EncoderRuntimeConfigV2;
 use rollio_types::messages::{
     BackpressureEvent, CameraFrameHeader, ControlEvent, FixedString256, FixedString64, VideoReady,
 };
@@ -200,7 +198,7 @@ pub fn run(args: RunArgs) -> Result<()> {
 }
 
 fn worker_main(
-    config: EncoderRuntimeConfig,
+    config: EncoderRuntimeConfigV2,
     control_rx: mpsc::Receiver<WorkerControl>,
     frame_rx: mpsc::Receiver<OwnedFrame>,
     event_tx: mpsc::Sender<WorkerEvent>,
@@ -307,29 +305,20 @@ fn worker_main(
     }
 }
 
-fn load_runtime_config(args: &RunArgs) -> Result<EncoderRuntimeConfig> {
+fn load_runtime_config(args: &RunArgs) -> Result<EncoderRuntimeConfigV2> {
     if let Some(path) = &args.config {
-        return EncoderRuntimeConfig::from_file(path).map_err(Into::into);
+        return EncoderRuntimeConfigV2::from_file(path).map_err(Into::into);
     }
     if let Some(inline) = &args.config_inline {
-        return inline.parse::<EncoderRuntimeConfig>().map_err(Into::into);
+        return inline.parse::<EncoderRuntimeConfigV2>().map_err(Into::into);
     }
     Err(EncoderError::message(
         "run requires either --config or --config-inline",
     ))
 }
 
-fn frame_topic(config: &EncoderRuntimeConfig) -> String {
-    config
-        .frame_topic
-        .clone()
-        .or_else(|| {
-            config
-                .camera_name
-                .as_ref()
-                .map(|camera_name| camera_frames_service_name(camera_name))
-        })
-        .expect("validated runtime config should provide a frame topic")
+fn frame_topic(config: &EncoderRuntimeConfigV2) -> String {
+    config.frame_topic.clone()
 }
 
 fn publish_video_ready(

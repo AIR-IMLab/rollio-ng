@@ -46,7 +46,7 @@ isProject: false
 
 ## Why This Migration Is Needed
 
-- Setup discovery is still framework-owned in [controller/src/setup.rs](controller/src/setup.rs) via `known_drivers()`, `derive_attached_airbot_eef_discovery()`, and several AIRBOT- and V4L2-specific heuristics.
+- Setup discovery is still framework-owned in [controller/src/setup.rs](controller/src/setup.rs) via `known_drivers()`, mounted AIRBOT end-effector channel synthesis, and several AIRBOT- and V4L2-specific heuristics.
 - Executable resolution is still hardcoded around `rollio-camera-*` and `rollio-robot-*` in [controller/src/runtime_paths.rs](controller/src/runtime_paths.rs) and [rollio-types/src/config.rs](rollio-types/src/config.rs).
 - The current config and runtime derivation assume one flat logical camera or robot per row in [rollio-types/src/config.rs](rollio-types/src/config.rs), especially `camera_names()`, `robot_names()`, `encoder_runtime_configs()`, and `assembler_runtime_config()`.
 - The current data plane is shared and hardcoded across [rollio-bus/src/lib.rs](rollio-bus/src/lib.rs), [controller/src/collect.rs](controller/src/collect.rs), [visualizer/src/ipc.rs](visualizer/src/ipc.rs), [teleop-router/src/lib.rs](teleop-router/src/lib.rs), [encoder/src/runtime.rs](encoder/src/runtime.rs), and [episode-assembler/src/runtime.rs](episode-assembler/src/runtime.rs).

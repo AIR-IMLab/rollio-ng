@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -35,20 +36,32 @@ auto capture_command_output(const std::string& command) -> std::string {
     return output;
 }
 
-auto spawn_run_command(const std::string& config_inline) -> pid_t {
+auto spawn_run_command(const std::string& config_inline, bool dry_run) -> pid_t {
     const auto pid = fork();
     if (pid < 0) {
         throw std::runtime_error("fork failed");
     }
     if (pid == 0) {
-        char* argv[] = {
-            const_cast<char*>(ROLLIO_CAMERA_REALSENSE_BIN),
-            const_cast<char*>("run"),
-            const_cast<char*>("--config-inline"),
-            const_cast<char*>(config_inline.c_str()),
-            nullptr,
-        };
-        execv(ROLLIO_CAMERA_REALSENSE_BIN, argv);
+        if (dry_run) {
+            char* argv[] = {
+                const_cast<char*>(ROLLIO_CAMERA_REALSENSE_BIN),
+                const_cast<char*>("run"),
+                const_cast<char*>("--dry-run"),
+                const_cast<char*>("--config-inline"),
+                const_cast<char*>(config_inline.c_str()),
+                nullptr,
+            };
+            execv(ROLLIO_CAMERA_REALSENSE_BIN, argv);
+        } else {
+            char* argv[] = {
+                const_cast<char*>(ROLLIO_CAMERA_REALSENSE_BIN),
+                const_cast<char*>("run"),
+                const_cast<char*>("--config-inline"),
+                const_cast<char*>(config_inline.c_str()),
+                nullptr,
+            };
+            execv(ROLLIO_CAMERA_REALSENSE_BIN, argv);
+        }
         _exit(127);
     }
 
@@ -93,16 +106,16 @@ auto run_invalid_capabilities_test() -> void {
 auto run_invalid_runtime_test() -> void {
     const auto config_inline =
         "name = \"realsense_invalid\"\n"
-        "type = \"camera\"\n"
         "driver = \"realsense\"\n"
         "id = \"invalid_serial\"\n"
-        "width = 640\n"
-        "height = 480\n"
-        "fps = 30\n"
-        "pixel_format = \"rgb24\"\n"
-        "stream = \"color\"\n"
-        "transport = \"usb\"\n";
-    const auto pid = spawn_run_command(config_inline);
+        "bus_root = \"device/realsense_invalid\"\n"
+        "\n"
+        "[[channels]]\n"
+        "channel_type = \"color\"\n"
+        "kind = \"camera\"\n"
+        "enabled = true\n"
+        "profile = { width = 640, height = 480, fps = 30, pixel_format = \"rgb24\" }\n";
+    const auto pid = spawn_run_command(config_inline, false);
     wait_for_failure(pid, std::chrono::seconds(2));
 }
 

@@ -169,7 +169,7 @@ test("parseJsonMessage accepts setup state payloads", () => {
         mode: "intervention",
         episode: { format: "lerobot-v2.1" },
         devices: [],
-        pairing: [],
+        pairings: [],
         encoder: {
           video_codec: "h264",
           depth_codec: "rvl",
@@ -196,7 +196,7 @@ test("parseJsonMessage accepts setup state payloads", () => {
       mode: "intervention",
       episode: { format: "lerobot-v2.1" },
       devices: [],
-      pairing: [],
+      pairings: [],
       encoder: {
         video_codec: "h264",
         depth_codec: "rvl",

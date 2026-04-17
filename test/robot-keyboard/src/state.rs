@@ -71,6 +71,8 @@ pub fn mode_label(mode: RobotMode) -> &'static str {
     match mode {
         RobotMode::FreeDrive => "free-drive",
         RobotMode::CommandFollowing => "command-following",
+        RobotMode::Identifying => "identifying",
+        RobotMode::Disabled => "disabled",
     }
 }
 
@@ -299,6 +301,8 @@ impl ControllerState {
                 let next_mode = match self.active_robot().mode_hint {
                     RobotMode::FreeDrive => RobotMode::CommandFollowing,
                     RobotMode::CommandFollowing => RobotMode::FreeDrive,
+                    RobotMode::Identifying => RobotMode::FreeDrive,
+                    RobotMode::Disabled => RobotMode::FreeDrive,
                 };
                 for session in &mut self.robots {
                     session.mode_hint = next_mode;

@@ -3,6 +3,10 @@ name = "rollio-robot-airbot-play"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "rollio-device-airbot-play"
+path = "src/bin/device.rs"
+
 [dependencies]
 airbot_play_rust = { path = "../../third_party/airbot-play-rust", default-features = false }
 async-trait = "0.1.89"

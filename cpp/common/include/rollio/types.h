@@ -11,6 +11,35 @@ namespace rollio {
 constexpr uint32_t MAX_JOINTS = 16;
 
 // ---------------------------------------------------------------------------
+// Device channel kind (matches rollio-types DeviceType serde: lowercase)
+// ---------------------------------------------------------------------------
+
+enum class DeviceKind : uint32_t {
+    Camera = 0,
+    Robot = 1,
+};
+
+inline auto device_kind_from_string(const std::string_view value) -> std::optional<DeviceKind> {
+    if (value == "camera") {
+        return DeviceKind::Camera;
+    }
+    if (value == "robot") {
+        return DeviceKind::Robot;
+    }
+    return std::nullopt;
+}
+
+inline auto device_kind_to_string(const DeviceKind kind) -> const char* {
+    switch (kind) {
+        case DeviceKind::Camera:
+            return "camera";
+        case DeviceKind::Robot:
+            return "robot";
+    }
+    return "camera";
+}
+
+// ---------------------------------------------------------------------------
 // Fixed-size strings (matching Rust FixedString64 / FixedString256)
 // ---------------------------------------------------------------------------
 

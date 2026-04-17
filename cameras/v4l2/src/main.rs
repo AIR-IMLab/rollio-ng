@@ -1,8 +1,11 @@
 use clap::{Parser, Subcommand};
 use iceoryx2::prelude::*;
 use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat as JpegPixelFormat};
-use rollio_bus::{camera_frames_service_name, CONTROL_EVENTS_SERVICE};
-use rollio_types::config::{DeviceConfig, DeviceType};
+use rollio_bus::{channel_frames_service_name, CONTROL_EVENTS_SERVICE};
+use rollio_types::config::{
+    BinaryDeviceConfig, CameraChannelProfile, DeviceQueryChannel, DeviceQueryDevice,
+    DeviceQueryResponse, DeviceType,
+};
 use rollio_types::messages::{CameraFrameHeader, ControlEvent, PixelFormat};
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -42,29 +45,45 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Probe,
+    Probe {
+        #[arg(long)]
+        json: bool,
+    },
     Validate {
-        path: String,
+        id: String,
+        #[arg(long = "channel-type")]
+        channel_types: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
     Capabilities {
         path: String,
+    },
+    Query {
+        id: String,
+        #[arg(long)]
+        json: bool,
     },
     Run {
         #[arg(long, value_name = "PATH", conflicts_with = "config_inline")]
         config: Option<PathBuf>,
         #[arg(long = "config-inline", value_name = "TOML", conflicts_with = "config")]
         config_inline: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
 #[derive(Debug, Clone)]
 struct RunConfig {
-    name: String,
+    bus_root: String,
+    channel_type: String,
     id: String,
     width: u32,
     height: u32,
     fps: u32,
     pixel_format: PixelFormat,
+    native_pixel_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,34 +140,36 @@ struct FrameConverter {
     scratch: Vec<u8>,
 }
 
-impl TryFrom<DeviceConfig> for RunConfig {
+impl TryFrom<BinaryDeviceConfig> for RunConfig {
     type Error = DynError;
 
-    fn try_from(device: DeviceConfig) -> Result<Self, Self::Error> {
-        if device.device_type != DeviceType::Camera {
-            return Err("v4l2 driver requires type = \"camera\"".into());
-        }
+    fn try_from(device: BinaryDeviceConfig) -> Result<Self, Self::Error> {
         if device.driver != "v4l2" {
             return Err("v4l2 driver requires driver = \"v4l2\"".into());
         }
-        if let Some(stream) = device.stream.as_deref() {
-            if stream != "color" {
-                return Err("v4l2 driver supports only a single color stream".into());
-            }
+        let enabled_channels = device
+            .channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .collect::<Vec<_>>();
+        if enabled_channels.len() != 1 {
+            return Err("v4l2 driver requires exactly one enabled channel".into());
         }
-
-        let width = device
-            .width
-            .ok_or("v4l2 driver requires camera width in config")?;
-        let height = device
-            .height
-            .ok_or("v4l2 driver requires camera height in config")?;
-        let fps = device
-            .fps
-            .ok_or("v4l2 driver requires camera fps in config")?;
-        let pixel_format = device
-            .pixel_format
-            .ok_or("v4l2 driver requires camera pixel_format in config")?;
+        let channel = enabled_channels[0];
+        if channel.kind != DeviceType::Camera {
+            return Err("v4l2 driver requires a camera channel".into());
+        }
+        if channel.channel_type != "color" {
+            return Err("v4l2 driver supports only channel_type=\"color\"".into());
+        }
+        let profile = channel
+            .profile
+            .as_ref()
+            .ok_or("v4l2 driver requires a camera profile")?;
+        let width = profile.width;
+        let height = profile.height;
+        let fps = profile.fps;
+        let pixel_format = profile.pixel_format;
 
         match pixel_format {
             PixelFormat::Rgb24 | PixelFormat::Bgr24 => {}
@@ -162,12 +183,14 @@ impl TryFrom<DeviceConfig> for RunConfig {
         }
 
         Ok(Self {
-            name: device.name,
+            bus_root: device.bus_root,
+            channel_type: channel.channel_type.clone(),
             id: device.id,
             width,
             height,
             fps,
             pixel_format,
+            native_pixel_format: profile.native_pixel_format.clone(),
         })
     }
 }
@@ -355,24 +378,54 @@ fn main() {
 fn run_cli() -> Result<(), DynError> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Probe => {
+        Command::Probe { json } => {
             let devices = probe_devices()?;
-            println!("{}", serde_json::to_string(&devices)?);
+            if json {
+                let ids = devices.iter().map(|device| device.id.clone()).collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&ids)?);
+            } else if devices.is_empty() {
+                println!("no v4l2 devices discovered");
+            } else {
+                for device in &devices {
+                    println!("{} ({})", device.name, device.id);
+                }
+            }
         }
-        Command::Validate { path } => {
-            let output = validate_device(&path)?;
-            println!("{}", serde_json::to_string(&output)?);
+        Command::Validate {
+            id,
+            channel_types,
+            json,
+        } => {
+            let output = validate_device(&id, &channel_types)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else if output.valid {
+                println!("{} is valid", output.id);
+            } else {
+                println!("{} is invalid", output.id);
+            }
         }
         Command::Capabilities { path } => {
             let output = capabilities_for_device(&path)?;
             println!("{}", serde_json::to_string(&output)?);
         }
+        Command::Query { id, json } => {
+            let output = query_device(&id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                print_query_human(&output);
+            }
+        }
         Command::Run {
             config,
             config_inline,
+            dry_run,
         } => {
             let config = load_run_config(config, config_inline)?;
-            run_camera(config)?;
+            if !dry_run {
+                run_camera(config)?;
+            }
         }
     }
 
@@ -389,7 +442,7 @@ fn load_run_config(
         _ => return Err("run requires exactly one of --config or --config-inline".into()),
     };
 
-    let device: DeviceConfig = text.parse()?;
+    let device: BinaryDeviceConfig = text.parse()?;
     RunConfig::try_from(device)
 }
 
@@ -422,8 +475,17 @@ fn probe_devices() -> Result<Vec<ProbeDevice>, DynError> {
     Ok(devices)
 }
 
-fn validate_device(path: &str) -> Result<ValidateOutput, DynError> {
+fn validate_device(path: &str, channel_types: &[String]) -> Result<ValidateOutput, DynError> {
     let (_device, caps) = open_capture_device(path)?;
+    if channel_types.iter().any(|channel_type| channel_type != "color") {
+        return Ok(ValidateOutput {
+            valid: false,
+            id: path.to_string(),
+            name: caps.card,
+            driver: "v4l2",
+            bus: caps.bus,
+        });
+    }
     Ok(ValidateOutput {
         valid: true,
         id: path.to_string(),
@@ -431,6 +493,58 @@ fn validate_device(path: &str) -> Result<ValidateOutput, DynError> {
         driver: "v4l2",
         bus: caps.bus,
     })
+}
+
+fn query_device(path: &str) -> Result<DeviceQueryResponse, DynError> {
+    let capabilities = capabilities_for_device(path)?;
+    let profiles = capabilities
+        .profiles
+        .into_iter()
+        .map(|profile| CameraChannelProfile {
+            width: profile.width,
+            height: profile.height,
+            fps: profile.fps.round() as u32,
+            pixel_format: match profile.native_pixel_format.as_str() {
+                "BGR3" => PixelFormat::Bgr24,
+                _ => PixelFormat::Rgb24,
+            },
+            native_pixel_format: Some(profile.native_pixel_format),
+        })
+        .collect::<Vec<_>>();
+    Ok(DeviceQueryResponse {
+        driver: "v4l2".into(),
+        devices: vec![DeviceQueryDevice {
+            id: path.to_string(),
+            device_class: "v4l2".into(),
+            device_label: capabilities.name,
+            optional_info: Default::default(),
+            channels: vec![DeviceQueryChannel {
+                channel_type: "color".into(),
+                kind: DeviceType::Camera,
+                available: true,
+                modes: vec!["enabled".into(), "disabled".into()],
+                profiles,
+                supported_states: Vec::new(),
+                supported_commands: Vec::new(),
+                supports_fk: false,
+                supports_ik: false,
+                dof: None,
+                default_control_frequency_hz: None,
+                direct_joint_compatibility: Default::default(),
+                defaults: Default::default(),
+                optional_info: Default::default(),
+            }],
+        }],
+    })
+}
+
+fn print_query_human(output: &DeviceQueryResponse) {
+    for device in &output.devices {
+        println!("{} ({})", device.device_label, device.id);
+        for channel in &device.channels {
+            println!("  - {} [camera]", channel.channel_type);
+        }
+    }
 }
 
 fn capabilities_for_device(path: &str) -> Result<CapabilitiesOutput, DynError> {
@@ -490,7 +604,7 @@ fn run_camera(config: RunConfig) -> Result<(), DynError> {
     let payload_len = payload_len(configured.width, configured.height)?;
 
     let node = NodeBuilder::new().create::<ipc::Service>()?;
-    let frame_service_name = camera_frames_service_name(&config.name);
+    let frame_service_name = channel_frames_service_name(&config.bus_root, &config.channel_type);
     let frame_service_name: ServiceName = frame_service_name.as_str().try_into()?;
     let frame_service = node
         .service_builder(&frame_service_name)
@@ -536,7 +650,7 @@ fn run_camera(config: RunConfig) -> Result<(), DynError> {
 
     loop {
         if drain_control_events(&control_subscriber)? {
-            eprintln!("rollio-camera-v4l2: shutdown received for {}", config.name);
+            eprintln!("rollio-camera-v4l2: shutdown received for {}", config.bus_root);
             return Ok(());
         }
 
@@ -564,10 +678,10 @@ fn run_camera(config: RunConfig) -> Result<(), DynError> {
             .ok_or("driver reported bytesused larger than mapped frame buffer")?;
         let converted = converter.convert(frame_data, configured.native_fourcc)?;
 
-        let timestamp_ns = wallclock_timestamp_ns()?;
+        let timestamp_ms = wallclock_timestamp_ms()?;
         let mut sample = publisher.loan_slice_uninit(payload_len)?;
         *sample.user_header_mut() = CameraFrameHeader {
-            timestamp_ns,
+            timestamp_ms,
             width: configured.width,
             height: configured.height,
             pixel_format: config.pixel_format,
@@ -579,8 +693,8 @@ fn run_camera(config: RunConfig) -> Result<(), DynError> {
         frame_index += 1;
         if last_status_log.elapsed() >= Duration::from_secs(1) {
             eprintln!(
-                "rollio-camera-v4l2: device={} frame_index={} latest_timestamp_ns={} active=true",
-                config.id, frame_index, timestamp_ns
+                "rollio-camera-v4l2: device={} frame_index={} latest_timestamp_ms={} active=true",
+                config.id, frame_index, timestamp_ms
             );
             last_status_log = Instant::now();
         }
@@ -590,7 +704,7 @@ fn run_camera(config: RunConfig) -> Result<(), DynError> {
 fn configure_capture(device: &Device, config: &RunConfig) -> Result<ConfiguredCapture, DynError> {
     let formats = device.enum_formats()?;
     let supported_formats: Vec<FourCC> = formats.iter().map(|format| format.fourcc).collect();
-    let requested_formats = preferred_native_formats(config.pixel_format);
+    let requested_formats = preferred_native_formats_for_config(config);
     let mut last_mismatch = None;
 
     for candidate in requested_formats.iter().copied() {
@@ -715,6 +829,34 @@ fn preferred_native_formats(output_pixel_format: PixelFormat) -> Vec<FourCC> {
     }
 }
 
+fn preferred_native_formats_for_config(config: &RunConfig) -> Vec<FourCC> {
+    if let Some(native_pixel_format) = config.native_pixel_format.as_deref() {
+        if let Some(fourcc) = native_fourcc_from_name(native_pixel_format) {
+            let mut formats = vec![fourcc];
+            formats.extend(
+                preferred_native_formats(config.pixel_format)
+                    .into_iter()
+                    .filter(|candidate| *candidate != fourcc),
+            );
+            return formats;
+        }
+    }
+    preferred_native_formats(config.pixel_format)
+}
+
+fn native_fourcc_from_name(name: &str) -> Option<FourCC> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "RGB3" => Some(FourCC::new(&RGB3_BYTES)),
+        "BGR3" => Some(FourCC::new(&BGR3_BYTES)),
+        "YUYV" => Some(FourCC::new(&YUYV_BYTES)),
+        "YUY2" => Some(FourCC::new(&YUY2_BYTES)),
+        "MJPG" => Some(FourCC::new(&MJPG_BYTES)),
+        "JPEG" => Some(FourCC::new(&JPEG_BYTES)),
+        "GREY" => Some(FourCC::new(&GREY_BYTES)),
+        _ => None,
+    }
+}
+
 fn is_supported_native_format(fourcc: FourCC) -> bool {
     matches!(
         fourcc.repr,
@@ -729,10 +871,10 @@ fn payload_len(width: u32, height: u32) -> Result<usize, DynError> {
         .ok_or_else(|| "frame payload size overflow".into())
 }
 
-fn wallclock_timestamp_ns() -> Result<u64, DynError> {
+fn wallclock_timestamp_ms() -> Result<u64, DynError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)?
-        .as_nanos()
+        .as_millis()
         .try_into()?)
 }
 

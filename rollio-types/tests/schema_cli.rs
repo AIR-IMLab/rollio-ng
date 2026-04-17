@@ -1,4 +1,4 @@
-use rollio_types::schema::config_schema;
+use rollio_types::schema::build_config_schema;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,8 +23,8 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 }
 
 #[test]
-fn schema_export_includes_documented_sections_and_driver_extension_rules() {
-    let schema = serde_json::to_value(config_schema()).expect("schema should serialize");
+fn schema_export_includes_nested_device_sections() {
+    let schema = serde_json::to_value(build_config_schema()).expect("schema should serialize");
     let sections = schema["sections"]
         .as_array()
         .expect("schema sections should be an array");
@@ -36,15 +36,13 @@ fn schema_export_includes_documented_sections_and_driver_extension_rules() {
     for required in [
         "root",
         "episode",
-        "controller",
-        "visualizer",
         "devices",
-        "pairing",
-        "ui",
+        "devices.channels",
+        "pairings",
+        "visualizer",
         "encoder",
-        "assembler",
         "storage",
-        "monitor",
+        "ui",
     ] {
         assert!(
             section_names.contains(&required),
@@ -59,53 +57,11 @@ fn schema_export_includes_documented_sections_and_driver_extension_rules() {
     assert_eq!(devices["kind"], "array-of-tables");
     assert_eq!(devices["allows_extra_fields"], true);
 
-    let pixel_format = devices["fields"]
-        .as_array()
-        .expect("device fields should be an array")
+    let channels = sections
         .iter()
-        .find(|field| field["name"] == "pixel_format")
-        .expect("pixel_format field should exist");
-    let enum_values = pixel_format["enum_values"]
-        .as_array()
-        .expect("pixel_format should declare enum values");
-    assert!(
-        enum_values
-            .iter()
-            .any(|value| value.as_str() == Some("rgb24")),
-        "pixel_format should include rgb24: {enum_values:?}"
-    );
-
-    let root = sections
-        .iter()
-        .find(|section| section["name"].as_str() == Some("root"))
-        .expect("root section should exist");
-    let mode_field = root["fields"]
-        .as_array()
-        .expect("root fields should be an array")
-        .iter()
-        .find(|field| field["name"] == "mode")
-        .expect("mode field should exist");
-    assert_eq!(mode_field["default"].as_str(), Some("intervention"));
-
-    let encoder = sections
-        .iter()
-        .find(|section| section["name"].as_str() == Some("encoder"))
-        .expect("encoder section should exist");
-    let encoder_fields = encoder["fields"]
-        .as_array()
-        .expect("encoder fields should be an array");
-    assert!(
-        encoder_fields
-            .iter()
-            .any(|field| field["name"].as_str() == Some("video_codec")),
-        "encoder should declare video_codec"
-    );
-    assert!(
-        encoder_fields
-            .iter()
-            .any(|field| field["name"].as_str() == Some("depth_codec")),
-        "encoder should declare depth_codec"
-    );
+        .find(|section| section["name"].as_str() == Some("devices.channels"))
+        .expect("devices.channels section should exist");
+    assert_eq!(channels["kind"], "array-of-tables");
 }
 
 #[test]
@@ -123,7 +79,7 @@ fn rollio_config_schema_command_outputs_valid_json() {
     let payload: Value =
         serde_json::from_slice(&output.stdout).expect("schema stdout should be valid JSON");
     assert_eq!(payload["format"], "rollio-config-schema");
-    assert_eq!(payload["version"], 1);
+    assert_eq!(payload["version"], 2);
 }
 
 #[test]

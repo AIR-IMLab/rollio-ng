@@ -68,3 +68,38 @@ pub fn resolve_device_program(
         .map(PathBuf::into_os_string)
         .unwrap_or_else(|| OsString::from(executable_name))
 }
+
+pub fn default_device_executable_name(driver: &str) -> String {
+    match driver {
+        "pseudo" => "rollio-device-pseudo".into(),
+        "v4l2" => "rollio-camera-v4l2".into(),
+        "realsense" => "rollio-camera-realsense".into(),
+        "airbot-play" => "rollio-device-airbot-play".into(),
+        "airbot-e2" => "rollio-device-airbot-e2".into(),
+        "airbot-g2" => "rollio-device-airbot-g2".into(),
+        other => format!("rollio-device-{}", other.replace('_', "-")),
+    }
+}
+
+pub fn resolve_registered_program(
+    executable_name: &str,
+    workspace_root: &Path,
+    current_exe_dir: &Path,
+) -> OsString {
+    let target_debug = workspace_root.join("target/debug").join(executable_name);
+    let mut camera_candidates = Vec::new();
+    let camera_build_root = workspace_root.join("cameras/build");
+    if let Ok(entries) = std::fs::read_dir(&camera_build_root) {
+        for entry in entries.flatten() {
+            camera_candidates.push(entry.path().join(executable_name));
+        }
+    }
+    let local_binary = resolve_existing_path(
+        [current_exe_dir.join(executable_name), target_debug]
+            .into_iter()
+            .chain(camera_candidates),
+    );
+    local_binary
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| OsString::from(executable_name))
+}

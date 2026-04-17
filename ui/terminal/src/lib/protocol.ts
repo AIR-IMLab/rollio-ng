@@ -70,28 +70,51 @@ export interface SetupCameraProfile {
   height: number;
   fps: number;
   pixel_format: string;
+  native_pixel_format?: string | null;
   stream: string | null;
   channel: number | null;
 }
 
-export interface SetupDeviceConfig {
+/** Single channel on a device-binary entry (matches rollio-types DeviceChannelConfigV2 JSON). */
+export interface SetupDeviceChannelV2 {
+  channel_type: string;
+  kind: "camera" | "robot";
+  enabled?: boolean;
+  mode?: "free-drive" | "command-following" | "identifying" | null;
+  dof?: number | null;
+  publish_states?: string[];
+  recorded_states?: string[];
+  control_frequency_hz?: number | null;
+  profile?: {
+    width: number;
+    height: number;
+    fps: number;
+    pixel_format: string;
+    native_pixel_format?: string | null;
+  } | null;
+}
+
+/** Device row in setup wizard (rollio-types BinaryDeviceConfig). */
+export interface SetupBinaryDeviceConfig {
   name: string;
-  type: "camera" | "robot";
+  executable?: string | null;
   driver: string;
   id: string;
-  width?: number | null;
-  height?: number | null;
-  fps?: number | null;
-  pixel_format?: string | null;
-  stream?: string | null;
-  channel?: number | null;
-  dof?: number | null;
-  mode?: "free-drive" | "command-following" | null;
-  control_frequency_hz?: number | null;
-  transport?: string | null;
-  interface?: string | null;
-  product_variant?: string | null;
-  end_effector?: string | null;
+  bus_root: string;
+  channels: SetupDeviceChannelV2[];
+  extra?: Record<string, unknown>;
+}
+
+export interface SetupChannelPairing {
+  leader_device: string;
+  leader_channel_type: string;
+  follower_device: string;
+  follower_channel_type: string;
+  mapping: "direct-joint" | "cartesian";
+  leader_state: string;
+  follower_command: string;
+  joint_index_map: number[];
+  joint_scales: number[];
 }
 
 export interface SetupAvailableDevice {
@@ -101,16 +124,8 @@ export interface SetupAvailableDevice {
   driver: string;
   id: string;
   camera_profiles: SetupCameraProfile[];
-  supported_modes: Array<"free-drive" | "command-following">;
-  current: SetupDeviceConfig;
-}
-
-export interface SetupPairing {
-  leader: string;
-  follower: string;
-  mapping: "direct-joint" | "cartesian";
-  joint_index_map: number[];
-  joint_scales: number[];
+  supported_modes: Array<"free-drive" | "command-following" | "identifying">;
+  current: SetupBinaryDeviceConfig;
 }
 
 export interface SetupConfigSnapshot {
@@ -119,8 +134,9 @@ export interface SetupConfigSnapshot {
   episode: {
     format: "lerobot-v2.1" | "lerobot-v3.0" | "mcap";
   };
-  devices: SetupDeviceConfig[];
-  pairing: SetupPairing[];
+  /** Native project layout: one binary per row with nested channels. */
+  devices: SetupBinaryDeviceConfig[];
+  pairings: SetupChannelPairing[];
   encoder: {
     video_codec: "h264" | "h265" | "av1" | "rvl";
     depth_codec: "h264" | "h265" | "av1" | "rvl";

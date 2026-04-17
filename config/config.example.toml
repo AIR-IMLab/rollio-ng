@@ -17,66 +17,92 @@ max_preview_height = 240
 jpeg_quality = 30
 preview_fps = 30
 
-# --- Devices ---
-
 [[devices]]
 name = "camera_top"
-type = "camera"
 driver = "pseudo"
-id = "pseudo_cam_0"
-width = 640
-height = 480
-fps = 30
-pixel_format = "rgb24"
-stream = "color"
+id = "pseudo_camera_0"
+bus_root = "camera_top"
+
+[devices.extra]
 transport = "simulated"
+
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+enabled = true
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
 
 [[devices]]
 name = "camera_side"
-type = "camera"
 driver = "pseudo"
-id = "pseudo_cam_1"
-width = 640
-height = 480
-fps = 30
-pixel_format = "rgb24"
-stream = "color"
+id = "pseudo_camera_1"
+bus_root = "camera_side"
+
+[devices.extra]
 transport = "simulated"
+
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+enabled = true
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
 
 [[devices]]
 name = "leader_arm"
-type = "robot"
 driver = "pseudo"
-id = "pseudo_robot_0"
-dof = 6
-mode = "free-drive"
-control_frequency_hz = 60.0
+id = "pseudo_robot_0_dof_6"
+bus_root = "leader_arm"
+
+[devices.extra]
 transport = "simulated"
-command_latency_ms = 20
-state_noise_stddev = 0.01
+
+[[devices.channels]]
+channel_type = "arm"
+kind = "robot"
+enabled = true
+mode = "free-drive"
+dof = 6
+publish_states = ["joint_position", "joint_velocity", "joint_effort", "end_effector_pose"]
+recorded_states = ["joint_position", "joint_velocity", "joint_effort"]
+control_frequency_hz = 60.0
+
+[devices.channels.command_defaults]
+joint_mit_kp = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+joint_mit_kd = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
 [[devices]]
 name = "follower_arm"
-type = "robot"
 driver = "pseudo"
-id = "pseudo_robot_1"
-dof = 6
-mode = "command-following"
-control_frequency_hz = 60.0
+id = "pseudo_robot_1_dof_6"
+bus_root = "follower_arm"
+
+[devices.extra]
 transport = "simulated"
-command_latency_ms = 35
-state_noise_stddev = 0.02
 
-# --- Pairing ---
+[[devices.channels]]
+channel_type = "arm"
+kind = "robot"
+enabled = true
+mode = "command-following"
+dof = 6
+publish_states = ["joint_position", "joint_velocity", "joint_effort", "end_effector_pose"]
+recorded_states = ["joint_position", "joint_velocity", "joint_effort"]
+control_frequency_hz = 60.0
 
-[[pairing]]
-leader = "leader_arm"
-follower = "follower_arm"
+[devices.channels.command_defaults]
+joint_mit_kp = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+joint_mit_kd = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+
+[[pairings]]
+leader_device = "leader_arm"
+leader_channel_type = "arm"
+follower_device = "follower_arm"
+follower_channel_type = "arm"
 mapping = "direct-joint"
+leader_state = "joint_position"
+follower_command = "joint_position"
 joint_index_map = [0, 1, 2, 3, 4, 5]
 joint_scales = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-
-# --- UI ---
 
 [ui]
 start_key = "s"
@@ -84,20 +110,17 @@ stop_key = "e"
 keep_key = "k"
 discard_key = "x"
 
-# --- Encoder ---
-
 [encoder]
-video_codec = "libx264"
+video_codec = "h264"
 depth_codec = "rvl"
 queue_size = 32
 
-# --- Storage ---
+[assembler]
+encoded_handoff = "file"
 
 [storage]
 backend = "local"
 output_path = "./output"
-
-# --- Monitor ---
 
 [monitor]
 metrics_frequency_hz = 1.0
@@ -105,7 +128,3 @@ metrics_frequency_hz = 1.0
 [monitor.thresholds."camera_top".actual_fps]
 explanation = "Top camera FPS dropped below target"
 lt = 28.0
-
-[monitor.thresholds."encoder.camera_top".queue_depth]
-explanation = "Encoder queue for top camera is nearly full"
-gt = 80.0

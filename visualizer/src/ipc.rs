@@ -6,12 +6,14 @@
 /// robot state is a small fixed-size Copy type.
 use iceoryx2::prelude::*;
 use rollio_bus::{
-    camera_frames_service_name, robot_state_service_name, EPISODE_COMMAND_SERVICE,
-    EPISODE_STATUS_SERVICE, SETUP_COMMAND_SERVICE, SETUP_STATE_SERVICE,
+    EPISODE_COMMAND_SERVICE, EPISODE_STATUS_SERVICE, SETUP_COMMAND_SERVICE, SETUP_STATE_SERVICE,
+};
+use rollio_types::config::{
+    RobotStateKind, VisualizerCameraSourceConfig, VisualizerRobotSourceConfig,
 };
 use rollio_types::messages::{
-    CameraFrameHeader, EpisodeCommand, EpisodeStatus, RobotState, SetupCommandMessage,
-    SetupStateMessage,
+    CameraFrameHeader, EpisodeCommand, EpisodeStatus, JointVector15, ParallelVector2, Pose7,
+    SetupCommandMessage, SetupStateMessage,
 };
 
 /// A message received from iceoryx2.
@@ -23,7 +25,9 @@ pub enum IpcMessage {
     },
     RobotStateMsg {
         name: String,
-        state: Box<RobotState>,
+        state_kind: RobotStateKind,
+        timestamp_ms: u64,
+        values: Vec<f64>,
     },
     EpisodeStatusMsg {
         status: Box<EpisodeStatus>,
@@ -55,7 +59,18 @@ struct CameraSubscriber {
 
 struct RobotSubscriber {
     name: String,
-    subscriber: iceoryx2::port::subscriber::Subscriber<ipc::Service, RobotState, ()>,
+    state_kind: RobotStateKind,
+    subscriber: RobotStateSubscriber,
+}
+
+enum RobotStateSubscriber {
+    JointVector15(
+        iceoryx2::port::subscriber::Subscriber<ipc::Service, JointVector15, ()>,
+    ),
+    ParallelVector2(
+        iceoryx2::port::subscriber::Subscriber<ipc::Service, ParallelVector2, ()>,
+    ),
+    Pose7(iceoryx2::port::subscriber::Subscriber<ipc::Service, Pose7, ()>),
 }
 
 impl IpcPoller {
@@ -63,16 +78,16 @@ impl IpcPoller {
     ///
     /// Uses `open_or_create` so the visualizer starts even if publishers don't exist yet.
     pub fn new(
-        camera_names: &[String],
-        robot_names: &[String],
+        camera_sources: &[VisualizerCameraSourceConfig],
+        robot_sources: &[VisualizerRobotSourceConfig],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let node = NodeBuilder::new()
             .signal_handling_mode(SignalHandlingMode::Disabled)
             .create::<ipc::Service>()?;
 
-        let mut camera_subs = Vec::with_capacity(camera_names.len());
-        for name in camera_names {
-            let service_name_str = camera_frames_service_name(name);
+        let mut camera_subs = Vec::with_capacity(camera_sources.len());
+        for source in camera_sources {
+            let service_name_str = source.frame_topic.clone();
             let service_name: ServiceName = service_name_str.as_str().try_into()?;
 
             let service = node
@@ -85,26 +100,45 @@ impl IpcPoller {
 
             log::info!("subscribed to camera: {service_name_str}");
             camera_subs.push(CameraSubscriber {
-                name: name.clone(),
+                name: source.channel_id.clone(),
                 subscriber,
             });
         }
 
-        let mut robot_subs = Vec::with_capacity(robot_names.len());
-        for name in robot_names {
-            let service_name_str = robot_state_service_name(name);
+        let mut robot_subs = Vec::with_capacity(robot_sources.len());
+        for source in robot_sources {
+            let service_name_str = source.state_topic.clone();
             let service_name: ServiceName = service_name_str.as_str().try_into()?;
 
-            let service = node
-                .service_builder(&service_name)
-                .publish_subscribe::<RobotState>()
-                .open_or_create()?;
-
-            let subscriber = service.subscriber_builder().create()?;
+            let subscriber = if source.state_kind.uses_pose_payload() {
+                let service = node
+                    .service_builder(&service_name)
+                    .publish_subscribe::<Pose7>()
+                    .open_or_create()?;
+                RobotStateSubscriber::Pose7(service.subscriber_builder().create()?)
+            } else if matches!(
+                source.state_kind,
+                RobotStateKind::ParallelPosition
+                    | RobotStateKind::ParallelVelocity
+                    | RobotStateKind::ParallelEffort
+            ) {
+                let service = node
+                    .service_builder(&service_name)
+                    .publish_subscribe::<ParallelVector2>()
+                    .open_or_create()?;
+                RobotStateSubscriber::ParallelVector2(service.subscriber_builder().create()?)
+            } else {
+                let service = node
+                    .service_builder(&service_name)
+                    .publish_subscribe::<JointVector15>()
+                    .open_or_create()?;
+                RobotStateSubscriber::JointVector15(service.subscriber_builder().create()?)
+            };
 
             log::info!("subscribed to robot: {service_name_str}");
             robot_subs.push(RobotSubscriber {
-                name: name.clone(),
+                name: robot_source_name(source),
+                state_kind: source.state_kind,
                 subscriber,
             });
         }
@@ -185,19 +219,55 @@ impl IpcPoller {
         for robot in &self.robot_subs {
             let mut latest: Option<IpcMessage> = None;
             loop {
-                match robot.subscriber.receive() {
-                    Ok(Some(sample)) => {
-                        let state = *sample.payload();
-                        latest = Some(IpcMessage::RobotStateMsg {
-                            name: robot.name.clone(),
-                            state: Box::new(state),
-                        });
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        log::warn!("robot {} receive error: {e}", robot.name);
-                        break;
-                    }
+                match &robot.subscriber {
+                    RobotStateSubscriber::JointVector15(subscriber) => match subscriber.receive() {
+                        Ok(Some(sample)) => {
+                            let payload = *sample.payload();
+                            latest = Some(IpcMessage::RobotStateMsg {
+                                name: robot.name.clone(),
+                                state_kind: robot.state_kind,
+                                timestamp_ms: payload.timestamp_ms,
+                                values: payload.values[..payload.len as usize].to_vec(),
+                            });
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("robot {} receive error: {e}", robot.name);
+                            break;
+                        }
+                    },
+                    RobotStateSubscriber::ParallelVector2(subscriber) => match subscriber.receive() {
+                        Ok(Some(sample)) => {
+                            let payload = *sample.payload();
+                            latest = Some(IpcMessage::RobotStateMsg {
+                                name: robot.name.clone(),
+                                state_kind: robot.state_kind,
+                                timestamp_ms: payload.timestamp_ms,
+                                values: payload.values[..payload.len as usize].to_vec(),
+                            });
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("robot {} receive error: {e}", robot.name);
+                            break;
+                        }
+                    },
+                    RobotStateSubscriber::Pose7(subscriber) => match subscriber.receive() {
+                        Ok(Some(sample)) => {
+                            let payload = *sample.payload();
+                            latest = Some(IpcMessage::RobotStateMsg {
+                                name: robot.name.clone(),
+                                state_kind: robot.state_kind,
+                                timestamp_ms: payload.timestamp_ms,
+                                values: payload.values.to_vec(),
+                            });
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("robot {} receive error: {e}", robot.name);
+                            break;
+                        }
+                    },
                 }
             }
             if let Some(msg) = latest {
@@ -265,5 +335,12 @@ impl IpcPoller {
     /// Access the iceoryx2 node (for `node.wait()` in the poll loop).
     pub fn node(&self) -> &Node<ipc::Service> {
         &self.node
+    }
+}
+
+fn robot_source_name(source: &VisualizerRobotSourceConfig) -> String {
+    match source.state_kind {
+        RobotStateKind::JointPosition => source.channel_id.clone(),
+        other => format!("{}/{}", source.channel_id, other.topic_suffix()),
     }
 }

@@ -2,7 +2,7 @@ use crate::error::{EncoderError, Result};
 use ffmpeg_next as ffmpeg;
 use rollio_types::config::{
     EncoderArtifactFormat, EncoderBackend, EncoderCapability, EncoderCapabilityDirection,
-    EncoderCapabilityReport, EncoderCodec, EncoderImplementationFamily, EncoderRuntimeConfig,
+    EncoderCapabilityReport, EncoderCodec, EncoderImplementationFamily, EncoderRuntimeConfigV2,
 };
 use rollio_types::messages::{CameraFrameHeader, PixelFormat};
 use rvl::{
@@ -79,7 +79,7 @@ pub(crate) enum SessionEncoder {
 }
 
 pub(crate) struct LibavSession {
-    config: EncoderRuntimeConfig,
+    config: EncoderRuntimeConfigV2,
     actual_backend: EncoderBackend,
     _codec_name: String,
     output_path: PathBuf,
@@ -100,7 +100,7 @@ pub(crate) struct LibavSession {
 }
 
 pub(crate) struct RvlSession {
-    config: EncoderRuntimeConfig,
+    config: EncoderRuntimeConfigV2,
     output_path: PathBuf,
     writer: BufWriter<File>,
     encoder: DepthEncoder,
@@ -215,7 +215,7 @@ pub fn probe_capabilities() -> Result<EncoderCapabilityReport> {
 }
 
 pub(crate) fn open_session(
-    runtime: &EncoderRuntimeConfig,
+    runtime: &EncoderRuntimeConfigV2,
     episode_index: u32,
     first_frame: &OwnedFrame,
 ) -> Result<SessionEncoder> {
@@ -273,7 +273,7 @@ pub(crate) fn record_dropped_frame(session: &mut SessionEncoder) {
 
 impl LibavSession {
     fn new(
-        config: EncoderRuntimeConfig,
+        config: EncoderRuntimeConfigV2,
         output_path: PathBuf,
         first_frame: &OwnedFrame,
     ) -> Result<Self> {
@@ -476,7 +476,7 @@ impl LibavSession {
 
 impl RvlSession {
     fn new(
-        config: EncoderRuntimeConfig,
+        config: EncoderRuntimeConfigV2,
         output_path: PathBuf,
         first_frame: &OwnedFrame,
     ) -> Result<Self> {
@@ -519,7 +519,7 @@ impl RvlSession {
         let depth_pixels = depth16_payload_to_vec(&frame.payload)?;
         let encoded = self.encoder.encode(&depth_pixels)?;
         self.writer
-            .write_all(&frame.header.timestamp_ns.to_le_bytes())?;
+            .write_all(&frame.header.timestamp_ms.to_le_bytes())?;
         self.writer
             .write_all(&frame.header.frame_index.to_le_bytes())?;
         self.writer
@@ -1073,7 +1073,7 @@ fn decode_rvl_artifact(path: &Path) -> Result<DecodedArtifact> {
     };
 
     loop {
-        let Some(_timestamp_ns) = read_optional_u64(&mut reader)? else {
+        let Some(_timestamp_ms) = read_optional_u64(&mut reader)? else {
             break;
         };
         let _frame_index = read_u64(&mut reader)?;

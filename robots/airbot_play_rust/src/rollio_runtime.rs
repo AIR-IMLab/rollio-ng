@@ -351,7 +351,8 @@ fn command_targets(command: &RobotCommand, dof: usize) -> [f64; ARM_DOF] {
 
 fn arm_state_for_mode(mode: RobotMode) -> ArmState {
     match mode {
-        RobotMode::FreeDrive => ArmState::FreeDrive,
+        RobotMode::Disabled => ArmState::Disabled,
+        RobotMode::FreeDrive | RobotMode::Identifying => ArmState::FreeDrive,
         RobotMode::CommandFollowing => ArmState::CommandFollowing,
     }
 }

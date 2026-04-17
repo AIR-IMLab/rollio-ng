@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use iceoryx2::node::NodeWaitFailure;
-use rollio_types::config::VisualizerRuntimeConfig;
+use rollio_types::config::{
+    RobotStateKind, VisualizerCameraSourceConfig, VisualizerRobotSourceConfig,
+    VisualizerRuntimeConfigV2,
+};
 use rollio_types::messages::{EpisodeCommand, SetupCommandMessage};
 use tokio::sync::broadcast;
 
@@ -41,14 +44,6 @@ struct Args {
     /// WebSocket server port
     #[arg(long)]
     port: Option<u16>,
-
-    /// Comma-separated camera names to subscribe to
-    #[arg(long)]
-    cameras: Option<String>,
-
-    /// Comma-separated robot names to subscribe to
-    #[arg(long)]
-    robots: Option<String>,
 
     /// Maximum preview width for JPEG downsampling
     #[arg(long)]
@@ -79,28 +74,21 @@ struct IpcPollConfig {
     preview_workers: usize,
 }
 
-fn split_name_list(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
-fn legacy_runtime_config(args: &Args) -> VisualizerRuntimeConfig {
-    let defaults = VisualizerRuntimeConfig::default();
-    VisualizerRuntimeConfig {
+fn legacy_runtime_config(args: &Args) -> VisualizerRuntimeConfigV2 {
+    let defaults = VisualizerRuntimeConfigV2 {
+        port: 9090,
+        camera_sources: Vec::new(),
+        robot_sources: Vec::new(),
+        max_preview_width: 320,
+        max_preview_height: 240,
+        jpeg_quality: 30,
+        preview_fps: 60,
+        preview_workers: None,
+    };
+    VisualizerRuntimeConfigV2 {
         port: args.port.unwrap_or(defaults.port),
-        cameras: args
-            .cameras
-            .as_deref()
-            .map(split_name_list)
-            .unwrap_or_else(|| split_name_list("camera_0,camera_1")),
-        robots: args
-            .robots
-            .as_deref()
-            .map(split_name_list)
-            .unwrap_or_else(|| split_name_list("robot_0")),
+        camera_sources: Vec::new(),
+        robot_sources: Vec::new(),
         max_preview_width: args.max_preview_width.unwrap_or(defaults.max_preview_width),
         max_preview_height: args
             .max_preview_height
@@ -111,23 +99,17 @@ fn legacy_runtime_config(args: &Args) -> VisualizerRuntimeConfig {
     }
 }
 
-fn load_runtime_config(args: &Args) -> Result<VisualizerRuntimeConfig, Box<dyn std::error::Error>> {
+fn load_runtime_config(args: &Args) -> Result<VisualizerRuntimeConfigV2, Box<dyn std::error::Error>> {
     let mut config = if let Some(config_path) = &args.config {
-        std::fs::read_to_string(config_path)?.parse::<VisualizerRuntimeConfig>()?
+        std::fs::read_to_string(config_path)?.parse::<VisualizerRuntimeConfigV2>()?
     } else if let Some(config_inline) = &args.config_inline {
-        config_inline.parse::<VisualizerRuntimeConfig>()?
+        config_inline.parse::<VisualizerRuntimeConfigV2>()?
     } else {
         legacy_runtime_config(args)
     };
 
     if let Some(port) = args.port {
         config.port = port;
-    }
-    if let Some(cameras) = args.cameras.as_deref() {
-        config.cameras = split_name_list(cameras);
-    }
-    if let Some(robots) = args.robots.as_deref() {
-        config.robots = split_name_list(robots);
     }
     if let Some(max_preview_width) = args.max_preview_width {
         config.max_preview_width = max_preview_width;
@@ -156,8 +138,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let runtime_config = load_runtime_config(&args)?;
 
-    let camera_names = runtime_config.cameras.clone();
-    let robot_names = runtime_config.robots.clone();
+    let camera_names = runtime_config
+        .camera_sources
+        .iter()
+        .map(|source| source.channel_id.clone())
+        .collect::<Vec<_>>();
+    let robot_names = runtime_config
+        .robot_sources
+        .iter()
+        .map(robot_source_name)
+        .collect::<Vec<_>>();
     let preview_workers = runtime_config
         .preview_workers
         .unwrap_or_else(|| default_preview_workers(camera_names.len()))
@@ -241,8 +231,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("rollio-visualizer-ipc".to_string())
         .spawn(move || {
             if let Err(e) = ipc_poll_loop(
-                &camera_names,
-                &robot_names,
+                &runtime_config.camera_sources,
+                &runtime_config.robot_sources,
                 ipc_config,
                 ipc_broadcast_tx,
                 ipc_stream_info,
@@ -273,8 +263,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Polls iceoryx2 subscribers, forwards robot state immediately, and hands the
 /// latest camera frames off to the preview worker pipeline.
 fn ipc_poll_loop(
-    camera_names: &[String],
-    robot_names: &[String],
+    camera_sources: &[VisualizerCameraSourceConfig],
+    robot_sources: &[VisualizerRobotSourceConfig],
     config: IpcPollConfig,
     broadcast_tx: broadcast::Sender<BroadcastMessage>,
     stream_info: Arc<Mutex<StreamInfoRegistry>>,
@@ -285,9 +275,13 @@ fn ipc_poll_loop(
     setup_command_rx: mpsc::Receiver<SetupCommandMessage>,
     shutdown: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let poller = IpcPoller::new(camera_names, robot_names)?;
+    let poller = IpcPoller::new(camera_sources, robot_sources)?;
+    let camera_names = camera_sources
+        .iter()
+        .map(|source| source.channel_id.clone())
+        .collect::<Vec<_>>();
     let preview_pipeline = PreviewPipeline::new(
-        camera_names,
+        &camera_names,
         config.preview_workers,
         preview_config,
         config.jpeg_quality,
@@ -337,8 +331,18 @@ fn ipc_poll_loop(
 
                     preview_pipeline.submit_frame(name, header, data);
                 }
-                IpcMessage::RobotStateMsg { name, state } => {
-                    let json = protocol::encode_robot_state(&name, &state);
+                IpcMessage::RobotStateMsg {
+                    name,
+                    state_kind,
+                    timestamp_ms,
+                    values,
+                } => {
+                    let json = protocol::encode_robot_state(
+                        &name,
+                        timestamp_ms,
+                        &values,
+                        Some(state_kind.topic_suffix()),
+                    );
                     let _ = broadcast_tx.send(BroadcastMessage::Text(Arc::new(json)));
                 }
                 IpcMessage::EpisodeStatusMsg { status } => {
@@ -388,8 +392,6 @@ mod tests {
             config: None,
             config_inline: None,
             port: None,
-            cameras: None,
-            robots: None,
             max_preview_width: None,
             max_preview_height: None,
             jpeg_quality: None,
@@ -402,21 +404,27 @@ mod tests {
     fn legacy_runtime_defaults_match_previous_cli_behavior() {
         let config = load_runtime_config(&empty_args()).expect("legacy runtime config should load");
         assert_eq!(config.port, 9090);
-        assert_eq!(
-            config.cameras,
-            vec!["camera_0".to_string(), "camera_1".to_string()]
-        );
-        assert_eq!(config.robots, vec!["robot_0".to_string()]);
+        assert!(config.camera_sources.is_empty());
+        assert!(config.robot_sources.is_empty());
     }
 
     #[test]
-    fn config_inline_runtime_overrides_legacy_lists() {
+    fn config_inline_runtime_loads_v2_sources() {
         let mut args = empty_args();
         args.config_inline = Some(
             r#"
 port = 9910
-cameras = ["camera_top"]
-robots = ["leader_arm", "follower_arm"]
+[[camera_sources]]
+channel_id = "camera_top/color"
+frame_topic = "camera_top/color/frames"
+[[robot_sources]]
+channel_id = "leader_arm/arm"
+state_kind = "joint_position"
+state_topic = "leader_arm/arm/states/joint_position"
+[[robot_sources]]
+channel_id = "leader_arm/arm"
+state_kind = "joint_velocity"
+state_topic = "leader_arm/arm/states/joint_velocity"
 max_preview_width = 160
 max_preview_height = 90
 jpeg_quality = 45
@@ -427,14 +435,18 @@ preview_fps = 15
 
         let config = load_runtime_config(&args).expect("inline runtime config should load");
         assert_eq!(config.port, 9910);
-        assert_eq!(config.cameras, vec!["camera_top".to_string()]);
-        assert_eq!(
-            config.robots,
-            vec!["leader_arm".to_string(), "follower_arm".to_string()]
-        );
+        assert_eq!(config.camera_sources.len(), 1);
+        assert_eq!(config.robot_sources.len(), 2);
         assert_eq!(config.max_preview_width, 160);
         assert_eq!(config.max_preview_height, 90);
         assert_eq!(config.jpeg_quality, 45);
         assert_eq!(config.preview_fps, 15);
+    }
+}
+
+fn robot_source_name(source: &VisualizerRobotSourceConfig) -> String {
+    match source.state_kind {
+        RobotStateKind::JointPosition => source.channel_id.clone(),
+        other => format!("{}/{}", source.channel_id, other.topic_suffix()),
     }
 }

@@ -2,6 +2,8 @@ use iceoryx2::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_JOINTS: usize = 16;
+pub const MAX_DOF: usize = 15;
+pub const MAX_PARALLEL: usize = 2;
 pub const MAX_PROCESS_ID_LEN: usize = 64;
 pub const MAX_METRIC_NAME_LEN: usize = 64;
 pub const MAX_METRICS: usize = 32;
@@ -260,6 +262,189 @@ impl PixelFormat {
 }
 
 // ---------------------------------------------------------------------------
+// Hierarchical device payloads
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ZeroCopySend, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[type_name("DeviceStatus")]
+#[repr(C)]
+pub enum DeviceStatus {
+    Okay = 0,
+    Degraded = 1,
+    Error = 2,
+}
+
+impl Default for DeviceStatus {
+    fn default() -> Self {
+        Self::Okay
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ZeroCopySend, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[type_name("DeviceChannelMode")]
+#[repr(C)]
+pub enum DeviceChannelMode {
+    Disabled = 0,
+    Enabled = 1,
+    FreeDrive = 2,
+    CommandFollowing = 3,
+    Identifying = 4,
+}
+
+impl Default for DeviceChannelMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl DeviceChannelMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Enabled => "enabled",
+            Self::FreeDrive => "free-drive",
+            Self::CommandFollowing => "command-following",
+            Self::Identifying => "identifying",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ZeroCopySend, Serialize, Deserialize)]
+#[type_name("JointVector15")]
+#[repr(C)]
+pub struct JointVector15 {
+    pub timestamp_ms: u64,
+    pub len: u32,
+    pub values: [f64; MAX_DOF],
+}
+
+impl Default for JointVector15 {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            len: 0,
+            values: [0.0; MAX_DOF],
+        }
+    }
+}
+
+impl JointVector15 {
+    pub fn from_slice(timestamp_ms: u64, values: &[f64]) -> Self {
+        let mut payload = Self {
+            timestamp_ms,
+            len: values.len().min(MAX_DOF) as u32,
+            ..Self::default()
+        };
+        payload.values[..payload.len as usize].copy_from_slice(&values[..payload.len as usize]);
+        payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, ZeroCopySend, Serialize, Deserialize)]
+#[type_name("ParallelVector2")]
+#[repr(C)]
+pub struct ParallelVector2 {
+    pub timestamp_ms: u64,
+    pub len: u32,
+    pub values: [f64; MAX_PARALLEL],
+}
+
+impl Default for ParallelVector2 {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            len: 0,
+            values: [0.0; MAX_PARALLEL],
+        }
+    }
+}
+
+impl ParallelVector2 {
+    pub fn from_slice(timestamp_ms: u64, values: &[f64]) -> Self {
+        let mut payload = Self {
+            timestamp_ms,
+            len: values.len().min(MAX_PARALLEL) as u32,
+            ..Self::default()
+        };
+        payload.values[..payload.len as usize].copy_from_slice(&values[..payload.len as usize]);
+        payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, ZeroCopySend, Serialize, Deserialize)]
+#[type_name("Pose7")]
+#[repr(C)]
+pub struct Pose7 {
+    pub timestamp_ms: u64,
+    pub values: [f64; 7],
+}
+
+impl Default for Pose7 {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            values: [0.0; 7],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ZeroCopySend, Serialize, Deserialize)]
+#[type_name("JointMitCommand15")]
+#[repr(C)]
+pub struct JointMitCommand15 {
+    pub timestamp_ms: u64,
+    pub len: u32,
+    pub position: [f64; MAX_DOF],
+    pub velocity: [f64; MAX_DOF],
+    pub effort: [f64; MAX_DOF],
+    pub kp: [f64; MAX_DOF],
+    pub kd: [f64; MAX_DOF],
+}
+
+impl Default for JointMitCommand15 {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            len: 0,
+            position: [0.0; MAX_DOF],
+            velocity: [0.0; MAX_DOF],
+            effort: [0.0; MAX_DOF],
+            kp: [0.0; MAX_DOF],
+            kd: [0.0; MAX_DOF],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ZeroCopySend, Serialize, Deserialize)]
+#[type_name("ParallelMitCommand2")]
+#[repr(C)]
+pub struct ParallelMitCommand2 {
+    pub timestamp_ms: u64,
+    pub len: u32,
+    pub position: [f64; MAX_PARALLEL],
+    pub velocity: [f64; MAX_PARALLEL],
+    pub effort: [f64; MAX_PARALLEL],
+    pub kp: [f64; MAX_PARALLEL],
+    pub kd: [f64; MAX_PARALLEL],
+}
+
+impl Default for ParallelMitCommand2 {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            len: 0,
+            position: [0.0; MAX_PARALLEL],
+            velocity: [0.0; MAX_PARALLEL],
+            effort: [0.0; MAX_PARALLEL],
+            kp: [0.0; MAX_PARALLEL],
+            kd: [0.0; MAX_PARALLEL],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CameraFrameHeader — user header for publish_subscribe::<[u8]>()
 // ---------------------------------------------------------------------------
 
@@ -270,7 +455,7 @@ impl PixelFormat {
 #[type_name("CameraFrameHeader")]
 #[repr(C)]
 pub struct CameraFrameHeader {
-    pub timestamp_ns: u64,
+    pub timestamp_ms: u64,
     pub width: u32,
     pub height: u32,
     pub pixel_format: PixelFormat,
@@ -280,7 +465,7 @@ pub struct CameraFrameHeader {
 impl Default for CameraFrameHeader {
     fn default() -> Self {
         Self {
-            timestamp_ns: 0,
+            timestamp_ms: 0,
             width: 0,
             height: 0,
             pixel_format: PixelFormat::Rgb24,

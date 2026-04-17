@@ -1,4 +1,4 @@
-mod rollio_runtime;
+pub mod rollio_runtime;
 
 use airbot_play_rust::can::worker::CanWorkerBackend;
 use airbot_play_rust::model::ModelBackendKind;
@@ -19,7 +19,8 @@ pub const DRIVER_NAME: &str = "airbot-play";
 pub const DEFAULT_DOF: u32 = 6;
 pub const DEFAULT_PRODUCT_VARIANT: &str = "play-e2";
 pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 1000;
-pub const SUPPORTED_MODES: [&str; 2] = ["free-drive", "command-following"];
+pub const SUPPORTED_MODES: [&str; 4] =
+    ["free-drive", "command-following", "identifying", "disabled"];
 
 #[derive(Debug, Parser)]
 #[command(name = "rollio-robot-airbot-play")]
@@ -76,7 +77,7 @@ pub struct CapabilitiesReport {
     pub id: String,
     pub driver: String,
     pub dof: u32,
-    pub supported_modes: [String; 2],
+    pub supported_modes: [String; 4],
     pub default_frequency_hz: f64,
     pub transport: String,
     pub interface: String,

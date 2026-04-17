@@ -191,17 +191,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let timestamp_ns = SystemTime::now()
+        let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos() as u64;
+            .as_millis() as u64;
+        let timestamp_ns = timestamp_ms.saturating_mul(1_000_000);
 
         // Publish camera frames
         for (_name, publisher) in &cam_publishers {
             let mut sample = publisher.loan_slice_uninit(payload_len)?;
             // Set user header before writing payload (write_from_slice consumes the uninit sample)
             *sample.user_header_mut() = CameraFrameHeader {
-                timestamp_ns,
+                timestamp_ms,
                 width: args.width,
                 height: args.height,
                 pixel_format: PixelFormat::Rgb24,

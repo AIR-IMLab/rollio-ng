@@ -17,14 +17,14 @@ unsafe fn roundtrip<T: Clone + Sized>(val: &T) -> T {
 #[test]
 fn camera_frame_header_roundtrip() {
     let hdr = CameraFrameHeader {
-        timestamp_ns: 123_456_789,
+        timestamp_ms: 123_456_789,
         width: 640,
         height: 480,
         pixel_format: PixelFormat::Rgb24,
         frame_index: 42,
     };
     let hdr2 = unsafe { roundtrip(&hdr) };
-    assert_eq!(hdr2.timestamp_ns, 123_456_789);
+    assert_eq!(hdr2.timestamp_ms, 123_456_789);
     assert_eq!(hdr2.width, 640);
     assert_eq!(hdr2.height, 480);
     assert!(matches!(hdr2.pixel_format, PixelFormat::Rgb24));
@@ -34,7 +34,7 @@ fn camera_frame_header_roundtrip() {
 #[test]
 fn camera_frame_header_payload_size_rgb24() {
     let hdr = CameraFrameHeader {
-        timestamp_ns: 0,
+        timestamp_ms: 0,
         width: 640,
         height: 480,
         pixel_format: PixelFormat::Rgb24,
@@ -46,7 +46,7 @@ fn camera_frame_header_payload_size_rgb24() {
 #[test]
 fn camera_frame_header_payload_size_depth16() {
     let hdr = CameraFrameHeader {
-        timestamp_ns: 0,
+        timestamp_ms: 0,
         width: 640,
         height: 480,
         pixel_format: PixelFormat::Depth16,

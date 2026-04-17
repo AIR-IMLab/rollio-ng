@@ -179,7 +179,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 "type": "camera_frame",
                                 "name": tap.name,
                                 "receive_timestamp_ns": receive_ns,
-                                "source_timestamp_ns": header.timestamp_ns,
+                                "source_timestamp_ms": header.timestamp_ms,
                                 "frame_index": header.frame_index,
                                 "width": header.width,
                                 "height": header.height,
@@ -295,12 +295,12 @@ fn update_camera_stats(stats: &mut CameraStats, header: CameraFrameHeader, recei
     stats.first_frame_index.get_or_insert(header.frame_index);
     stats
         .first_source_timestamp_ns
-        .get_or_insert(header.timestamp_ns);
+        .get_or_insert(header.timestamp_ms);
 
     if let Some(previous_source_ns) = stats.last_source_timestamp_ns {
         stats
             .source_intervals_ms
-            .push((header.timestamp_ns.saturating_sub(previous_source_ns)) as f64 / 1_000_000.0);
+            .push((header.timestamp_ms.saturating_sub(previous_source_ns)) as f64);
     }
     if let Some(previous_receive_ns) = stats.last_receive_ns {
         stats
@@ -308,7 +308,7 @@ fn update_camera_stats(stats: &mut CameraStats, header: CameraFrameHeader, recei
             .push((receive_ns.saturating_sub(previous_receive_ns)) as f64 / 1_000_000.0);
     }
 
-    stats.last_source_timestamp_ns = Some(header.timestamp_ns);
+    stats.last_source_timestamp_ns = Some(header.timestamp_ms);
     stats.last_frame_index = Some(header.frame_index);
     stats.last_receive_ns = Some(receive_ns);
 }
@@ -324,7 +324,7 @@ fn print_summary(camera_stats: &HashMap<String, CameraStats>, command_stats: &Co
             (Some(first_frame), Some(last_frame), Some(first_ts), Some(last_ts))
                 if last_frame > first_frame && last_ts > first_ts =>
             {
-                (last_frame - first_frame) as f64 / ((last_ts - first_ts) as f64 / 1_000_000_000.0)
+                (last_frame - first_frame) as f64 / ((last_ts - first_ts) as f64 / 1_000.0)
             }
             _ => 0.0,
         };

@@ -1,4 +1,4 @@
-use crate::messages::{PixelFormat, MAX_JOINTS};
+use crate::messages::{MAX_DOF, MAX_JOINTS, MAX_PARALLEL, PixelFormat};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -737,6 +737,8 @@ pub enum DeviceType {
 pub enum RobotMode {
     FreeDrive,
     CommandFollowing,
+    Identifying,
+    Disabled,
 }
 
 impl RobotMode {
@@ -744,6 +746,8 @@ impl RobotMode {
         match self {
             Self::FreeDrive => 0,
             Self::CommandFollowing => 1,
+            Self::Identifying => 2,
+            Self::Disabled => 3,
         }
     }
 
@@ -751,7 +755,18 @@ impl RobotMode {
         match value {
             0 => Some(Self::FreeDrive),
             1 => Some(Self::CommandFollowing),
+            2 => Some(Self::Identifying),
+            3 => Some(Self::Disabled),
             _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FreeDrive => "free-drive",
+            Self::CommandFollowing => "command-following",
+            Self::Identifying => "identifying",
+            Self::Disabled => "disabled",
         }
     }
 }
@@ -1469,6 +1484,14 @@ impl EncoderConfig {
         }
     }
 
+    pub fn codec_for_pixel_format(&self, pixel_format: PixelFormat) -> EncoderCodec {
+        if matches!(pixel_format, PixelFormat::Depth16 | PixelFormat::Gray8) {
+            self.depth_codec
+        } else {
+            self.video_codec
+        }
+    }
+
     pub fn resolved_artifact_format(&self) -> EncoderArtifactFormat {
         self.resolved_artifact_format_for(self.video_codec)
     }
@@ -1775,7 +1798,7 @@ pub struct ControllerConfig {
 }
 
 fn default_shutdown_timeout_ms() -> u64 {
-    3_000
+    30_000
 }
 
 fn default_child_poll_interval_ms() -> u64 {
@@ -2160,4 +2183,1430 @@ impl ThresholdDef {
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sprint Extra A hierarchical device-binary config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ProjectConfigSerde")]
+pub struct ProjectConfig {
+    pub project_name: String,
+    pub mode: CollectionMode,
+    pub episode: EpisodeConfig,
+    pub devices: Vec<BinaryDeviceConfig>,
+    #[serde(default)]
+    pub pairings: Vec<ChannelPairingConfig>,
+    pub encoder: EncoderConfig,
+    #[serde(default)]
+    pub assembler: AssemblerConfig,
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub monitor: MonitorConfig,
+    #[serde(default)]
+    pub controller: ControllerConfig,
+    #[serde(default)]
+    pub visualizer: VisualizerConfig,
+    #[serde(default)]
+    pub ui: UiRuntimeConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectConfigSerde {
+    #[serde(default = "default_project_name")]
+    project_name: String,
+    #[serde(default)]
+    mode: Option<CollectionMode>,
+    episode: EpisodeConfig,
+    devices: Vec<BinaryDeviceConfig>,
+    #[serde(default)]
+    pairings: Vec<ChannelPairingConfig>,
+    encoder: EncoderConfig,
+    #[serde(default)]
+    assembler: AssemblerConfig,
+    storage: StorageConfig,
+    #[serde(default)]
+    monitor: MonitorConfig,
+    #[serde(default)]
+    controller: ControllerConfig,
+    #[serde(default)]
+    visualizer: VisualizerConfig,
+    #[serde(default)]
+    ui: UiRuntimeConfig,
+}
+
+impl From<ProjectConfigSerde> for ProjectConfig {
+    fn from(value: ProjectConfigSerde) -> Self {
+        let mode = value
+            .mode
+            .unwrap_or_else(|| infer_collection_mode_v2(&value.pairings));
+        Self {
+            project_name: value.project_name,
+            mode,
+            episode: value.episode,
+            devices: value.devices,
+            pairings: value.pairings,
+            encoder: value.encoder,
+            assembler: value.assembler,
+            storage: value.storage,
+            monitor: value.monitor,
+            controller: value.controller,
+            visualizer: value.visualizer,
+            ui: value.ui,
+        }
+    }
+}
+
+fn infer_collection_mode_v2(pairings: &[ChannelPairingConfig]) -> CollectionMode {
+    if pairings.is_empty() {
+        CollectionMode::Intervention
+    } else {
+        CollectionMode::Teleop
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BinaryDeviceConfig {
+    pub name: String,
+    #[serde(default)]
+    pub executable: Option<String>,
+    pub driver: String,
+    pub id: String,
+    pub bus_root: String,
+    #[serde(default)]
+    pub channels: Vec<DeviceChannelConfigV2>,
+    #[serde(flatten, default)]
+    pub extra: toml::Table,
+}
+
+impl BinaryDeviceConfig {
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        text.parse()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "device: name must not be empty".into(),
+            ));
+        }
+        if self.driver.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\": driver must not be empty",
+                self.name
+            )));
+        }
+        if matches!(self.driver.as_str(), "airbot-e2" | "airbot-e2b" | "airbot-g2") {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\": {} is no longer configured as a standalone device; use driver \"airbot-play\" with an enabled \"e2\" or \"g2\" channel instead",
+                self.name, self.driver
+            )));
+        }
+        if self
+            .executable
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\": executable must not be empty when set",
+                self.name
+            )));
+        }
+        if self.id.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\": id must not be empty",
+                self.name
+            )));
+        }
+        if self.bus_root.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\": bus_root must not be empty",
+                self.name
+            )));
+        }
+        if self.channels.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\": at least one [[devices.channels]] entry is required",
+                self.name
+            )));
+        }
+        let mut channel_types = HashSet::new();
+        for channel in &self.channels {
+            if !channel_types.insert(channel.channel_type.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "device \"{}\": duplicate channel_type \"{}\"",
+                    self.name, channel.channel_type
+                )));
+            }
+            channel.validate(self)?;
+        }
+        Ok(())
+    }
+
+    pub fn channel_named(&self, channel_type: &str) -> Option<&DeviceChannelConfigV2> {
+        self.channels
+            .iter()
+            .find(|channel| channel.channel_type == channel_type)
+    }
+}
+
+impl FromStr for BinaryDeviceConfig {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: BinaryDeviceConfig = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceChannelConfigV2 {
+    pub channel_type: String,
+    pub kind: DeviceType,
+    #[serde(default = "default_enabled_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: Option<RobotMode>,
+    #[serde(default)]
+    pub dof: Option<u32>,
+    #[serde(default)]
+    pub publish_states: Vec<RobotStateKind>,
+    #[serde(default)]
+    pub recorded_states: Vec<RobotStateKind>,
+    #[serde(default)]
+    pub control_frequency_hz: Option<f64>,
+    #[serde(default)]
+    pub profile: Option<CameraChannelProfile>,
+    #[serde(default)]
+    pub command_defaults: ChannelCommandDefaults,
+    #[serde(flatten, default)]
+    pub extra: toml::Table,
+}
+
+fn default_enabled_true() -> bool {
+    true
+}
+
+impl DeviceChannelConfigV2 {
+    fn validate(&self, device: &BinaryDeviceConfig) -> Result<(), ConfigError> {
+        if self.channel_type.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\": channel_type must not be empty",
+                device.name
+            )));
+        }
+        match self.kind {
+            DeviceType::Camera => {
+                if self.mode.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": camera channels do not accept mode",
+                        device.name, self.channel_type
+                    )));
+                }
+                if self.dof.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": camera channels do not accept dof",
+                        device.name, self.channel_type
+                    )));
+                }
+                if !self.publish_states.is_empty() || !self.recorded_states.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": camera channels do not accept publish_states or recorded_states",
+                        device.name, self.channel_type
+                    )));
+                }
+                if self.control_frequency_hz.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": camera channels do not accept control_frequency_hz",
+                        device.name, self.channel_type
+                    )));
+                }
+                self.profile.as_ref().ok_or_else(|| {
+                    ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": enabled camera channels require profile",
+                        device.name, self.channel_type
+                    ))
+                })?;
+                if let Some(profile) = &self.profile {
+                    profile.validate(device, &self.channel_type)?;
+                }
+                self.command_defaults
+                    .validate(device, &self.channel_type, 0)?;
+            }
+            DeviceType::Robot => {
+                let dof = self.dof.ok_or_else(|| {
+                    ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": robot channels require dof",
+                        device.name, self.channel_type
+                    ))
+                })?;
+                if dof == 0 || dof as usize > MAX_DOF {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": dof must be 1..{}, got {}",
+                        device.name, self.channel_type, MAX_DOF, dof
+                    )));
+                }
+                if self.enabled && self.mode.is_none() {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": enabled robot channels require mode",
+                        device.name, self.channel_type
+                    )));
+                }
+                if self.enabled && self.publish_states.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": enabled robot channels require publish_states",
+                        device.name, self.channel_type
+                    )));
+                }
+                if self
+                    .recorded_states
+                    .iter()
+                    .any(|state| !self.publish_states.contains(state))
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": recorded_states must be a subset of publish_states",
+                        device.name, self.channel_type
+                    )));
+                }
+                if let Some(profile) = &self.profile {
+                    return Err(ConfigError::Validation(format!(
+                        "device \"{}\" channel \"{}\": robot channels do not accept profile ({:?})",
+                        device.name, self.channel_type, profile
+                    )));
+                }
+                if let Some(freq) = self.control_frequency_hz {
+                    if !freq.is_finite() || freq <= 0.0 {
+                        return Err(ConfigError::Validation(format!(
+                            "device \"{}\" channel \"{}\": control_frequency_hz must be a positive finite number",
+                            device.name, self.channel_type
+                        )));
+                    }
+                }
+                self.command_defaults
+                    .validate(device, &self.channel_type, dof as usize)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CameraChannelProfile {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub pixel_format: PixelFormat,
+    #[serde(default)]
+    pub native_pixel_format: Option<String>,
+}
+
+impl CameraChannelProfile {
+    fn validate(
+        &self,
+        device: &BinaryDeviceConfig,
+        channel_type: &str,
+    ) -> Result<(), ConfigError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\" channel \"{}\": camera profile requires non-zero width and height",
+                device.name, channel_type
+            )));
+        }
+        if self.fps == 0 || self.fps > 1000 {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\" channel \"{}\": camera profile fps must be 1..1000, got {}",
+                device.name, channel_type, self.fps
+            )));
+        }
+        if self
+            .native_pixel_format
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\" channel \"{}\": native_pixel_format must not be empty",
+                device.name, channel_type
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChannelCommandDefaults {
+    #[serde(default)]
+    pub joint_mit_kp: Vec<f64>,
+    #[serde(default)]
+    pub joint_mit_kd: Vec<f64>,
+    #[serde(default)]
+    pub parallel_mit_kp: Vec<f64>,
+    #[serde(default)]
+    pub parallel_mit_kd: Vec<f64>,
+}
+
+impl ChannelCommandDefaults {
+    fn validate(
+        &self,
+        device: &BinaryDeviceConfig,
+        channel_type: &str,
+        dof: usize,
+    ) -> Result<(), ConfigError> {
+        for (label, values, limit) in [
+            ("joint_mit_kp", &self.joint_mit_kp, MAX_DOF),
+            ("joint_mit_kd", &self.joint_mit_kd, MAX_DOF),
+            ("parallel_mit_kp", &self.parallel_mit_kp, MAX_PARALLEL),
+            ("parallel_mit_kd", &self.parallel_mit_kd, MAX_PARALLEL),
+        ] {
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(ConfigError::Validation(format!(
+                    "device \"{}\" channel \"{}\": {} values must be finite",
+                    device.name, channel_type, label
+                )));
+            }
+            if values.len() > limit {
+                return Err(ConfigError::Validation(format!(
+                    "device \"{}\" channel \"{}\": {} may contain at most {} values",
+                    device.name, channel_type, label, limit
+                )));
+            }
+        }
+        if !self.joint_mit_kp.is_empty() && dof != 0 && self.joint_mit_kp.len() != dof {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\" channel \"{}\": joint_mit_kp length must match dof {}",
+                device.name, channel_type, dof
+            )));
+        }
+        if !self.joint_mit_kd.is_empty() && dof != 0 && self.joint_mit_kd.len() != dof {
+            return Err(ConfigError::Validation(format!(
+                "device \"{}\" channel \"{}\": joint_mit_kd length must match dof {}",
+                device.name, channel_type, dof
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RobotStateKind {
+    JointPosition,
+    JointVelocity,
+    JointEffort,
+    EndEffectorPose,
+    EndEffectorTwist,
+    EndEffectorWrench,
+    ParallelPosition,
+    ParallelVelocity,
+    ParallelEffort,
+}
+
+impl RobotStateKind {
+    pub fn topic_suffix(self) -> &'static str {
+        match self {
+            Self::JointPosition => "joint_position",
+            Self::JointVelocity => "joint_velocity",
+            Self::JointEffort => "joint_effort",
+            Self::EndEffectorPose => "end_effector_pose",
+            Self::EndEffectorTwist => "end_effector_twist",
+            Self::EndEffectorWrench => "end_effector_wrench",
+            Self::ParallelPosition => "parallel_position",
+            Self::ParallelVelocity => "parallel_velocity",
+            Self::ParallelEffort => "parallel_effort",
+        }
+    }
+
+    pub fn value_len(self, dof: u32) -> u32 {
+        match self {
+            Self::JointPosition | Self::JointVelocity | Self::JointEffort => dof,
+            Self::ParallelPosition | Self::ParallelVelocity | Self::ParallelEffort => {
+                dof.min(MAX_PARALLEL as u32)
+            }
+            Self::EndEffectorPose => 7,
+            Self::EndEffectorTwist | Self::EndEffectorWrench => 6,
+        }
+    }
+
+    pub fn uses_pose_payload(self) -> bool {
+        matches!(self, Self::EndEffectorPose)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RobotCommandKind {
+    JointPosition,
+    JointMit,
+    EndPose,
+    ParallelPosition,
+    ParallelMit,
+}
+
+impl RobotCommandKind {
+    pub fn topic_suffix(self) -> &'static str {
+        match self {
+            Self::JointPosition => "joint_position",
+            Self::JointMit => "joint_mit",
+            Self::EndPose => "end_pose",
+            Self::ParallelPosition => "parallel_position",
+            Self::ParallelMit => "parallel_mit",
+        }
+    }
+
+    pub fn uses_pose_payload(self) -> bool {
+        matches!(self, Self::EndPose)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelPairingConfig {
+    pub leader_device: String,
+    pub leader_channel_type: String,
+    pub follower_device: String,
+    pub follower_channel_type: String,
+    #[serde(default = "default_mapping")]
+    pub mapping: MappingStrategy,
+    pub leader_state: RobotStateKind,
+    pub follower_command: RobotCommandKind,
+    #[serde(default)]
+    pub joint_index_map: Vec<u32>,
+    #[serde(default)]
+    pub joint_scales: Vec<f64>,
+}
+
+impl ChannelPairingConfig {
+    fn validate(&self, config: &ProjectConfig) -> Result<(), ConfigError> {
+        let leader_device = config.device_named(&self.leader_device).ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "pairing references unknown leader_device \"{}\"",
+                self.leader_device
+            ))
+        })?;
+        let follower_device = config.device_named(&self.follower_device).ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "pairing references unknown follower_device \"{}\"",
+                self.follower_device
+            ))
+        })?;
+        let leader = leader_device
+            .channel_named(&self.leader_channel_type)
+            .ok_or_else(|| {
+                ConfigError::Validation(format!(
+                    "pairing references unknown leader channel {}:{}",
+                    self.leader_device, self.leader_channel_type
+                ))
+            })?;
+        let follower = follower_device
+            .channel_named(&self.follower_channel_type)
+            .ok_or_else(|| {
+                ConfigError::Validation(format!(
+                    "pairing references unknown follower channel {}:{}",
+                    self.follower_device, self.follower_channel_type
+                ))
+            })?;
+        if leader.kind != DeviceType::Robot || follower.kind != DeviceType::Robot {
+            return Err(ConfigError::Validation(format!(
+                "pairing {}:{} -> {}:{} must target robot channels",
+                self.leader_device,
+                self.leader_channel_type,
+                self.follower_device,
+                self.follower_channel_type
+            )));
+        }
+        if self.leader_device == self.follower_device
+            && self.leader_channel_type == self.follower_channel_type
+        {
+            return Err(ConfigError::Validation(
+                "pairing leader and follower channel must differ".into(),
+            ));
+        }
+        if !leader.publish_states.contains(&self.leader_state) {
+            return Err(ConfigError::Validation(format!(
+                "pairing {}:{} leader_state {:?} is not present in publish_states",
+                self.leader_device, self.leader_channel_type, self.leader_state
+            )));
+        }
+        match self.mapping {
+            MappingStrategy::DirectJoint => {
+                if matches!(self.leader_state, RobotStateKind::EndEffectorPose)
+                    || matches!(self.follower_command, RobotCommandKind::EndPose)
+                {
+                    return Err(ConfigError::Validation(
+                        "direct-joint mapping does not allow end-effector pose commands".into(),
+                    ));
+                }
+            }
+            MappingStrategy::Cartesian => {
+                if self.leader_state != RobotStateKind::EndEffectorPose
+                    || self.follower_command != RobotCommandKind::EndPose
+                {
+                    return Err(ConfigError::Validation(
+                        "cartesian mapping requires leader_state=end_effector_pose and follower_command=end_pose"
+                            .into(),
+                    ));
+                }
+                if !self.joint_index_map.is_empty() || !self.joint_scales.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "cartesian mapping does not use joint_index_map or joint_scales".into(),
+                    ));
+                }
+            }
+        }
+        if self.joint_scales.iter().any(|value| !value.is_finite()) {
+            return Err(ConfigError::Validation(
+                "pairing joint_scales must be finite".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VisualizerConfig {
+    #[serde(default = "default_visualizer_port")]
+    pub port: u16,
+    #[serde(default = "default_max_preview_width")]
+    pub max_preview_width: u32,
+    #[serde(default = "default_max_preview_height")]
+    pub max_preview_height: u32,
+    #[serde(default = "default_jpeg_quality")]
+    pub jpeg_quality: i32,
+    #[serde(default = "default_preview_fps")]
+    pub preview_fps: u32,
+    #[serde(default)]
+    pub preview_workers: Option<usize>,
+}
+
+impl VisualizerConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        VisualizerRuntimeConfig {
+            port: self.port,
+            cameras: Vec::new(),
+            robots: Vec::new(),
+            max_preview_width: self.max_preview_width,
+            max_preview_height: self.max_preview_height,
+            jpeg_quality: self.jpeg_quality,
+            preview_fps: self.preview_fps,
+            preview_workers: self.preview_workers,
+        }
+        .validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizerCameraSourceConfig {
+    pub channel_id: String,
+    pub frame_topic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizerRobotSourceConfig {
+    pub channel_id: String,
+    pub state_kind: RobotStateKind,
+    pub state_topic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizerRuntimeConfigV2 {
+    pub port: u16,
+    #[serde(default)]
+    pub camera_sources: Vec<VisualizerCameraSourceConfig>,
+    #[serde(default)]
+    pub robot_sources: Vec<VisualizerRobotSourceConfig>,
+    pub max_preview_width: u32,
+    pub max_preview_height: u32,
+    pub jpeg_quality: i32,
+    pub preview_fps: u32,
+    #[serde(default)]
+    pub preview_workers: Option<usize>,
+}
+
+impl VisualizerRuntimeConfigV2 {
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        text.parse()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        VisualizerRuntimeConfig {
+            port: self.port,
+            cameras: self
+                .camera_sources
+                .iter()
+                .map(|source| source.channel_id.clone())
+                .collect(),
+            robots: self
+                .robot_sources
+                .iter()
+                .map(|source| source.channel_id.clone())
+                .collect(),
+            max_preview_width: self.max_preview_width,
+            max_preview_height: self.max_preview_height,
+            jpeg_quality: self.jpeg_quality,
+            preview_fps: self.preview_fps,
+            preview_workers: self.preview_workers,
+        }
+        .validate()?;
+        Ok(())
+    }
+}
+
+impl FromStr for VisualizerRuntimeConfigV2 {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: VisualizerRuntimeConfigV2 = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeleopRuntimeConfigV2 {
+    pub process_id: String,
+    pub leader_channel_id: String,
+    pub follower_channel_id: String,
+    pub leader_state_kind: RobotStateKind,
+    pub leader_state_topic: String,
+    pub follower_command_kind: RobotCommandKind,
+    pub follower_command_topic: String,
+    #[serde(default = "default_mapping")]
+    pub mapping: MappingStrategy,
+    #[serde(default)]
+    pub joint_index_map: Vec<u32>,
+    #[serde(default)]
+    pub joint_scales: Vec<f64>,
+    #[serde(default)]
+    pub command_defaults: ChannelCommandDefaults,
+}
+
+impl TeleopRuntimeConfigV2 {
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        text.parse()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.process_id.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "teleop runtime v2: process_id must not be empty".into(),
+            ));
+        }
+        if self.leader_channel_id.trim().is_empty() || self.follower_channel_id.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "teleop runtime v2: leader_channel_id and follower_channel_id must not be empty"
+                    .into(),
+            ));
+        }
+        if self.leader_state_topic.trim().is_empty()
+            || self.follower_command_topic.trim().is_empty()
+        {
+            return Err(ConfigError::Validation(
+                "teleop runtime v2: state and command topics must not be empty".into(),
+            ));
+        }
+        if self.joint_scales.iter().any(|scale| !scale.is_finite()) {
+            return Err(ConfigError::Validation(
+                "teleop runtime v2: joint_scales must be finite".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for TeleopRuntimeConfigV2 {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: TeleopRuntimeConfigV2 = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncoderRuntimeConfigV2 {
+    pub process_id: String,
+    pub channel_id: String,
+    pub frame_topic: String,
+    pub output_dir: String,
+    pub codec: EncoderCodec,
+    #[serde(default)]
+    pub backend: EncoderBackend,
+    #[serde(default)]
+    pub artifact_format: EncoderArtifactFormat,
+    #[serde(default = "default_queue_size")]
+    pub queue_size: u32,
+    pub fps: u32,
+}
+
+impl EncoderRuntimeConfigV2 {
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        text.parse()
+    }
+
+    pub fn resolved_artifact_format(&self) -> EncoderArtifactFormat {
+        EncoderConfig {
+            video_codec: self.codec,
+            depth_codec: self.codec,
+            backend: self.backend,
+            artifact_format: self.artifact_format,
+            queue_size: self.queue_size,
+        }
+        .resolved_artifact_format()
+    }
+
+    pub fn output_extension(&self) -> &'static str {
+        self.resolved_artifact_format().extension()
+    }
+
+    pub fn output_file_name(&self, episode_index: u32) -> String {
+        let stem = self
+            .process_id
+            .chars()
+            .map(|ch| match ch {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+                _ => '_',
+            })
+            .collect::<String>();
+        format!(
+            "{stem}_episode_{episode_index:06}.{}",
+            self.output_extension()
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.process_id.trim().is_empty()
+            || self.channel_id.trim().is_empty()
+            || self.frame_topic.trim().is_empty()
+            || self.output_dir.trim().is_empty()
+        {
+            return Err(ConfigError::Validation(
+                "encoder runtime v2: process_id, channel_id, frame_topic, and output_dir must not be empty"
+                    .into(),
+            ));
+        }
+        if self.fps == 0 || self.fps > 1000 {
+            return Err(ConfigError::Validation(format!(
+                "encoder runtime v2: fps must be 1..1000, got {}",
+                self.fps
+            )));
+        }
+        EncoderConfig {
+            video_codec: self.codec,
+            depth_codec: self.codec,
+            backend: self.backend,
+            artifact_format: self.artifact_format,
+            queue_size: self.queue_size,
+        }
+        .validate()
+    }
+}
+
+impl FromStr for EncoderRuntimeConfigV2 {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: EncoderRuntimeConfigV2 = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblerCameraRuntimeConfigV2 {
+    pub channel_id: String,
+    pub encoder_process_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub pixel_format: PixelFormat,
+    pub codec: EncoderCodec,
+    pub artifact_format: EncoderArtifactFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblerObservationRuntimeConfigV2 {
+    pub channel_id: String,
+    pub state_kind: RobotStateKind,
+    pub state_topic: String,
+    pub value_len: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblerActionRuntimeConfigV2 {
+    pub channel_id: String,
+    pub command_kind: RobotCommandKind,
+    pub command_topic: String,
+    pub value_len: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblerRuntimeConfigV2 {
+    pub process_id: String,
+    pub format: EpisodeFormat,
+    pub fps: u32,
+    pub chunk_size: u32,
+    pub missing_video_timeout_ms: u64,
+    pub staging_dir: String,
+    #[serde(default)]
+    pub encoded_handoff: EncodedHandoffMode,
+    #[serde(default)]
+    pub cameras: Vec<AssemblerCameraRuntimeConfigV2>,
+    #[serde(default)]
+    pub observations: Vec<AssemblerObservationRuntimeConfigV2>,
+    #[serde(default)]
+    pub actions: Vec<AssemblerActionRuntimeConfigV2>,
+    pub embedded_config_toml: String,
+}
+
+impl AssemblerRuntimeConfigV2 {
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        text.parse()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.process_id.trim().is_empty() || self.staging_dir.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "assembler runtime v2: process_id and staging_dir must not be empty".into(),
+            ));
+        }
+        if self.fps == 0 || self.fps > 1000 || self.chunk_size == 0 {
+            return Err(ConfigError::Validation(
+                "assembler runtime v2: fps must be 1..1000 and chunk_size must be > 0".into(),
+            ));
+        }
+        if self.cameras.is_empty() {
+            return Err(ConfigError::Validation(
+                "assembler runtime v2: at least one camera is required".into(),
+            ));
+        }
+        if self.embedded_config_toml.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "assembler runtime v2: embedded_config_toml must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for AssemblerRuntimeConfigV2 {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: AssemblerRuntimeConfigV2 = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectJointCompatibilityPeer {
+    pub driver: String,
+    pub channel_type: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectJointCompatibility {
+    #[serde(default)]
+    pub can_lead: Vec<DirectJointCompatibilityPeer>,
+    #[serde(default)]
+    pub can_follow: Vec<DirectJointCompatibilityPeer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceQueryChannel {
+    pub channel_type: String,
+    pub kind: DeviceType,
+    pub available: bool,
+    #[serde(default)]
+    pub modes: Vec<String>,
+    #[serde(default)]
+    pub profiles: Vec<CameraChannelProfile>,
+    #[serde(default)]
+    pub supported_states: Vec<RobotStateKind>,
+    #[serde(default)]
+    pub supported_commands: Vec<RobotCommandKind>,
+    #[serde(default)]
+    pub supports_fk: bool,
+    #[serde(default)]
+    pub supports_ik: bool,
+    pub dof: Option<u32>,
+    pub default_control_frequency_hz: Option<f64>,
+    #[serde(default)]
+    pub direct_joint_compatibility: DirectJointCompatibility,
+    #[serde(default)]
+    pub defaults: ChannelCommandDefaults,
+    #[serde(default)]
+    pub optional_info: toml::Table,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceQueryDevice {
+    pub id: String,
+    pub device_class: String,
+    pub device_label: String,
+    #[serde(default)]
+    pub optional_info: toml::Table,
+    #[serde(default)]
+    pub channels: Vec<DeviceQueryChannel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceQueryResponse {
+    pub driver: String,
+    #[serde(default)]
+    pub devices: Vec<DeviceQueryDevice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedCameraChannel {
+    pub channel_id: String,
+    pub device_name: String,
+    pub bus_root: String,
+    pub channel_type: String,
+    pub frame_topic: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub pixel_format: PixelFormat,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedRobotChannel {
+    pub channel_id: String,
+    pub device_name: String,
+    pub driver: String,
+    pub bus_root: String,
+    pub channel_type: String,
+    pub dof: u32,
+    pub state_topics: Vec<(RobotStateKind, String)>,
+    pub recorded_states: Vec<RobotStateKind>,
+    pub control_frequency_hz: f64,
+    pub command_defaults: ChannelCommandDefaults,
+}
+
+impl ProjectConfig {
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path)?;
+        text.parse()
+    }
+
+    /// Empty project shell used by interactive setup before devices are finalized.
+    pub fn draft_setup_template() -> Self {
+        Self {
+            project_name: default_project_name(),
+            mode: CollectionMode::Intervention,
+            episode: EpisodeConfig::default(),
+            devices: Vec::new(),
+            pairings: Vec::new(),
+            encoder: EncoderConfig::default(),
+            assembler: AssemblerConfig::default(),
+            storage: StorageConfig::default(),
+            monitor: MonitorConfig::default(),
+            controller: ControllerConfig::default(),
+            // `VisualizerConfig` uses `#[derive(Default)]` with serde defaults only for
+            // deserialization — explicit values keep draft templates valid before TOML parse.
+            visualizer: VisualizerConfig {
+                port: 9090,
+                max_preview_width: 320,
+                max_preview_height: 240,
+                jpeg_quality: 30,
+                preview_fps: 60,
+                preview_workers: None,
+            },
+            ui: UiRuntimeConfig::default(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.project_name.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "project_name must not be empty".into(),
+            ));
+        }
+        self.episode.validate()?;
+        if self.devices.is_empty() {
+            return Err(ConfigError::Validation(
+                "at least one [[devices]] entry is required".into(),
+            ));
+        }
+        let mut names = HashSet::new();
+        let mut bus_roots = HashSet::new();
+        for device in &self.devices {
+            if !names.insert(device.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate device name: \"{}\"",
+                    device.name
+                )));
+            }
+            if !bus_roots.insert(device.bus_root.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate bus_root: \"{}\"",
+                    device.bus_root
+                )));
+            }
+            device.validate()?;
+        }
+        for pairing in &self.pairings {
+            pairing.validate(self)?;
+        }
+        match self.mode {
+            CollectionMode::Teleop => {
+                if self.pairings.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "mode=teleop requires at least one [[pairings]] entry".into(),
+                    ));
+                }
+            }
+            CollectionMode::Intervention => {
+                if !self.pairings.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "mode=intervention does not allow [[pairings]] entries".into(),
+                    ));
+                }
+            }
+        }
+        self.encoder.validate()?;
+        self.assembler.validate()?;
+        self.storage.validate()?;
+        self.monitor.validate()?;
+        self.controller.validate()?;
+        self.visualizer.validate()?;
+        self.ui.validate()?;
+        Ok(())
+    }
+
+    pub fn device_named(&self, name: &str) -> Option<&BinaryDeviceConfig> {
+        self.devices.iter().find(|device| device.name == name)
+    }
+
+    pub fn resolved_camera_channels(&self) -> Vec<ResolvedCameraChannel> {
+        let mut channels = Vec::new();
+        for device in &self.devices {
+            for channel in &device.channels {
+                if channel.kind != DeviceType::Camera || !channel.enabled {
+                    continue;
+                }
+                let Some(profile) = channel.profile.as_ref() else {
+                    continue;
+                };
+                let channel_id = device_channel_id(&device.name, &channel.channel_type);
+                channels.push(ResolvedCameraChannel {
+                    channel_id,
+                    device_name: device.name.clone(),
+                    bus_root: device.bus_root.clone(),
+                    channel_type: channel.channel_type.clone(),
+                    frame_topic: camera_frames_topic_v2(&device.bus_root, &channel.channel_type),
+                    width: profile.width,
+                    height: profile.height,
+                    fps: profile.fps,
+                    pixel_format: profile.pixel_format,
+                });
+            }
+        }
+        channels
+    }
+
+    pub fn resolved_robot_channels(&self) -> Vec<ResolvedRobotChannel> {
+        let mut channels = Vec::new();
+        for device in &self.devices {
+            for channel in &device.channels {
+                if channel.kind != DeviceType::Robot || !channel.enabled {
+                    continue;
+                }
+                let dof = channel.dof.unwrap_or_default();
+                let recorded_states = if channel.recorded_states.is_empty() {
+                    channel.publish_states.clone()
+                } else {
+                    channel.recorded_states.clone()
+                };
+                let state_topics = channel
+                    .publish_states
+                    .iter()
+                    .copied()
+                    .map(|state| {
+                        (
+                            state,
+                            robot_state_topic_v2(&device.bus_root, &channel.channel_type, state),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                channels.push(ResolvedRobotChannel {
+                    channel_id: device_channel_id(&device.name, &channel.channel_type),
+                    device_name: device.name.clone(),
+                    driver: device.driver.clone(),
+                    bus_root: device.bus_root.clone(),
+                    channel_type: channel.channel_type.clone(),
+                    dof,
+                    state_topics,
+                    recorded_states,
+                    control_frequency_hz: channel.control_frequency_hz.unwrap_or(60.0),
+                    command_defaults: channel.command_defaults.clone(),
+                });
+            }
+        }
+        channels
+    }
+
+    pub fn ui_runtime_config(&self) -> UiRuntimeConfig {
+        let mut config = self.ui.clone();
+        if config.websocket_url.is_none() {
+            config.websocket_url = Some(format!("ws://127.0.0.1:{}", self.visualizer.port));
+        }
+        config
+    }
+
+    pub fn visualizer_runtime_config_v2(&self) -> VisualizerRuntimeConfigV2 {
+        let camera_sources = self
+            .resolved_camera_channels()
+            .into_iter()
+            .map(|camera| VisualizerCameraSourceConfig {
+                channel_id: camera.channel_id,
+                frame_topic: camera.frame_topic,
+            })
+            .collect();
+        let robot_sources = self
+            .resolved_robot_channels()
+            .into_iter()
+            .flat_map(|robot| {
+                let channel_id = robot.channel_id.clone();
+                robot.state_topics
+                    .into_iter()
+                    .map(move |(state_kind, state_topic)| VisualizerRobotSourceConfig {
+                        channel_id: channel_id.clone(),
+                        state_kind,
+                        state_topic,
+                    })
+            })
+            .collect();
+        VisualizerRuntimeConfigV2 {
+            port: self.visualizer.port,
+            camera_sources,
+            robot_sources,
+            max_preview_width: self.visualizer.max_preview_width,
+            max_preview_height: self.visualizer.max_preview_height,
+            jpeg_quality: self.visualizer.jpeg_quality,
+            preview_fps: self.visualizer.preview_fps,
+            preview_workers: self.visualizer.preview_workers,
+        }
+    }
+
+    pub fn encoder_runtime_configs_v2(&self) -> Vec<EncoderRuntimeConfigV2> {
+        self.resolved_camera_channels()
+            .into_iter()
+            .map(|camera| {
+                let codec = self.encoder.codec_for_pixel_format(camera.pixel_format);
+                EncoderRuntimeConfigV2 {
+                    process_id: encoder_process_id_v2(&camera.channel_id),
+                    channel_id: camera.channel_id.clone(),
+                    frame_topic: camera.frame_topic,
+                    output_dir: encoder_output_dir_v2(&self.assembler.staging_dir, &camera.channel_id),
+                    codec,
+                    backend: self.encoder.backend,
+                    artifact_format: self.encoder.resolved_artifact_format_for(codec),
+                    queue_size: self.encoder.queue_size,
+                    fps: camera.fps,
+                }
+            })
+            .collect()
+    }
+
+    pub fn assembler_runtime_config_v2(
+        &self,
+        embedded_config_toml: String,
+    ) -> AssemblerRuntimeConfigV2 {
+        let cameras = self
+            .resolved_camera_channels()
+            .into_iter()
+            .map(|camera| {
+                let codec = self.encoder.codec_for_pixel_format(camera.pixel_format);
+                AssemblerCameraRuntimeConfigV2 {
+                    channel_id: camera.channel_id.clone(),
+                    encoder_process_id: encoder_process_id_v2(&camera.channel_id),
+                    width: camera.width,
+                    height: camera.height,
+                    fps: camera.fps,
+                    pixel_format: camera.pixel_format,
+                    codec,
+                    artifact_format: self.encoder.resolved_artifact_format_for(codec),
+                }
+            })
+            .collect();
+        let observations = self
+            .resolved_robot_channels()
+            .into_iter()
+            .flat_map(|robot| {
+                let recorded = robot.recorded_states.clone();
+                robot.state_topics
+                    .into_iter()
+                    .filter(move |(state_kind, _)| recorded.contains(state_kind))
+                    .map(move |(state_kind, state_topic)| AssemblerObservationRuntimeConfigV2 {
+                        channel_id: robot.channel_id.clone(),
+                        state_kind,
+                        state_topic,
+                        value_len: state_kind.value_len(robot.dof),
+                    })
+            })
+            .collect();
+        let actions = self
+            .pairings
+            .iter()
+            .filter_map(|pairing| {
+                let follower = self
+                    .device_named(&pairing.follower_device)?
+                    .channel_named(&pairing.follower_channel_type)?;
+                let dof = follower.dof.unwrap_or_default();
+                let bus_root = &self.device_named(&pairing.follower_device)?.bus_root;
+                Some(AssemblerActionRuntimeConfigV2 {
+                    channel_id: device_channel_id(&pairing.follower_device, &pairing.follower_channel_type),
+                    command_kind: pairing.follower_command,
+                    command_topic: robot_command_topic_v2(
+                        bus_root,
+                        &pairing.follower_channel_type,
+                        pairing.follower_command,
+                    ),
+                    value_len: match pairing.follower_command {
+                        RobotCommandKind::JointPosition | RobotCommandKind::JointMit => dof,
+                        RobotCommandKind::ParallelPosition | RobotCommandKind::ParallelMit => {
+                            dof.min(MAX_PARALLEL as u32)
+                        }
+                        RobotCommandKind::EndPose => 7,
+                    },
+                })
+            })
+            .collect();
+        AssemblerRuntimeConfigV2 {
+            process_id: "episode-assembler".into(),
+            format: self.episode.format,
+            fps: self.episode.fps,
+            chunk_size: self.episode.chunk_size,
+            missing_video_timeout_ms: self.assembler.missing_video_timeout_ms,
+            staging_dir: episode_staging_root_v2(&self.assembler.staging_dir),
+            encoded_handoff: self.assembler.encoded_handoff,
+            cameras,
+            observations,
+            actions,
+            embedded_config_toml,
+        }
+    }
+
+    pub fn teleop_runtime_configs_v2(&self) -> Vec<TeleopRuntimeConfigV2> {
+        self.pairings
+            .iter()
+            .filter_map(|pairing| {
+                let leader_device = self.device_named(&pairing.leader_device)?;
+                let follower_device = self.device_named(&pairing.follower_device)?;
+                let follower_channel = follower_device.channel_named(&pairing.follower_channel_type)?;
+                Some(TeleopRuntimeConfigV2 {
+                    process_id: format!(
+                        "teleop.{}.{}.to.{}.{}",
+                        pairing.leader_device,
+                        pairing.leader_channel_type,
+                        pairing.follower_device,
+                        pairing.follower_channel_type
+                    ),
+                    leader_channel_id: device_channel_id(
+                        &pairing.leader_device,
+                        &pairing.leader_channel_type,
+                    ),
+                    follower_channel_id: device_channel_id(
+                        &pairing.follower_device,
+                        &pairing.follower_channel_type,
+                    ),
+                    leader_state_kind: pairing.leader_state,
+                    leader_state_topic: robot_state_topic_v2(
+                        &leader_device.bus_root,
+                        &pairing.leader_channel_type,
+                        pairing.leader_state,
+                    ),
+                    follower_command_kind: pairing.follower_command,
+                    follower_command_topic: robot_command_topic_v2(
+                        &follower_device.bus_root,
+                        &pairing.follower_channel_type,
+                        pairing.follower_command,
+                    ),
+                    mapping: pairing.mapping,
+                    joint_index_map: pairing.joint_index_map.clone(),
+                    joint_scales: pairing.joint_scales.clone(),
+                    command_defaults: follower_channel.command_defaults.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn storage_runtime_config(&self) -> StorageRuntimeConfig {
+        StorageRuntimeConfig {
+            process_id: "storage".into(),
+            backend: self.storage.backend,
+            output_path: self.storage.output_path.clone(),
+            endpoint: self.storage.endpoint.clone(),
+            queue_size: self.storage.queue_size,
+        }
+    }
+}
+
+impl FromStr for ProjectConfig {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let config: ProjectConfig = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn device_channel_id(device_name: &str, channel_type: &str) -> String {
+    format!("{device_name}/{channel_type}")
+}
+
+fn channel_prefix_v2(bus_root: &str, channel_type: &str) -> String {
+    format!("{bus_root}/{channel_type}")
+}
+
+fn camera_frames_topic_v2(bus_root: &str, channel_type: &str) -> String {
+    format!("{}/frames", channel_prefix_v2(bus_root, channel_type))
+}
+
+fn robot_state_topic_v2(bus_root: &str, channel_type: &str, state: RobotStateKind) -> String {
+    format!(
+        "{}/states/{}",
+        channel_prefix_v2(bus_root, channel_type),
+        state.topic_suffix()
+    )
+}
+
+fn robot_command_topic_v2(
+    bus_root: &str,
+    channel_type: &str,
+    command: RobotCommandKind,
+) -> String {
+    format!(
+        "{}/commands/{}",
+        channel_prefix_v2(bus_root, channel_type),
+        command.topic_suffix()
+    )
+}
+
+fn encoder_process_id_v2(channel_id: &str) -> String {
+    format!("encoder.{}", channel_id.replace('/', "."))
+}
+
+fn encoder_output_dir_v2(staging_root: &str, channel_id: &str) -> String {
+    Path::new(staging_root)
+        .join("encoders")
+        .join(channel_id.replace('/', "__"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn episode_staging_root_v2(staging_root: &str) -> String {
+    Path::new(staging_root)
+        .join("episodes")
+        .to_string_lossy()
+        .into_owned()
 }

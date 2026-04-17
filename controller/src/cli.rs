@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use rollio_types::config::Config;
+use rollio_types::config::{Config, ProjectConfig};
 use std::error::Error;
 use std::path::PathBuf;
 
@@ -41,6 +41,17 @@ impl CollectArgs {
 
         Err("collect requires either --config or --config-inline".into())
     }
+
+    pub fn load_project_config(&self) -> Result<ProjectConfig, Box<dyn Error>> {
+        if let Some(config_path) = &self.config {
+            return Ok(ProjectConfig::from_file(config_path)?);
+        }
+        if let Some(config_inline) = &self.config_inline {
+            return Ok(config_inline.parse::<ProjectConfig>()?);
+        }
+
+        Err("collect requires either --config or --config-inline".into())
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -71,6 +82,16 @@ impl SetupArgs {
         }
         if let Some(config_inline) = &self.config_inline {
             return Ok(Some(config_inline.parse::<Config>()?));
+        }
+        Ok(None)
+    }
+
+    pub fn load_project_config(&self) -> Result<Option<ProjectConfig>, Box<dyn Error>> {
+        if let Some(config_path) = &self.config {
+            return Ok(Some(ProjectConfig::from_file(config_path)?));
+        }
+        if let Some(config_inline) = &self.config_inline {
+            return Ok(Some(config_inline.parse::<ProjectConfig>()?));
         }
         Ok(None)
     }

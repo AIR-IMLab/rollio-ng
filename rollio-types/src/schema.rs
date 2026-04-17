@@ -106,7 +106,7 @@ pub fn config_schema() -> ConfigSchema {
                         "shutdown_timeout_ms",
                         "How long the controller waits for children to exit cleanly.",
                         false,
-                        3000,
+                        30000,
                     ),
                     int_field(
                         "child_poll_interval_ms",
@@ -198,7 +198,12 @@ pub fn config_schema() -> ConfigSchema {
                         "Robot control mode at startup.",
                         false,
                         None,
-                        &["free-drive", "command-following"],
+                        &[
+                            "free-drive",
+                            "command-following",
+                            "identifying",
+                            "disabled",
+                        ],
                         &["robot"],
                     ),
                     scoped_float_field(
@@ -555,6 +560,23 @@ fn scoped_string_field(
     }
 }
 
+fn scoped_string_array_field(
+    name: &'static str,
+    description: &'static str,
+    required: bool,
+    applies_to: &'static [&'static str],
+) -> SchemaField {
+    SchemaField {
+        name,
+        type_name: "string[]",
+        description,
+        required,
+        default: None,
+        enum_values: None,
+        applies_to: Some(applies_to.to_vec()),
+    }
+}
+
 fn int_field(
     name: &'static str,
     description: &'static str,
@@ -679,6 +701,310 @@ fn scoped_enum_field(
     }
 }
 
+fn sprint_extra_a_schema() -> ConfigSchema {
+    ConfigSchema {
+        format: "rollio-config-schema",
+        version: 2,
+        sections: vec![
+            SchemaSection {
+                name: "root",
+                kind: SchemaSectionKind::Table,
+                description: "Top-level project metadata and collection mode.",
+                fields: vec![
+                    string_field_with_default(
+                        "project_name",
+                        "Logical project name embedded in saved configs and episode metadata.",
+                        false,
+                        "default",
+                    ),
+                    enum_field(
+                        "mode",
+                        "Collection semantics controlling whether teleoperation pairings are active.",
+                        false,
+                        "intervention",
+                        &["teleop", "intervention"],
+                    ),
+                ],
+                notes: vec![
+                    "The new device-binary migration stores physical devices under [[devices]] with nested [[devices.channels]].",
+                ],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "episode",
+                kind: SchemaSectionKind::Table,
+                description: "Episode-level recording and file-layout settings.",
+                fields: vec![
+                    enum_field(
+                        "format",
+                        "Episode container and directory layout.",
+                        true,
+                        "lerobot-v2.1",
+                        &["lerobot-v2.1", "lerobot-v3.0", "mcap"],
+                    ),
+                    int_field("fps", "Target recording frame rate.", true, 30),
+                    int_field(
+                        "chunk_size",
+                        "Number of frames per output chunk for chunked formats.",
+                        false,
+                        1000,
+                    ),
+                ],
+                notes: vec![],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "controller",
+                kind: SchemaSectionKind::Table,
+                description: "Controller orchestration settings.",
+                fields: vec![
+                    int_field(
+                        "shutdown_timeout_ms",
+                        "How long the controller waits for children to exit cleanly.",
+                        false,
+                        30000,
+                    ),
+                    int_field(
+                        "child_poll_interval_ms",
+                        "Polling cadence while watching child processes.",
+                        false,
+                        100,
+                    ),
+                ],
+                notes: vec![],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "devices",
+                kind: SchemaSectionKind::ArrayOfTables,
+                description: "Physical device processes launched by the controller.",
+                fields: vec![
+                    string_field("name", "Logical physical-device name.", true),
+                    string_field("driver", "Executable driver family name.", true),
+                    string_field("id", "Vendor-defined device identifier.", true),
+                    string_field("bus_root", "Topic namespace root used by this device process.", true),
+                ],
+                notes: vec![
+                    "Additional driver-specific fields may be stored on the device table via extra TOML keys.",
+                ],
+                allows_extra_fields: true,
+            },
+            SchemaSection {
+                name: "devices.channels",
+                kind: SchemaSectionKind::ArrayOfTables,
+                description: "Enabled or disabled channels for a physical device.",
+                fields: vec![
+                    string_field("channel_type", "Fixed channel vocabulary item such as arm, e2, color, or depth.", true),
+                    enum_field(
+                        "kind",
+                        "Channel kind.",
+                        true,
+                        "camera",
+                        &["camera", "robot"],
+                    ),
+                    SchemaField {
+                        name: "enabled",
+                        type_name: "boolean",
+                        description: "Whether the channel is active in this project config.",
+                        required: false,
+                        default: Some(Value::Boolean(true)),
+                        enum_values: None,
+                        applies_to: None,
+                    },
+                    scoped_enum_field(
+                        "mode",
+                        "Robot startup mode.",
+                        false,
+                        None,
+                        &[
+                            "free-drive",
+                            "command-following",
+                            "identifying",
+                            "disabled",
+                        ],
+                        &["robot"],
+                    ),
+                    scoped_int_field("dof", "Robot degrees of freedom.", false, None, &["robot"]),
+                    scoped_string_array_field(
+                        "publish_states",
+                        "Robot state topics published by the device process.",
+                        false,
+                        &["robot"],
+                    ),
+                    scoped_string_array_field(
+                        "recorded_states",
+                        "Subset of publish_states recorded by the assembler. Defaults to all publish_states.",
+                        false,
+                        &["robot"],
+                    ),
+                    scoped_float_field(
+                        "control_frequency_hz",
+                        "Robot publish/control rate in Hz.",
+                        false,
+                        None,
+                        &["robot"],
+                    ),
+                    SchemaField {
+                        name: "profile",
+                        type_name: "inline-table",
+                        description: "Camera profile inline table with width, height, fps, and pixel_format.",
+                        required: false,
+                        default: None,
+                        enum_values: None,
+                        applies_to: Some(vec!["camera"]),
+                    },
+                    SchemaField {
+                        name: "command_defaults",
+                        type_name: "inline-table",
+                        description: "Optional command-default arrays such as joint_mit_kp, joint_mit_kd, parallel_mit_kp, and parallel_mit_kd.",
+                        required: false,
+                        default: None,
+                        enum_values: None,
+                        applies_to: None,
+                    },
+                ],
+                notes: vec![
+                    "Camera channels require profile when enabled.",
+                    "Robot channels require dof, mode, and publish_states when enabled.",
+                ],
+                allows_extra_fields: true,
+            },
+            SchemaSection {
+                name: "pairings",
+                kind: SchemaSectionKind::ArrayOfTables,
+                description: "Framework-owned teleoperation pairings between robot channels.",
+                fields: vec![
+                    string_field("leader_device", "Leader physical-device name.", true),
+                    string_field("leader_channel_type", "Leader robot channel_type.", true),
+                    string_field("follower_device", "Follower physical-device name.", true),
+                    string_field("follower_channel_type", "Follower robot channel_type.", true),
+                    enum_field(
+                        "mapping",
+                        "Teleoperation mapping strategy.",
+                        false,
+                        "direct-joint",
+                        &["direct-joint", "cartesian"],
+                    ),
+                    string_field("leader_state", "Leader state topic kind, such as joint_position or end_effector_pose.", true),
+                    string_field("follower_command", "Follower command topic kind, such as joint_mit or end_pose.", true),
+                    SchemaField {
+                        name: "joint_index_map",
+                        type_name: "integer[]",
+                        description: "Optional leader-to-follower joint remapping for direct-joint mode.",
+                        required: false,
+                        default: Some(Value::Array(Vec::new())),
+                        enum_values: None,
+                        applies_to: None,
+                    },
+                    SchemaField {
+                        name: "joint_scales",
+                        type_name: "float[]",
+                        description: "Optional per-joint scaling for direct-joint mode.",
+                        required: false,
+                        default: Some(Value::Array(Vec::new())),
+                        enum_values: None,
+                        applies_to: None,
+                    },
+                ],
+                notes: vec![
+                    "Setup should derive legal pairings from query.direct_joint_compatibility plus channel capabilities.",
+                ],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "visualizer",
+                kind: SchemaSectionKind::Table,
+                description: "Visualizer preview settings. Runtime sources are derived from enabled channels.",
+                fields: vec![
+                    int_field("port", "WebSocket port served by the visualizer.", false, 9090),
+                    int_field(
+                        "max_preview_width",
+                        "Maximum preview frame width exposed to UIs.",
+                        false,
+                        320,
+                    ),
+                    int_field(
+                        "max_preview_height",
+                        "Maximum preview frame height exposed to UIs.",
+                        false,
+                        240,
+                    ),
+                    int_field("jpeg_quality", "Preview JPEG quality from 1 to 100.", false, 30),
+                    int_field("preview_fps", "Maximum preview frame rate.", false, 60),
+                    SchemaField {
+                        name: "preview_workers",
+                        type_name: "integer",
+                        description: "Optional worker-thread override for preview encoding.",
+                        required: false,
+                        default: None,
+                        enum_values: None,
+                        applies_to: None,
+                    },
+                ],
+                notes: vec![],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "encoder",
+                kind: SchemaSectionKind::Table,
+                description: "Encoder defaults applied to every enabled camera channel.",
+                fields: vec![
+                    enum_field(
+                        "video_codec",
+                        "Codec used for color-like camera channels.",
+                        false,
+                        "h264",
+                        &["h264", "h265", "av1", "rvl"],
+                    ),
+                    enum_field(
+                        "depth_codec",
+                        "Codec used for depth-like camera channels.",
+                        false,
+                        "rvl",
+                        &["h264", "h265", "av1", "rvl"],
+                    ),
+                ],
+                notes: vec![
+                    "This section keeps the existing encoder fields such as video_codec, depth_codec, backend, artifact_format, and queue_size.",
+                ],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "assembler",
+                kind: SchemaSectionKind::Table,
+                description: "Assembler settings for staged episodes and video handoff.",
+                fields: vec![],
+                notes: vec![],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "storage",
+                kind: SchemaSectionKind::Table,
+                description: "Storage backend settings. This control-plane surface remains unchanged in the first migration phase.",
+                fields: vec![],
+                notes: vec![],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "monitor",
+                kind: SchemaSectionKind::Table,
+                description: "Metric publication and threshold settings.",
+                fields: vec![],
+                notes: vec![],
+                allows_extra_fields: false,
+            },
+            SchemaSection {
+                name: "ui",
+                kind: SchemaSectionKind::Table,
+                description: "Terminal and browser UI runtime settings.",
+                fields: vec![],
+                notes: vec![],
+                allows_extra_fields: false,
+            },
+        ],
+    }
+}
+
 pub fn build_config_schema() -> ConfigSchema {
-    config_schema()
+    sprint_extra_a_schema()
 }

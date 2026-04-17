@@ -1,27 +1,23 @@
 use crate::cli::CollectArgs;
 use crate::episode::EpisodeLifecycle;
 use crate::process::{
-    poll_children_once, spawn_child, terminate_children, ChildSpec, ManagedChild, ResolvedCommand,
-    ShutdownTrigger,
+    poll_children_once, spawn_child, terminate_children, ChildSpec, ManagedChild, ShutdownTrigger,
 };
-use crate::runtime_paths::{
-    current_executable_dir, resolve_device_program, resolve_program, workspace_root,
-};
+#[cfg(test)]
+pub(crate) use crate::runtime_plan::{build_collect_specs, build_preview_specs, build_teleop_spec};
+use crate::runtime_paths::{current_executable_dir, workspace_root};
 use iceoryx2::prelude::*;
 use rollio_bus::{
-    robot_command_service_name, robot_state_service_name, BACKPRESSURE_SERVICE,
-    CONTROL_EVENTS_SERVICE, EPISODE_COMMAND_SERVICE, EPISODE_STATUS_SERVICE,
-    EPISODE_STORED_SERVICE,
+    BACKPRESSURE_SERVICE, CONTROL_EVENTS_SERVICE, EPISODE_COMMAND_SERVICE,
+    EPISODE_STATUS_SERVICE, EPISODE_STORED_SERVICE,
 };
-use rollio_types::config::{
-    AssemblerRuntimeConfig, CollectionMode, Config, DeviceConfig, EncoderRuntimeConfig,
-    MappingStrategy, StorageRuntimeConfig, TeleopRuntimeConfig,
-};
+use rollio_types::config::ProjectConfig;
 use rollio_types::messages::{
     BackpressureEvent, ControlEvent, EpisodeCommand, EpisodeState, EpisodeStatus, EpisodeStored,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::error::Error;
+#[cfg(test)]
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -30,15 +26,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub fn run(args: CollectArgs) -> Result<(), Box<dyn Error>> {
-    let config = args.load_config()?;
+    let config = args.load_project_config()?;
     run_with_config(config)
 }
 
-fn run_with_config(config: Config) -> Result<(), Box<dyn Error>> {
+fn run_with_config(config: ProjectConfig) -> Result<(), Box<dyn Error>> {
     let workspace_root = workspace_root()?;
     let current_exe_dir = current_executable_dir()?;
     let poll_interval = Duration::from_millis(config.controller.child_poll_interval_ms);
-    let shutdown_timeout = Duration::from_millis(config.controller.shutdown_timeout_ms);
+    let shutdown_timeout =
+        Duration::from_millis(config.controller.shutdown_timeout_ms).max(Duration::from_secs(30));
     let log_dir = workspace_root.join("target/rollio-logs");
     std::fs::create_dir_all(&log_dir)?;
 
@@ -47,7 +44,7 @@ fn run_with_config(config: Config) -> Result<(), Box<dyn Error>> {
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
 
     let controller_ipc = ControllerIpc::new()?;
-    let specs = build_collect_specs(&config, &workspace_root, &current_exe_dir)?;
+    let specs = crate::runtime_plan::build_collect_specs(&config, &workspace_root, &current_exe_dir)?;
 
     let mut children = spawn_collect_children(
         &specs,
@@ -164,279 +161,6 @@ fn result_for_shutdown_trigger(trigger: &ShutdownTrigger) -> Result<(), Box<dyn 
     }
 }
 
-fn build_collect_specs(
-    config: &Config,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<Vec<ChildSpec>, Box<dyn Error>> {
-    let mut specs = build_preview_specs(config, workspace_root, current_exe_dir)?;
-
-    for encoder_config in config.encoder_runtime_configs() {
-        specs.push(build_encoder_spec(
-            &encoder_config,
-            workspace_root,
-            current_exe_dir,
-        )?);
-    }
-
-    let embedded_config_toml = toml::to_string(config)?;
-    let assembler_config = config.assembler_runtime_config(embedded_config_toml);
-    specs.push(build_assembler_spec(
-        &assembler_config,
-        workspace_root,
-        current_exe_dir,
-    )?);
-
-    let storage_config = config.storage_runtime_config();
-    specs.push(build_storage_spec(
-        &storage_config,
-        workspace_root,
-        current_exe_dir,
-    )?);
-
-    let ui_runtime_config = config.ui_runtime_config();
-    let web_bundle_dir = workspace_root.join("ui/web/dist");
-    let web_index = web_bundle_dir.join("index.html");
-    if !web_index.exists() {
-        return Err(format!(
-            "Web UI bundle not found at {}. Run `cd ui/web && npm run build` first.",
-            web_index.display()
-        )
-        .into());
-    }
-
-    ui_runtime_config
-        .websocket_url
-        .as_ref()
-        .ok_or("ui runtime config did not produce an upstream websocket url")?;
-    eprintln!(
-        "rollio: web ui available at {}",
-        ui_browser_url(&ui_runtime_config.http_host, ui_runtime_config.http_port)
-    );
-    specs.push(ChildSpec {
-        id: "ui".into(),
-        command: ResolvedCommand {
-            program: resolve_program(current_exe_dir.join("rollio-ui-server"), "rollio-ui-server"),
-            args: vec![
-                OsString::from("--config-inline"),
-                OsString::from(toml::to_string(&ui_runtime_config)?),
-                OsString::from("--asset-dir"),
-                web_bundle_dir.into_os_string(),
-            ],
-        },
-        working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: false,
-    });
-
-    Ok(specs)
-}
-
-pub(crate) fn build_preview_specs(
-    config: &Config,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<Vec<ChildSpec>, Box<dyn Error>> {
-    let mut specs = Vec::new();
-
-    specs.push(build_visualizer_spec(
-        config,
-        workspace_root,
-        current_exe_dir,
-    )?);
-
-    for device in &config.devices {
-        specs.push(build_device_spec(device, workspace_root, current_exe_dir)?);
-    }
-
-    if config.mode == CollectionMode::Teleop {
-        for pair in &config.pairing {
-            let leader = config
-                .device_named(&pair.leader)
-                .ok_or_else(|| format!("missing pairing leader {}", pair.leader))?;
-            let follower = config
-                .device_named(&pair.follower)
-                .ok_or_else(|| format!("missing pairing follower {}", pair.follower))?;
-            specs.push(build_teleop_spec(
-                pair,
-                leader,
-                follower,
-                workspace_root,
-                current_exe_dir,
-            )?);
-        }
-    }
-
-    Ok(specs)
-}
-
-pub(crate) fn build_visualizer_spec(
-    config: &Config,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<ChildSpec, Box<dyn Error>> {
-    let visualizer_config = toml::to_string(&config.visualizer_runtime_config())?;
-    Ok(ChildSpec {
-        id: "visualizer".into(),
-        command: ResolvedCommand {
-            program: resolve_program(
-                current_exe_dir.join("rollio-visualizer"),
-                "rollio-visualizer",
-            ),
-            args: vec![
-                OsString::from("--config-inline"),
-                OsString::from(visualizer_config),
-            ],
-        },
-        working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: false,
-    })
-}
-
-pub(crate) fn build_device_spec(
-    device: &DeviceConfig,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<ChildSpec, Box<dyn Error>> {
-    let inline_config = toml::to_string(device)?;
-    let program = resolve_device_program(
-        device.device_type,
-        &device.driver,
-        workspace_root,
-        current_exe_dir,
-    );
-    let common_args = vec![
-        OsString::from("run"),
-        OsString::from("--config-inline"),
-        OsString::from(inline_config),
-    ];
-
-    Ok(ChildSpec {
-        id: format!("device-{}", device.name),
-        command: ResolvedCommand {
-            program,
-            args: common_args,
-        },
-        working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: false,
-    })
-}
-
-pub(crate) fn build_teleop_spec(
-    pair: &rollio_types::config::PairConfig,
-    leader: &DeviceConfig,
-    follower: &DeviceConfig,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<ChildSpec, Box<dyn Error>> {
-    let follower_dof = follower.dof.unwrap_or(0);
-    let joint_index_map = match pair.mapping {
-        MappingStrategy::DirectJoint if !pair.joint_index_map.is_empty() => {
-            pair.joint_index_map.clone()
-        }
-        MappingStrategy::DirectJoint => (0..follower_dof).collect(),
-        MappingStrategy::Cartesian => Vec::new(),
-    };
-    let runtime_config = TeleopRuntimeConfig {
-        process_id: format!("teleop.{}.to.{}", leader.name, follower.name),
-        leader_name: leader.name.clone(),
-        follower_name: follower.name.clone(),
-        leader_state_topic: robot_state_service_name(&leader.name),
-        follower_state_topic: robot_state_service_name(&follower.name),
-        follower_command_topic: robot_command_service_name(&follower.name),
-        mapping: pair.mapping,
-        joint_index_map,
-        joint_scales: pair.joint_scales.clone(),
-    };
-    let inline_config = toml::to_string(&runtime_config)?;
-
-    Ok(ChildSpec {
-        id: format!("teleop-{}-to-{}", leader.name, follower.name),
-        command: ResolvedCommand {
-            program: resolve_program(
-                current_exe_dir.join("rollio-teleop-router"),
-                "rollio-teleop-router",
-            ),
-            args: vec![
-                OsString::from("run"),
-                OsString::from("--config-inline"),
-                OsString::from(inline_config),
-            ],
-        },
-        working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: false,
-    })
-}
-
-fn build_encoder_spec(
-    config: &EncoderRuntimeConfig,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<ChildSpec, Box<dyn Error>> {
-    let inline_config = toml::to_string(config)?;
-    let camera_name = config
-        .camera_name
-        .as_deref()
-        .unwrap_or(config.process_id.as_str());
-    Ok(ChildSpec {
-        id: format!("encoder-{camera_name}"),
-        command: ResolvedCommand {
-            program: resolve_program(current_exe_dir.join("rollio-encoder"), "rollio-encoder"),
-            args: vec![
-                OsString::from("run"),
-                OsString::from("--config-inline"),
-                OsString::from(inline_config),
-            ],
-        },
-        working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: false,
-    })
-}
-
-fn build_assembler_spec(
-    config: &AssemblerRuntimeConfig,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<ChildSpec, Box<dyn Error>> {
-    let inline_config = toml::to_string(config)?;
-    Ok(ChildSpec {
-        id: "assembler".into(),
-        command: ResolvedCommand {
-            program: resolve_program(
-                current_exe_dir.join("rollio-episode-assembler"),
-                "rollio-episode-assembler",
-            ),
-            args: vec![
-                OsString::from("run"),
-                OsString::from("--config-inline"),
-                OsString::from(inline_config),
-            ],
-        },
-        working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: false,
-    })
-}
-
-fn build_storage_spec(
-    config: &StorageRuntimeConfig,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-) -> Result<ChildSpec, Box<dyn Error>> {
-    let inline_config = toml::to_string(config)?;
-    Ok(ChildSpec {
-        id: "storage".into(),
-        command: ResolvedCommand {
-            program: resolve_program(current_exe_dir.join("rollio-storage"), "rollio-storage"),
-            args: vec![
-                OsString::from("run"),
-                OsString::from("--config-inline"),
-                OsString::from(inline_config),
-            ],
-        },
-        working_directory: workspace_root.to_path_buf(),
-        inherit_stdio: false,
-    })
-}
-
 fn apply_backpressure_events(start_blocked: &mut bool, events: &[BackpressureEvent]) {
     for event in events {
         eprintln!(
@@ -488,14 +212,6 @@ fn collect_control_events(
         }
     }
     (events, status_changed)
-}
-
-fn ui_browser_url(host: &str, port: u16) -> String {
-    let display_host = match host {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        _ => host,
-    };
-    format!("http://{display_host}:{port}")
 }
 
 struct ControllerIpc {
@@ -619,7 +335,10 @@ impl ControllerIpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rollio_types::config::{Config, DeviceType};
+    use rollio_types::config::{
+        ChannelCommandDefaults, MappingStrategy, ProjectConfig, RobotCommandKind, RobotStateKind,
+        TeleopRuntimeConfigV2,
+    };
     use rollio_types::messages::{FixedString256, FixedString64};
     use std::fs;
     use std::path::PathBuf;
@@ -653,67 +372,21 @@ mod tests {
 
     #[test]
     fn build_teleop_spec_expands_identity_mapping_and_names() {
-        let pair = rollio_types::config::PairConfig {
-            leader: "leader_arm".into(),
-            follower: "follower_arm".into(),
+        let teleop = TeleopRuntimeConfigV2 {
+            process_id: "leader_arm-to-follower_arm".into(),
+            leader_channel_id: "robot/leader_arm/arm".into(),
+            follower_channel_id: "robot/follower_arm/arm".into(),
+            leader_state_kind: RobotStateKind::JointPosition,
+            leader_state_topic: "robot/leader_arm/state".into(),
+            follower_command_kind: RobotCommandKind::JointPosition,
+            follower_command_topic: "robot/follower_arm/command".into(),
             mapping: MappingStrategy::DirectJoint,
-            joint_index_map: Vec::new(),
-            joint_scales: Vec::new(),
-        };
-        let leader = DeviceConfig {
-            name: "leader_arm".into(),
-            device_type: DeviceType::Robot,
-            driver: "pseudo".into(),
-            id: "leader".into(),
-            width: None,
-            height: None,
-            fps: None,
-            pixel_format: None,
-            stream: None,
-            channel: None,
-            dof: Some(6),
-            mode: Some(rollio_types::config::RobotMode::FreeDrive),
-            control_frequency_hz: Some(60.0),
-            transport: Some("simulated".into()),
-            interface: None,
-            product_variant: None,
-            end_effector: None,
-            model_path: None,
-            gravity_comp_torque_scales: None,
-            mit_kp: None,
-            mit_kd: None,
-            command_latency_ms: Some(10),
-            state_noise_stddev: Some(0.0),
-            extra: toml::Table::new(),
-        };
-        let follower = DeviceConfig {
-            name: "follower_arm".into(),
-            device_type: DeviceType::Robot,
-            driver: "pseudo".into(),
-            id: "follower".into(),
-            width: None,
-            height: None,
-            fps: None,
-            pixel_format: None,
-            stream: None,
-            channel: None,
-            dof: Some(6),
-            mode: Some(rollio_types::config::RobotMode::CommandFollowing),
-            control_frequency_hz: Some(60.0),
-            transport: Some("simulated".into()),
-            interface: None,
-            product_variant: None,
-            end_effector: None,
-            model_path: None,
-            gravity_comp_torque_scales: None,
-            mit_kp: None,
-            mit_kd: None,
-            command_latency_ms: Some(10),
-            state_noise_stddev: Some(0.0),
-            extra: toml::Table::new(),
+            joint_index_map: (0..6).collect(),
+            joint_scales: vec![1.0; 6],
+            command_defaults: ChannelCommandDefaults::default(),
         };
 
-        let spec = build_teleop_spec(&pair, &leader, &follower, Path::new("."), Path::new("."))
+        let spec = build_teleop_spec(&teleop, Path::new("."), Path::new("."))
             .expect("teleop spec should build");
 
         assert_eq!(spec.id, "teleop-leader_arm-to-follower_arm");
@@ -722,14 +395,13 @@ mod tests {
         let inline = spec.command.args[2].to_string_lossy();
         assert!(inline.contains("joint_index_map = [0, 1, 2, 3, 4, 5]"));
         assert!(inline.contains("leader_state_topic = \"robot/leader_arm/state\""));
-        assert!(inline.contains("follower_state_topic = \"robot/follower_arm/state\""));
         assert!(inline.contains("follower_command_topic = \"robot/follower_arm/command\""));
     }
 
     #[test]
     fn build_collect_specs_adds_encoder_assembler_and_storage_children() {
         let mut config = include_str!("../../config/config.example.toml")
-            .parse::<Config>()
+            .parse::<ProjectConfig>()
             .expect("example config should parse");
         let workspace_root = temp_workspace_root();
         let staging_root = workspace_root.join("staging");
@@ -743,23 +415,23 @@ mod tests {
             .iter()
             .map(|spec| spec.id.as_str())
             .collect::<Vec<_>>();
-        assert!(ids.contains(&"encoder-camera_top"));
-        assert!(ids.contains(&"encoder-camera_side"));
+        assert!(ids.contains(&"encoder-camera_top-color"));
+        assert!(ids.contains(&"encoder-camera_side-color"));
         assert!(ids.contains(&"assembler"));
         assert!(ids.contains(&"storage"));
 
         let encoder_spec = specs
             .iter()
-            .find(|spec| spec.id == "encoder-camera_top")
+            .find(|spec| spec.id == "encoder-camera_top-color")
             .expect("encoder spec should exist");
         let inline = encoder_spec.command.args[2].to_string_lossy();
-        assert!(inline.contains("process_id = \"encoder.camera_top\""));
-        assert!(inline.contains("frame_topic = \"camera/camera_top/frames\""));
+        assert!(inline.contains("process_id = \"encoder.camera_top.color\""));
+        assert!(inline.contains("frame_topic = \"camera_top/color/frames\""));
         assert!(
             inline.contains(&format!(
                 "output_dir = \"{}\"",
                 workspace_root
-                    .join("staging/encoders/camera_top")
+                    .join("staging/encoders/camera_top__color")
                     .to_string_lossy()
             )),
             "unexpected encoder inline config: {inline}"
@@ -798,10 +470,10 @@ mod tests {
     #[test]
     fn build_preview_specs_skips_teleop_router_for_intervention_mode() {
         let mut config = include_str!("../../config/config.example.toml")
-            .parse::<Config>()
+            .parse::<ProjectConfig>()
             .expect("example config should parse");
         config.mode = rollio_types::config::CollectionMode::Intervention;
-        config.pairing.clear();
+        config.pairings.clear();
 
         let specs = build_preview_specs(&config, Path::new("."), Path::new("."))
             .expect("specs should build");

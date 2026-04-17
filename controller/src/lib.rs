@@ -1,7 +1,9 @@
 mod cli;
 mod collect;
+mod discovery;
 mod episode;
 mod process;
+mod runtime_plan;
 mod runtime_paths;
 mod setup;
 

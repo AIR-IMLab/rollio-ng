@@ -1,0 +1,9 @@
+{"sessionId":"a25973","location":"SetupApp.tsx:stdin_raw","message":"supportsInteractiveInput_changed","data":{"supportsInteractiveInput":true,"isRawModeSupported":true},"timestamp":1776407476703,"hypothesisId":"H4"}
+{"sessionId":"a25973","location":"websocket.ts:on_open","message":"ws_open","data":{"url":"ws://127.0.0.1:40973"},"timestamp":1776407476721,"hypothesisId":"H3"}
+{"sessionId":"a25973","location":"SetupApp.tsx:toggle_identify","message":"toggle_identify_send","data":{"deviceName":"camera|v4l2|/dev/video0|color|-","connected":true},"timestamp":1776407480776,"hypothesisId":"H2"}
+{"sessionId":"a25973","location":"SetupApp.tsx:toggle_identify","message":"toggle_identify_send","data":{"deviceName":"camera|v4l2|/dev/video0|color|-","connected":true},"timestamp":1776407540151,"hypothesisId":"H2"}
+{"sessionId":"a25973","location":"websocket.ts:on_close","message":"ws_close","data":{"url":"ws://127.0.0.1:40973","setupStateKept":true},"timestamp":1776407540901,"hypothesisId":"H3"}
+{"sessionId":"a25973","location":"websocket.ts:on_close","message":"ws_close","data":{"url":"ws://127.0.0.1:40973","setupStateKept":true},"timestamp":1776407540904,"hypothesisId":"H3"}
+{"sessionId":"a25973","location":"websocket.ts:on_open","message":"ws_open","data":{"url":"ws://127.0.0.1:40973"},"timestamp":1776407541105,"hypothesisId":"H3"}
+{"sessionId":"a25973","location":"SetupApp.tsx:toggle_identify","message":"toggle_identify_send","data":{"deviceName":"camera|v4l2|/dev/video0|color|-","connected":true},"timestamp":1776407550140,"hypothesisId":"H2"}
+{"sessionId":"a25973","location":"SetupApp.tsx:toggle_identify","message":"toggle_identify_send","data":{"deviceName":"camera|v4l2|/dev/video0|color|-","connected":true},"timestamp":1776407552531,"hypothesisId":"H2"}

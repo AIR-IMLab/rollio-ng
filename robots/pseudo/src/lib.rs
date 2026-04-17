@@ -108,7 +108,7 @@ pub fn run_device(device: DeviceConfig) -> Result<(), Box<dyn Error>> {
                 tuning,
                 period,
             );
-        } else {
+        } else if current_mode != RobotMode::Disabled {
             update_free_drive_state(
                 &mut current_positions,
                 tuning,
@@ -127,7 +127,10 @@ pub fn run_device(device: DeviceConfig) -> Result<(), Box<dyn Error>> {
             velocities[joint_idx] = (positions[joint_idx] - previous_positions[joint_idx])
                 / period.as_secs_f64().max(1e-6);
             efforts[joint_idx] = match current_mode {
-                RobotMode::FreeDrive => 0.1 * (elapsed_secs * 0.5 + joint_idx as f64).sin(),
+                RobotMode::Disabled => 0.0,
+                RobotMode::FreeDrive | RobotMode::Identifying => {
+                    0.1 * (elapsed_secs * 0.5 + joint_idx as f64).sin()
+                }
                 RobotMode::CommandFollowing => {
                     (target_positions[joint_idx] - positions[joint_idx]) * 0.25
                 }

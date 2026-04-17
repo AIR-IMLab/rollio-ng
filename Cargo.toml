@@ -11,7 +11,6 @@ members = [
     "storage",
     "monitor",
     "robots/pseudo",
-    "robots/airbot_eef",
     "robots/airbot_play_rust",
     "test/test-publisher",
     "cameras/v4l2",

@@ -1,26 +1,37 @@
 use crate::cli::SetupArgs;
-use crate::collect::{build_preview_specs, build_visualizer_spec};
+use crate::discovery::{
+    discover_probe_entries, run_driver_json, DiscoveryOptions, KnownDriver,
+};
 use crate::process::{
     poll_children_once, spawn_child, terminate_children, ChildSpec, ManagedChild,
 };
-use crate::runtime_paths::{current_executable_dir, resolve_device_program, workspace_root};
-use airbot_play_rust::can::socketcan_io::SocketCanIo;
-use airbot_play_rust::protocol::board::gpio::PlayLedProtocol;
-use iceoryx2::prelude::*;
-use rollio_bus::{SETUP_COMMAND_SERVICE, SETUP_STATE_SERVICE};
-use rollio_types::config::{
-    CollectionMode, Config, DeviceConfig, DeviceType, EncoderCodec, EpisodeFormat, MappingStrategy,
-    PairConfig, RobotMode, StorageBackend,
+use crate::runtime_plan::{build_preview_specs, build_visualizer_spec};
+use crate::runtime_paths::{
+    current_executable_dir, default_device_executable_name, resolve_registered_program,
+    workspace_root,
 };
-use rollio_types::messages::{PixelFormat, SetupCommandMessage, SetupStateMessage};
+use iceoryx2::prelude::*;
+use rollio_bus::{
+    channel_mode_control_service_name, CONTROL_EVENTS_SERVICE, SETUP_COMMAND_SERVICE,
+    SETUP_STATE_SERVICE,
+};
+use rollio_types::config::{
+    BinaryDeviceConfig, CameraChannelProfile, ChannelCommandDefaults, ChannelPairingConfig,
+    CollectionMode, DeviceChannelConfigV2, DeviceType, EncoderCodec, EpisodeFormat,
+    MappingStrategy, ProjectConfig, RobotCommandKind, RobotMode, RobotStateKind, StorageBackend,
+};
+use rollio_types::messages::{
+    ControlEvent, DeviceChannelMode, PixelFormat, SetupCommandMessage, SetupStateMessage,
+    MAX_PARALLEL,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -31,25 +42,65 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use crate::discovery::known_drivers;
+
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(2_000);
 const VALIDATION_TIMEOUT: Duration = Duration::from_millis(1_000);
 const SETUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const SETUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(2_000);
+const SETUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const SETUP_STATE_MAX_AGE: Duration = Duration::from_millis(500);
 const SETUP_UI_SUCCESS_DELAY: Duration = Duration::from_millis(300);
 const IDENTIFY_ACTIVE_MESSAGE_PREFIX: &str = "Identify active for ";
+const SETUP_DEV_RUNTIME_PACKAGES: &[&str] = &[
+    "rollio-ui-server",
+    "rollio-visualizer",
+    "rollio-camera-v4l2",
+    "rollio-robot-airbot-play",
+    "rollio-robot-pseudo",
+];
 
-#[derive(Debug, Clone, Copy)]
-struct KnownDriver {
-    device_type: DeviceType,
-    driver: &'static str,
-    probe_args: &'static [&'static str],
+fn dev_build_profile(workspace_root: &Path, current_exe_dir: &Path) -> Option<&'static str> {
+    let target_root = workspace_root.join("target");
+    if current_exe_dir == target_root.join("release") {
+        Some("release")
+    } else if current_exe_dir == target_root.join("debug") {
+        Some("debug")
+    } else {
+        None
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct DiscoveryOptions {
-    simulated_cameras: usize,
-    simulated_arms: usize,
+fn ensure_setup_dev_runtime_binaries_built(
+    workspace_root: &Path,
+    current_exe_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let Some(profile) = dev_build_profile(workspace_root, current_exe_dir) else {
+        return Ok(());
+    };
+    eprintln!(
+        "rollio: ensuring setup UI/device binaries are built ({profile} profile; first run may take a while)..."
+    );
+    let mut command = Command::new("cargo");
+    command.arg("build");
+    if profile == "release" {
+        command.arg("--release");
+    }
+    for package in SETUP_DEV_RUNTIME_PACKAGES {
+        command.arg("-p").arg(package);
+    }
+    let status = command
+        .current_dir(workspace_root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        return Err(format!(
+            "failed to build setup runtime binaries for {profile} (cargo build exited with {status})"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +110,7 @@ struct DiscoveredDevice {
     id: String,
     display_name: String,
     camera_profiles: Vec<CameraProfile>,
+    supported_modes_by_channel: BTreeMap<String, Vec<RobotMode>>,
     dof: Option<u32>,
     supported_modes: Vec<RobotMode>,
     default_frequency_hz: Option<f64>,
@@ -74,68 +126,9 @@ struct CameraProfile {
     height: u32,
     fps: u32,
     pixel_format: PixelFormat,
+    native_pixel_format: Option<String>,
     stream: Option<String>,
     channel: Option<u32>,
-}
-
-#[derive(Debug)]
-enum DriverCommandError {
-    NotFound {
-        program: String,
-    },
-    Io {
-        program: String,
-        source: std::io::Error,
-    },
-    Timeout {
-        program: String,
-        args: String,
-    },
-    Failed {
-        program: String,
-        args: String,
-        details: String,
-    },
-    InvalidJson {
-        program: String,
-        source: serde_json::Error,
-        stdout: String,
-    },
-}
-
-impl std::fmt::Display for DriverCommandError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound { program } => write!(f, "driver executable not found: {program}"),
-            Self::Io { program, source } => write!(f, "failed to run {program}: {source}"),
-            Self::Timeout { program, args } => {
-                write!(f, "driver command timed out: {program} {args}")
-            }
-            Self::Failed {
-                program,
-                args,
-                details,
-            } => write!(f, "driver command failed: {program} {args}: {details}"),
-            Self::InvalidJson {
-                program,
-                source,
-                stdout,
-            } => write!(
-                f,
-                "driver command returned invalid JSON: {program}: {source}; stdout={stdout}"
-            ),
-        }
-    }
-}
-
-impl Error for DriverCommandError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::InvalidJson { source, .. } => Some(source),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,7 +140,8 @@ struct AvailableDevice {
     id: String,
     camera_profiles: Vec<CameraProfile>,
     supported_modes: Vec<RobotMode>,
-    current: DeviceConfig,
+    /// Single-binary snapshot for this discovery row (one channel).
+    current: BinaryDeviceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,8 +149,8 @@ struct DeviceIdentity {
     device_type: DeviceType,
     driver: String,
     id: String,
-    stream: Option<String>,
-    channel: Option<u32>,
+    /// Logical camera/robot channel id (`color`, `arm`, `infrared_1`, …).
+    channel_type: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -195,9 +189,9 @@ enum SetupExitKind {
 
 #[derive(Debug)]
 struct SetupSession {
-    config: Config,
+    config: ProjectConfig,
     available_devices: Vec<AvailableDevice>,
-    teleop_pairing_cache: Vec<PairConfig>,
+    teleop_pairing_cache: Vec<ChannelPairingConfig>,
     identify_device_name: Option<String>,
     current_step: SetupStep,
     output_path: PathBuf,
@@ -235,7 +229,7 @@ struct SetupStateEnvelope {
     message: Option<String>,
     identify_device: Option<String>,
     warnings: Vec<String>,
-    config: Config,
+    config: ProjectConfig,
     available_devices: Vec<AvailableDevice>,
 }
 
@@ -281,22 +275,21 @@ impl SessionMutation {
 struct SetupRuntimeState {
     children: Vec<ManagedChild>,
     temp_config_path: Option<PathBuf>,
-    identify_device_name: Option<String>,
-    airbot_identify_interface: Option<String>,
+    preview_target_name: Option<String>,
 }
 
 impl SetupSession {
     fn new(
-        config: Config,
+        config: ProjectConfig,
         available_devices: Vec<AvailableDevice>,
         output_path: PathBuf,
         resume_mode: bool,
         warnings: Vec<String>,
     ) -> Self {
-        let teleop_pairing_cache = if config.pairing.is_empty() {
-            build_default_pairings(&config.devices)
+        let teleop_pairing_cache = if config.pairings.is_empty() {
+            build_default_channel_pairings(&config.devices)
         } else {
-            config.pairing.clone()
+            config.pairings.clone()
         };
         Self {
             current_step: if resume_mode {
@@ -445,12 +438,12 @@ impl SetupSession {
     }
 
     fn refresh_pairings_for_devices(&mut self) {
-        self.teleop_pairing_cache = build_default_pairings(&self.config.devices);
+        self.teleop_pairing_cache = build_default_channel_pairings(&self.config.devices);
         if self.config.mode == CollectionMode::Teleop && !self.teleop_pairing_cache.is_empty() {
-            self.config.pairing = self.teleop_pairing_cache.clone();
+            self.config.pairings = self.teleop_pairing_cache.clone();
         } else {
             self.config.mode = CollectionMode::Intervention;
-            self.config.pairing.clear();
+            self.config.pairings.clear();
         }
     }
 
@@ -466,14 +459,35 @@ impl SetupSession {
             .find(|device| device.name == name)
     }
 
-    fn selected_device_index(&self, name: &str) -> Option<usize> {
+    fn configured_device_channel_index(&self, name: &str) -> Option<(usize, usize)> {
         let identity = self
             .available_device(name)
-            .map(device_identity_from_available)?;
+            .map(|device| device_identity_from_binary(&device.current))?;
         self.config
             .devices
             .iter()
-            .position(|device| device_identity_from_config(device) == identity)
+            .enumerate()
+            .find_map(|(device_index, device)| {
+                if device.driver != identity.driver || device.id != identity.id {
+                    return None;
+                }
+                device
+                    .channels
+                    .iter()
+                    .enumerate()
+                    .find(|(_, channel)| {
+                        channel.kind == identity.device_type
+                            && channel.channel_type == identity.channel_type
+                    })
+                    .map(|(channel_index, _)| (device_index, channel_index))
+            })
+    }
+
+    fn selected_device_index(&self, name: &str) -> Option<(usize, usize)> {
+        self.configured_device_channel_index(name)
+            .filter(|(device_index, channel_index)| {
+                self.config.devices[*device_index].channels[*channel_index].enabled
+            })
     }
 
     fn is_device_selected(&self, name: &str) -> bool {
@@ -481,7 +495,7 @@ impl SetupSession {
     }
 
     fn set_device_name(&mut self, name: &str, value: &str) -> Result<bool, Box<dyn Error>> {
-        let Some(selected_index) = self.selected_device_index(name) else {
+        let Some((selected_index, _channel_index)) = self.selected_device_index(name) else {
             return Ok(false);
         };
         let trimmed = value.trim();
@@ -490,42 +504,48 @@ impl SetupSession {
             return Ok(false);
         }
 
-        let Some(current_identity) = self
+        let Some((target_driver, target_id)) = self
             .available_device(name)
-            .map(device_identity_from_available)
+            .map(|device| (device.driver.clone(), device.id.clone()))
         else {
             return Ok(false);
         };
-
         let duplicate_name = self.available_devices.iter().any(|device| {
             device.current.name == trimmed
-                && device_identity_from_available(device) != current_identity
+                && device.name != name
+                && !(device.driver == target_driver && device.id == target_id)
         });
         if duplicate_name {
             self.message = Some(format!("Device name \"{trimmed}\" is already in use."));
             return Ok(false);
         }
 
-        let Some(available) = self.available_device_mut(name) else {
-            return Ok(false);
-        };
-        if available.current.name == trimmed {
+        let current_name = self.config.devices[selected_index].name.clone();
+        if current_name == trimmed {
             return Ok(false);
         }
+        let previous_name = current_name;
 
-        let previous_name = available.current.name.clone();
-        available.current.name = trimmed.to_owned();
+        for available in self
+            .available_devices
+            .iter_mut()
+            .filter(|device| device.driver == target_driver && device.id == target_id)
+        {
+            available.current.name = trimmed.to_owned();
+            available.current.bus_root = trimmed.to_owned();
+        }
 
         self.config.devices[selected_index].name = trimmed.to_owned();
-        for pair in &mut self.config.pairing {
-            if pair.leader == previous_name {
-                pair.leader = trimmed.to_owned();
+        self.config.devices[selected_index].bus_root = trimmed.to_owned();
+        for pair in &mut self.config.pairings {
+            if pair.leader_device == previous_name {
+                pair.leader_device = trimmed.to_owned();
             }
-            if pair.follower == previous_name {
-                pair.follower = trimmed.to_owned();
+            if pair.follower_device == previous_name {
+                pair.follower_device = trimmed.to_owned();
             }
         }
-        self.teleop_pairing_cache = self.config.pairing.clone();
+        self.teleop_pairing_cache = self.config.pairings.clone();
         self.config.validate()?;
 
         Ok(true)
@@ -539,11 +559,19 @@ impl SetupSession {
             return false;
         }
         self.identify_device_name = name.map(ToOwned::to_owned);
+        if let Some(name) = name {
+            if let Some(device) = self.available_device(name) {
+                self.message = Some(format!(
+                    "Identify active for {} ({})",
+                    device.display_name, device.id
+                ));
+            }
+        }
         true
     }
 
     fn cycle_device_profile(&mut self, name: &str, delta: i32) -> Result<bool, Box<dyn Error>> {
-        let Some(device_index) = self.selected_device_index(name) else {
+        let Some((device_index, channel_index)) = self.selected_device_index(name) else {
             return Ok(false);
         };
         let updated_current = {
@@ -553,34 +581,46 @@ impl SetupSession {
             if available.camera_profiles.is_empty() {
                 return Ok(false);
             }
+            let Some(ch) = available.current.channels.first_mut() else {
+                return Ok(false);
+            };
+            if ch.kind != DeviceType::Camera {
+                return Ok(false);
+            }
+            let prof = ch.profile.as_ref();
             let current_profile = available
                 .camera_profiles
                 .iter()
                 .position(|profile| {
-                    available.current.width == Some(profile.width)
-                        && available.current.height == Some(profile.height)
-                        && available.current.fps == Some(profile.fps)
-                        && available.current.pixel_format == Some(profile.pixel_format)
-                        && available.current.stream == profile.stream
-                        && available.current.channel == profile.channel
+                    prof.is_some_and(|p| {
+                        p.width == profile.width
+                            && p.height == profile.height
+                            && p.fps == profile.fps
+                            && p.pixel_format == profile.pixel_format
+                            && p.native_pixel_format == profile.native_pixel_format
+                    }) && camera_channel_type_for_profile(profile)
+                        == ch.channel_type
                 })
                 .unwrap_or(0);
             let next_index = rotate_index(current_profile, available.camera_profiles.len(), delta);
             let profile = available.camera_profiles[next_index].clone();
-            available.current.width = Some(profile.width);
-            available.current.height = Some(profile.height);
-            available.current.fps = Some(profile.fps);
-            available.current.pixel_format = Some(profile.pixel_format);
-            available.current.stream = profile.stream;
-            available.current.channel = profile.channel;
+            ch.channel_type = camera_channel_type_for_profile(&profile);
+            ch.profile = Some(CameraChannelProfile {
+                width: profile.width,
+                height: profile.height,
+                fps: profile.fps,
+                pixel_format: profile.pixel_format,
+                native_pixel_format: profile.native_pixel_format.clone(),
+            });
             available.current.clone()
         };
-        self.config.devices[device_index] = updated_current;
+        self.config.devices[device_index].channels[channel_index] =
+            updated_current.channels[0].clone();
         Ok(true)
     }
 
     fn cycle_robot_mode(&mut self, name: &str, delta: i32) -> Result<bool, Box<dyn Error>> {
-        let Some(device_index) = self.selected_device_index(name) else {
+        let Some((device_index, channel_index)) = self.selected_device_index(name) else {
             return Ok(false);
         };
         let updated_current = {
@@ -590,26 +630,39 @@ impl SetupSession {
             if available.supported_modes.is_empty() {
                 return Ok(false);
             }
-            let current_mode = available
-                .current
-                .mode
-                .unwrap_or(available.supported_modes[0]);
+            let Some(ch) = available.current.channels.first_mut() else {
+                return Ok(false);
+            };
+            if ch.kind != DeviceType::Robot {
+                return Ok(false);
+            }
+            let current_mode = ch.mode.unwrap_or(available.supported_modes[0]);
             let current_index = available
                 .supported_modes
                 .iter()
                 .position(|mode| *mode == current_mode)
                 .unwrap_or(0);
             let next_index = rotate_index(current_index, available.supported_modes.len(), delta);
-            available.current.mode = Some(available.supported_modes[next_index]);
+            ch.mode = Some(available.supported_modes[next_index]);
             available.current.clone()
         };
-        self.config.devices[device_index] = updated_current;
+        self.config.devices[device_index].channels[channel_index] =
+            updated_current.channels[0].clone();
         Ok(true)
     }
 
     fn toggle_device_selection(&mut self, name: &str) -> Result<bool, Box<dyn Error>> {
-        if let Some(index) = self.selected_device_index(name) {
-            self.config.devices.remove(index);
+        if let Some((device_index, channel_index)) = self.selected_device_index(name) {
+            let enabled_channels = self.config.devices[device_index]
+                .channels
+                .iter()
+                .filter(|channel| channel.enabled)
+                .count();
+            if enabled_channels <= 1 {
+                self.config.devices.remove(device_index);
+            } else {
+                self.config.devices[device_index].channels[channel_index].enabled = false;
+            }
             if self.identify_device_name.as_deref() == Some(name) {
                 self.clear_identify_state();
             }
@@ -626,24 +679,108 @@ impl SetupSession {
         else {
             return Ok(false);
         };
-        self.config.devices.push(available.current);
+        if let Some((device_index, channel_index)) = self.configured_device_channel_index(name) {
+            self.config.devices[device_index].channels[channel_index] =
+                available.current.channels[0].clone();
+            self.config.devices[device_index].channels[channel_index].enabled = true;
+        } else if let Some(device) = self.build_selected_device_from_available(name) {
+            self.config.devices.push(device);
+        } else {
+            return Ok(false);
+        }
         self.refresh_pairings_for_devices();
         self.config.validate()?;
         Ok(true)
     }
 
+    fn build_selected_device_from_available(&self, name: &str) -> Option<BinaryDeviceConfig> {
+        let target = self.available_device(name)?;
+        let mut device = target.current.clone();
+        let enabled_channel = device.channels.first()?.channel_type.clone();
+        let mut channels = self
+            .available_devices
+            .iter()
+            .filter(|available| available.driver == target.driver && available.id == target.id)
+            .filter_map(|available| available.current.channels.first().cloned())
+            .collect::<Vec<_>>();
+        channels.sort_by(|left, right| left.channel_type.cmp(&right.channel_type));
+        for channel in &mut channels {
+            channel.enabled = channel.channel_type == enabled_channel;
+        }
+        device.channels = channels;
+        Some(device)
+    }
+
     fn cycle_pair_mapping(&mut self, index: usize, delta: i32) -> Result<bool, Box<dyn Error>> {
-        let Some(pair) = self.config.pairing.get_mut(index) else {
+        let (
+            leader_device,
+            leader_channel_type,
+            follower_device,
+            follower_channel_type,
+            current_mapping,
+        ) = self
+            .config
+            .pairings
+            .get(index)
+            .map(|pair| {
+                (
+                    pair.leader_device.clone(),
+                    pair.leader_channel_type.clone(),
+                    pair.follower_device.clone(),
+                    pair.follower_channel_type.clone(),
+                    pair.mapping,
+                )
+            })
+            .ok_or_else(|| "missing pairing".to_string())?;
+        let follower_dof_hint = self
+            .config
+            .device_named(&follower_device)
+            .and_then(|device| device.channel_named(&follower_channel_type))
+            .and_then(|channel| channel.dof)
+            .unwrap_or(1);
+        let leader_ch = self
+            .config
+            .device_named(&leader_device)
+            .and_then(|d| d.channel_named(&leader_channel_type));
+        let follower_ch = self
+            .config
+            .device_named(&follower_device)
+            .and_then(|d| d.channel_named(&follower_channel_type));
+        let parallel = leader_ch.is_some_and(channel_uses_parallel_teleop)
+            && follower_ch.is_some_and(channel_uses_parallel_teleop);
+        let Some(pair) = self.config.pairings.get_mut(index) else {
             return Ok(false);
         };
         let options = [MappingStrategy::DirectJoint, MappingStrategy::Cartesian];
         let current_index = options
             .iter()
-            .position(|mapping| *mapping == pair.mapping)
+            .position(|mapping| *mapping == current_mapping)
             .unwrap_or(0);
         let next_index = rotate_index(current_index, options.len(), delta);
         pair.mapping = options[next_index];
-        self.teleop_pairing_cache = self.config.pairing.clone();
+        match pair.mapping {
+            MappingStrategy::DirectJoint => {
+                if parallel {
+                    pair.leader_state = RobotStateKind::ParallelPosition;
+                    pair.follower_command = RobotCommandKind::ParallelMit;
+                    let map_len = follower_dof_hint.min(MAX_PARALLEL as u32);
+                    pair.joint_index_map = (0..map_len).collect();
+                    pair.joint_scales = vec![1.0; map_len as usize];
+                } else {
+                    pair.leader_state = RobotStateKind::JointPosition;
+                    pair.follower_command = RobotCommandKind::JointPosition;
+                    pair.joint_index_map = (0..follower_dof_hint).collect();
+                    pair.joint_scales = vec![1.0; follower_dof_hint as usize];
+                }
+            }
+            MappingStrategy::Cartesian => {
+                pair.leader_state = RobotStateKind::EndEffectorPose;
+                pair.follower_command = RobotCommandKind::EndPose;
+                pair.joint_index_map.clear();
+                pair.joint_scales.clear();
+            }
+        }
+        self.teleop_pairing_cache = self.config.pairings.clone();
         self.config.validate()?;
         Ok(true)
     }
@@ -703,7 +840,7 @@ impl SetupSession {
 
         if next_mode == CollectionMode::Teleop {
             if self.teleop_pairing_cache.is_empty() {
-                self.teleop_pairing_cache = build_default_pairings(&self.config.devices);
+                self.teleop_pairing_cache = build_default_channel_pairings(&self.config.devices);
             }
             if self.teleop_pairing_cache.is_empty() {
                 self.message = Some(
@@ -712,10 +849,10 @@ impl SetupSession {
                 return Ok(false);
             }
             self.config.mode = CollectionMode::Teleop;
-            self.config.pairing = self.teleop_pairing_cache.clone();
+            self.config.pairings = self.teleop_pairing_cache.clone();
         } else {
             self.config.mode = CollectionMode::Intervention;
-            self.config.pairing.clear();
+            self.config.pairings.clear();
         }
         self.ensure_visible_current_step();
         self.config.validate()?;
@@ -911,7 +1048,7 @@ impl SetupSession {
                 ))
             }
             "setup_save" => {
-                save_config(&self.config, &self.output_path)?;
+                save_project_config(&self.config, &self.output_path)?;
                 self.mark_saved();
                 Ok(SessionMutation::state_only(true))
             }
@@ -957,6 +1094,7 @@ fn normalized_delta(delta: Option<i32>) -> i32 {
 pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
     let workspace_root = workspace_root()?;
     let current_exe_dir = current_executable_dir()?;
+    ensure_setup_dev_runtime_binaries_built(&workspace_root, &current_exe_dir)?;
     let output_path = args.output_path();
     let discovery_options = DiscoveryOptions {
         simulated_cameras: args.sim_cameras,
@@ -964,11 +1102,13 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
     };
 
     let (config, available_devices, warnings, resume_mode) =
-        if let Some(existing_config) = args.load_config()? {
-            validate_existing_config(&existing_config, &workspace_root, &current_exe_dir)?;
-            let available_devices = available_devices_from_config(&existing_config);
+        if let Some(existing_config) = args.load_project_config()? {
+            existing_config.validate().map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
+            validate_existing_project(&existing_config, &workspace_root, &current_exe_dir)?;
+            let available_devices = available_devices_from_project(&existing_config);
             (existing_config, available_devices, Vec::new(), true)
         } else {
+            eprintln!("rollio: discovering devices...");
             let (discoveries, warnings) =
                 discover_devices(&workspace_root, &current_exe_dir, discovery_options)?;
             if discoveries.is_empty() {
@@ -981,7 +1121,7 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
 
     if args.accept_defaults {
         eprintln!("rollio: setup accepted defaults without launching the interactive wizard");
-        save_config(&config, &output_path)?;
+        save_project_config(&config, &output_path)?;
         println!("wrote setup config to {}", output_path.display());
         return Ok(());
     }
@@ -998,7 +1138,7 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_interactive_setup(
-    config: Config,
+    config: ProjectConfig,
     available_devices: Vec<AvailableDevice>,
     output_path: PathBuf,
     resume_mode: bool,
@@ -1025,9 +1165,9 @@ fn run_interactive_setup(
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
 
     let mut bridge_runtime: Option<SetupRuntimeState> = None;
-    let mut identify_runtime: Option<SetupRuntimeState> = None;
     let mut ui_children = Vec::new();
     let mut preview_runtime: Option<SetupRuntimeState> = None;
+    let mut active_identify_target: Option<String> = None;
     let run_result = (|| -> Result<(), Box<dyn Error>> {
         bridge_runtime = Some(start_setup_bridge_runtime(
             &session,
@@ -1072,19 +1212,6 @@ fn run_interactive_setup(
                 }
             }
 
-            if let Some(runtime) = identify_runtime.as_mut() {
-                if let Some(trigger) = poll_children_once(&mut runtime.children)? {
-                    if should_treat_trigger_as_shutdown(
-                        &trigger,
-                        shutdown_requested.load(std::sync::atomic::Ordering::Relaxed),
-                        session.exit_kind.is_some(),
-                    ) {
-                        break;
-                    }
-                    return Err(setup_trigger_error(trigger).into());
-                }
-            }
-
             if let Some(runtime) = bridge_runtime.as_mut() {
                 if let Some(trigger) = poll_children_once(&mut runtime.children)? {
                     if should_treat_trigger_as_shutdown(
@@ -1111,32 +1238,26 @@ fn run_interactive_setup(
                 mutations.state_changed |= session.clear_identify_state();
             }
 
-            if mutations.config_changed
-                || (mutations.step_changed && session.current_step != SetupStep::Preview)
+            let should_preview = should_run_preview_runtime(&session);
+            let desired_preview_target = if should_preview && session.current_step == SetupStep::Devices
             {
-                stop_setup_runtime(&mut preview_runtime)?;
+                session.identify_device_name.clone()
+            } else {
+                None
+            };
+            let mut preview_runtime_restarted = false;
+
+            if preview_runtime.as_ref().is_some_and(|runtime| {
+                !should_preview
+                    || mutations.config_changed
+                    || runtime.preview_target_name != desired_preview_target
+            }) {
+                stop_setup_runtime(&mut preview_runtime, &ipc)?;
+                mutations.state_changed = true;
             }
 
-            if mutations.config_changed && session.current_step == SetupStep::Devices {
-                stop_setup_runtime(&mut identify_runtime)?;
-            }
-
-            if session.current_step != SetupStep::Devices
-                || session.identify_device_name.is_none()
-                || session
-                    .identify_device_name
-                    .as_deref()
-                    .is_some_and(|name| !session.is_device_selected(name))
-            {
-                stop_setup_runtime(&mut identify_runtime)?;
-            }
-
-            if session.current_step == SetupStep::Preview
-                && session.exit_kind.is_none()
-                && preview_runtime.is_none()
-            {
-                stop_setup_runtime(&mut identify_runtime)?;
-                stop_setup_runtime(&mut bridge_runtime)?;
+            if should_preview && preview_runtime.is_none() {
+                stop_setup_runtime(&mut bridge_runtime, &ipc)?;
                 preview_runtime = Some(start_preview_runtime(
                     &mut session,
                     websocket_port,
@@ -1145,40 +1266,11 @@ fn run_interactive_setup(
                     current_exe_dir,
                     &log_dir,
                 )?);
+                preview_runtime_restarted = true;
                 mutations.state_changed = true;
             }
 
-            if session.current_step == SetupStep::Devices && session.exit_kind.is_none() {
-                if let Some(target_name) = session.identify_device_name.clone() {
-                    let should_restart_identify = identify_runtime
-                        .as_ref()
-                        .and_then(|runtime| runtime.identify_device_name.as_deref())
-                        != Some(target_name.as_str());
-                    if should_restart_identify {
-                        stop_setup_runtime(&mut identify_runtime)?;
-                    }
-                    if identify_runtime.is_none() {
-                        stop_setup_runtime(&mut bridge_runtime)?;
-                        identify_runtime = Some(start_identify_runtime(
-                            &mut session,
-                            &target_name,
-                            websocket_port,
-                            &websocket_url,
-                            workspace_root,
-                            current_exe_dir,
-                            &log_dir,
-                        )?);
-                        mutations.state_changed = true;
-                    }
-                }
-            }
-
-            if session.current_step != SetupStep::Preview
-                && (session.current_step != SetupStep::Devices
-                    || session.identify_device_name.is_none())
-                && session.exit_kind.is_none()
-                && bridge_runtime.is_none()
-            {
+            if !should_preview && bridge_runtime.is_none() {
                 bridge_runtime = Some(start_setup_bridge_runtime(
                     &session,
                     websocket_port,
@@ -1188,6 +1280,13 @@ fn run_interactive_setup(
                 )?);
                 mutations.state_changed = true;
             }
+
+            sync_identify_mode(
+                &session,
+                &ipc,
+                &mut active_identify_target,
+                preview_runtime_restarted,
+            )?;
 
             state_dirty |= mutations.state_changed;
 
@@ -1212,9 +1311,8 @@ fn run_interactive_setup(
         Ok(())
     })();
 
-    let cleanup_result = stop_setup_runtime(&mut preview_runtime)
-        .and_then(|_| stop_setup_runtime(&mut identify_runtime))
-        .and_then(|_| stop_setup_runtime(&mut bridge_runtime))
+    let cleanup_result = stop_setup_runtime(&mut preview_runtime, &ipc)
+        .and_then(|_| stop_setup_runtime(&mut bridge_runtime, &ipc))
         .and_then(|_| {
             terminate_children(
                 &mut ui_children,
@@ -1303,6 +1401,87 @@ fn spawn_setup_children(
     Ok(children)
 }
 
+fn should_run_preview_runtime(session: &SetupSession) -> bool {
+    session.exit_kind.is_none()
+        && (session.current_step == SetupStep::Preview
+            || (session.current_step == SetupStep::Devices
+                && session.identify_device_name.is_some()))
+}
+
+fn robot_mode_to_channel_mode(mode: RobotMode) -> DeviceChannelMode {
+    match mode {
+        RobotMode::FreeDrive => DeviceChannelMode::FreeDrive,
+        RobotMode::CommandFollowing => DeviceChannelMode::CommandFollowing,
+        RobotMode::Identifying => DeviceChannelMode::Identifying,
+        RobotMode::Disabled => DeviceChannelMode::Disabled,
+    }
+}
+
+fn available_primary_channel(available: &AvailableDevice) -> Option<&DeviceChannelConfigV2> {
+    available.current.channels.first()
+}
+
+fn publish_available_device_mode(
+    ipc: &SetupIpc,
+    available: &AvailableDevice,
+    mode: DeviceChannelMode,
+) -> Result<(), Box<dyn Error>> {
+    let Some(channel) = available_primary_channel(available) else {
+        return Ok(());
+    };
+    ipc.publish_channel_mode(&available.current.bus_root, &channel.channel_type, mode)
+}
+
+fn configured_channel_mode_for_available(available: &AvailableDevice) -> Option<DeviceChannelMode> {
+    let channel = available_primary_channel(available)?;
+    if channel.kind != DeviceType::Robot || !channel.enabled {
+        return None;
+    }
+    channel.mode.map(robot_mode_to_channel_mode)
+}
+
+fn sync_identify_mode(
+    session: &SetupSession,
+    ipc: &SetupIpc,
+    active_identify_target: &mut Option<String>,
+    preview_runtime_restarted: bool,
+) -> Result<(), Box<dyn Error>> {
+    let desired_target = if session.current_step == SetupStep::Devices {
+        session.identify_device_name.clone()
+    } else {
+        None
+    };
+
+    if active_identify_target.as_ref() != desired_target.as_ref() {
+        if let Some(previous_name) = active_identify_target.as_deref() {
+            if let Some(previous_available) = session.available_device(previous_name) {
+                if let Some(mode) = configured_channel_mode_for_available(previous_available) {
+                    publish_available_device_mode(ipc, previous_available, mode)?;
+                }
+            }
+        }
+    }
+
+    if preview_runtime_restarted || active_identify_target.as_ref() != desired_target.as_ref() {
+        if let Some(target_name) = desired_target.as_deref() {
+            if let Some(target_available) = session.available_device(target_name) {
+                if available_primary_channel(target_available)
+                    .is_some_and(|channel| channel.kind == DeviceType::Robot)
+                {
+                    publish_available_device_mode(
+                        ipc,
+                        target_available,
+                        DeviceChannelMode::Identifying,
+                    )?;
+                }
+            }
+        }
+    }
+
+    *active_identify_target = desired_target;
+    Ok(())
+}
+
 fn start_preview_runtime(
     session: &mut SetupSession,
     websocket_port: u16,
@@ -1311,7 +1490,7 @@ fn start_preview_runtime(
     current_exe_dir: &Path,
     log_dir: &Path,
 ) -> Result<SetupRuntimeState, Box<dyn Error>> {
-    let preview_config = build_preview_config(&session.config, websocket_port, websocket_url);
+    let preview_config = build_preview_project_config(session, websocket_port, websocket_url)?;
     let temp_config_path = write_setup_temp_config(
         &preview_config,
         log_dir,
@@ -1319,57 +1498,16 @@ fn start_preview_runtime(
     )?;
     let specs = build_setup_preview_specs(&preview_config, workspace_root, current_exe_dir)?;
     let children = spawn_setup_children(&specs, log_dir)?;
-    session.message = Some(format!(
-        "Preview running from {}",
-        temp_config_path.display()
-    ));
-    Ok(SetupRuntimeState {
-        children,
-        temp_config_path: Some(temp_config_path),
-        identify_device_name: None,
-        airbot_identify_interface: None,
-    })
-}
-
-fn start_identify_runtime(
-    session: &mut SetupSession,
-    target_name: &str,
-    websocket_port: u16,
-    websocket_url: &str,
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-    log_dir: &Path,
-) -> Result<SetupRuntimeState, Box<dyn Error>> {
-    let available = session
-        .available_device(target_name)
-        .cloned()
-        .ok_or_else(|| format!("missing identify target {target_name}"))?;
-    let identify_config =
-        build_identify_config(&available, &session.config, websocket_port, websocket_url)?;
-    let temp_config_path = write_setup_temp_config(
-        &identify_config,
-        log_dir,
-        &format!("setup-identify-{}.toml", sanitize_temp_name(target_name)),
-    )?;
-    let specs = build_setup_preview_specs(&identify_config, workspace_root, current_exe_dir)?;
-    let children = spawn_setup_children(&specs, log_dir)?;
-    let airbot_identify_interface = if is_airbot_identify_driver(&available.driver) {
-        available.current.interface.clone()
-    } else {
-        None
-    };
-    if let Some(interface) = airbot_identify_interface.as_deref() {
-        let _ = set_airbot_identify_led(interface, true);
+    if session.current_step == SetupStep::Preview {
+        session.message = Some(format!(
+            "Preview running from {}",
+            temp_config_path.display()
+        ));
     }
-    session.message = Some(format!(
-        "Identify active for {} ({})",
-        available.display_name, available.id
-    ));
     Ok(SetupRuntimeState {
         children,
         temp_config_path: Some(temp_config_path),
-        identify_device_name: Some(target_name.to_owned()),
-        airbot_identify_interface,
+        preview_target_name: session.identify_device_name.clone(),
     })
 }
 
@@ -1380,29 +1518,47 @@ fn start_setup_bridge_runtime(
     current_exe_dir: &Path,
     log_dir: &Path,
 ) -> Result<SetupRuntimeState, Box<dyn Error>> {
-    let bridge_config = build_setup_bridge_config(&session.config, websocket_port);
-    let spec = build_visualizer_spec(&bridge_config, workspace_root, current_exe_dir)?;
+    let mut bridge_project_config = session.config.clone();
+    bridge_project_config.visualizer.port = websocket_port;
+    let spec = build_visualizer_spec(&bridge_project_config, workspace_root, current_exe_dir)?;
     let children = spawn_setup_children(std::slice::from_ref(&spec), log_dir)?;
     Ok(SetupRuntimeState {
         children,
         temp_config_path: None,
-        identify_device_name: None,
-        airbot_identify_interface: None,
+        preview_target_name: None,
     })
 }
 
-fn stop_setup_runtime(runtime_state: &mut Option<SetupRuntimeState>) -> Result<(), Box<dyn Error>> {
+fn stop_setup_runtime(
+    runtime_state: &mut Option<SetupRuntimeState>,
+    ipc: &SetupIpc,
+) -> Result<(), Box<dyn Error>> {
     let Some(mut runtime) = runtime_state.take() else {
         return Ok(());
     };
 
-    terminate_children(
-        &mut runtime.children,
-        SETUP_SHUTDOWN_TIMEOUT,
-        SETUP_POLL_INTERVAL,
-    )?;
-    if let Some(interface) = runtime.airbot_identify_interface.as_deref() {
-        let _ = set_airbot_identify_led(interface, false);
+    ipc.send_shutdown()?;
+
+    let deadline = Instant::now() + SETUP_SHUTDOWN_TIMEOUT;
+    loop {
+        let mut remaining_children = 0usize;
+        for child in runtime.children.iter_mut() {
+            if child.child.try_wait()?.is_none() {
+                remaining_children += 1;
+            }
+        }
+        if remaining_children == 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            terminate_children(
+                &mut runtime.children,
+                SETUP_SHUTDOWN_TIMEOUT,
+                SETUP_POLL_INTERVAL,
+            )?;
+            break;
+        }
+        thread::sleep(SETUP_POLL_INTERVAL);
     }
     if let Some(temp_config_path) = runtime.temp_config_path.as_deref() {
         cleanup_preview_temp_config(temp_config_path);
@@ -1410,48 +1566,39 @@ fn stop_setup_runtime(runtime_state: &mut Option<SetupRuntimeState>) -> Result<(
     Ok(())
 }
 
-fn build_setup_bridge_config(config: &Config, websocket_port: u16) -> Config {
-    let mut bridge_config = config.clone();
-    bridge_config.visualizer.port = websocket_port;
-    bridge_config
-}
-
-fn build_preview_config(config: &Config, websocket_port: u16, websocket_url: &str) -> Config {
-    let mut preview_config = config.clone();
-    preview_config.visualizer.port = websocket_port;
-    preview_config.ui.websocket_url = Some(websocket_url.into());
-    preview_config
-}
-
-fn build_identify_config(
-    target: &AvailableDevice,
-    config: &Config,
+fn build_preview_project_config(
+    session: &SetupSession,
     websocket_port: u16,
     websocket_url: &str,
-) -> Result<Config, Box<dyn Error>> {
-    let mut identify_config = config.clone();
-    identify_config.visualizer.port = websocket_port;
-    identify_config.ui.websocket_url = Some(websocket_url.into());
-    identify_config.mode = CollectionMode::Intervention;
-    identify_config.pairing.clear();
-    identify_config.devices = vec![{
-        let mut device = target.current.clone();
-        if device.device_type == DeviceType::Robot {
-            device.mode = Some(RobotMode::FreeDrive);
+) -> Result<ProjectConfig, Box<dyn Error>> {
+    let mut preview = if session.current_step == SetupStep::Devices {
+        if let Some(target_name) = session.identify_device_name.as_deref() {
+            let target = session
+                .available_device(target_name)
+                .ok_or_else(|| format!("missing identify target {target_name}"))?;
+            let mut preview = session.config.clone();
+            preview.mode = CollectionMode::Intervention;
+            preview.pairings.clear();
+            preview.devices = vec![target.current.clone()];
+            preview
+        } else {
+            session.config.clone()
         }
-        device
-    }];
-    identify_config.validate()?;
-    Ok(identify_config)
+    } else {
+        session.config.clone()
+    };
+    preview.visualizer.port = websocket_port;
+    preview.ui.websocket_url = Some(websocket_url.into());
+    Ok(preview)
 }
 
 fn write_setup_temp_config(
-    config: &Config,
+    project: &ProjectConfig,
     log_dir: &Path,
     filename: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let path = log_dir.join(filename);
-    fs::write(&path, toml::to_string_pretty(config)?)?;
+    fs::write(&path, toml::to_string_pretty(project)?)?;
     Ok(path)
 }
 
@@ -1460,54 +1607,262 @@ fn cleanup_preview_temp_config(path: &Path) {
 }
 
 fn build_setup_preview_specs(
-    config: &Config,
+    project: &ProjectConfig,
     workspace_root: &Path,
     current_exe_dir: &Path,
 ) -> Result<Vec<ChildSpec>, Box<dyn Error>> {
-    build_preview_specs(config, workspace_root, current_exe_dir)
+    build_preview_specs(project, workspace_root, current_exe_dir)
 }
 
-fn sanitize_temp_name(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "device".into()
-    } else {
-        sanitized
+fn camera_channel_type_for_profile(profile: &CameraProfile) -> String {
+    let base = profile
+        .stream
+        .clone()
+        .unwrap_or_else(|| "color".to_string());
+    match profile.channel {
+        Some(ch) if ch > 0 => format!("{base}_{ch}"),
+        _ => base,
     }
 }
 
-fn is_airbot_identify_driver(driver: &str) -> bool {
-    matches!(driver, "airbot-play" | "airbot-e2" | "airbot-g2")
+fn robot_default_channel_type(_driver: &str) -> String {
+    "arm".into()
 }
 
-fn set_airbot_identify_led(interface: &str, enabled: bool) -> Result<(), Box<dyn Error>> {
-    let frames =
-        PlayLedProtocol::new(0x00).generate_led_effect(if enabled { 0x22 } else { 0x1F })?;
-    let interface = interface.trim().to_owned();
-    if interface.is_empty() {
-        return Ok(());
+fn binary_device_from_camera_discovery(
+    discovery: &DiscoveredDevice,
+    profile: &CameraProfile,
+    name: String,
+) -> BinaryDeviceConfig {
+    let channel_type = camera_channel_type_for_profile(profile);
+    let mut extra = toml::Table::new();
+    if let Some(transport) = &discovery.transport {
+        extra.insert("transport".into(), toml::Value::String(transport.clone()));
     }
+    if let Some(interface) = &discovery.interface {
+        extra.insert("interface".into(), toml::Value::String(interface.clone()));
+    }
+    if let Some(product_variant) = &discovery.product_variant {
+        extra.insert(
+            "product_variant".into(),
+            toml::Value::String(product_variant.clone()),
+        );
+    }
+    if let Some(end_effector) = &discovery.end_effector {
+        extra.insert(
+            "end_effector".into(),
+            toml::Value::String(end_effector.clone()),
+        );
+    }
+    BinaryDeviceConfig {
+        name: name.clone(),
+        executable: Some(default_device_executable_name(&discovery.driver)),
+        driver: discovery.driver.clone(),
+        id: discovery.id.clone(),
+        bus_root: name,
+        channels: vec![DeviceChannelConfigV2 {
+            channel_type,
+            kind: DeviceType::Camera,
+            enabled: true,
+            mode: None,
+            dof: None,
+            publish_states: Vec::new(),
+            recorded_states: Vec::new(),
+            control_frequency_hz: None,
+            profile: Some(CameraChannelProfile {
+                width: profile.width,
+                height: profile.height,
+                fps: profile.fps,
+                pixel_format: profile.pixel_format,
+                native_pixel_format: profile.native_pixel_format.clone(),
+            }),
+            command_defaults: ChannelCommandDefaults::default(),
+            extra: toml::Table::new(),
+        }],
+        extra,
+    }
+}
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        let io = SocketCanIo::open(interface)?;
-        for frame in &frames {
-            io.send(frame).await?;
+fn binary_device_from_robot_discovery(
+    discovery: &DiscoveredDevice,
+    name: String,
+    preferred_mode: RobotMode,
+) -> BinaryDeviceConfig {
+    let mode = Some(select_supported_mode(
+        &discovery.supported_modes,
+        preferred_mode,
+    ));
+    let publish_states = vec![
+        RobotStateKind::JointPosition,
+        RobotStateKind::JointVelocity,
+        RobotStateKind::JointEffort,
+    ];
+    let recorded_states = vec![
+        RobotStateKind::JointPosition,
+        RobotStateKind::JointVelocity,
+        RobotStateKind::JointEffort,
+    ];
+    let command_defaults = ChannelCommandDefaults::default();
+    let mut extra = toml::Table::new();
+    if let Some(transport) = &discovery.transport {
+        extra.insert("transport".into(), toml::Value::String(transport.clone()));
+    }
+    if let Some(interface) = &discovery.interface {
+        extra.insert("interface".into(), toml::Value::String(interface.clone()));
+    }
+    if let Some(product_variant) = &discovery.product_variant {
+        extra.insert(
+            "product_variant".into(),
+            toml::Value::String(product_variant.clone()),
+        );
+    }
+    if let Some(end_effector) = &discovery.end_effector {
+        extra.insert(
+            "end_effector".into(),
+            toml::Value::String(end_effector.clone()),
+        );
+    }
+    let mut channels = vec![DeviceChannelConfigV2 {
+        channel_type: robot_default_channel_type(&discovery.driver),
+        kind: DeviceType::Robot,
+        enabled: true,
+        mode,
+        dof: discovery.dof.or(Some(6)),
+        publish_states,
+        recorded_states,
+        control_frequency_hz: discovery.default_frequency_hz,
+        profile: None,
+        command_defaults,
+        extra: toml::Table::new(),
+    }];
+    if discovery.driver == "airbot-play" {
+        if let Some((channel_type, eef_defaults)) =
+            mounted_airbot_end_effector_channel(discovery.end_effector.as_deref())
+        {
+            channels.push(DeviceChannelConfigV2 {
+                channel_type,
+                kind: DeviceType::Robot,
+                enabled: true,
+                mode: Some(preferred_mode),
+                dof: Some(1),
+                publish_states: vec![
+                    RobotStateKind::ParallelPosition,
+                    RobotStateKind::ParallelVelocity,
+                    RobotStateKind::ParallelEffort,
+                ],
+                recorded_states: vec![RobotStateKind::ParallelPosition],
+                control_frequency_hz: discovery.default_frequency_hz.or(Some(250.0)),
+                profile: None,
+                command_defaults: eef_defaults,
+                extra: toml::Table::new(),
+            });
         }
-        Ok::<(), Box<dyn Error>>(())
-    })?;
-    Ok(())
+    }
+    BinaryDeviceConfig {
+        name: name.clone(),
+        executable: Some(default_device_executable_name(&discovery.driver)),
+        driver: discovery.driver.clone(),
+        id: discovery.id.clone(),
+        bus_root: name,
+        channels,
+        extra,
+    }
+}
+
+fn mounted_airbot_end_effector_channel(
+    end_effector: Option<&str>,
+) -> Option<(String, ChannelCommandDefaults)> {
+    match end_effector?.trim().to_ascii_lowercase().as_str() {
+        "e2" | "e2b" => Some((
+            "e2".into(),
+            ChannelCommandDefaults {
+                joint_mit_kp: Vec::new(),
+                joint_mit_kd: Vec::new(),
+                parallel_mit_kp: vec![0.0],
+                parallel_mit_kd: vec![0.0],
+            },
+        )),
+        "g2" => Some((
+            "g2".into(),
+            ChannelCommandDefaults {
+                joint_mit_kp: Vec::new(),
+                joint_mit_kd: Vec::new(),
+                parallel_mit_kp: vec![10.0],
+                parallel_mit_kd: vec![0.5],
+            },
+        )),
+        _ => None,
+    }
+}
+
+fn channel_uses_parallel_teleop(ch: &DeviceChannelConfigV2) -> bool {
+    ch.publish_states
+        .contains(&RobotStateKind::ParallelPosition)
+}
+
+fn build_default_channel_pairings(devices: &[BinaryDeviceConfig]) -> Vec<ChannelPairingConfig> {
+    let mut pairings = Vec::new();
+    let arms = primary_robot_channels(devices, false);
+    let eefs = primary_robot_channels(devices, true);
+    for pairs in [pair_robot_channels_by_order(&arms), pair_robot_channels_by_order(&eefs)] {
+        if let Some((leader_dev, leader_ch, follower_dev, follower_ch)) = pairs {
+            let dof = follower_ch.dof.unwrap_or(6);
+            let parallel_pair =
+                channel_uses_parallel_teleop(leader_ch) && channel_uses_parallel_teleop(follower_ch);
+            let (leader_state, follower_command, map_len) = if parallel_pair {
+                (
+                    RobotStateKind::ParallelPosition,
+                    RobotCommandKind::ParallelMit,
+                    dof.min(MAX_PARALLEL as u32),
+                )
+            } else {
+                (RobotStateKind::JointPosition, RobotCommandKind::JointPosition, dof)
+            };
+            pairings.push(ChannelPairingConfig {
+                leader_device: leader_dev.name.clone(),
+                leader_channel_type: leader_ch.channel_type.clone(),
+                follower_device: follower_dev.name.clone(),
+                follower_channel_type: follower_ch.channel_type.clone(),
+                mapping: MappingStrategy::DirectJoint,
+                leader_state,
+                follower_command,
+                joint_index_map: (0..map_len).collect(),
+                joint_scales: vec![1.0; map_len as usize],
+            });
+        }
+    }
+    pairings
+}
+
+fn primary_robot_channels(
+    devices: &[BinaryDeviceConfig],
+    end_effector_only: bool,
+) -> Vec<(&BinaryDeviceConfig, &DeviceChannelConfigV2)> {
+    devices
+        .iter()
+        .filter_map(|device| {
+            let ch = device.channels.iter().find(|c| {
+                c.kind == DeviceType::Robot
+                    && c.enabled
+                    && ((c.dof == Some(1)) == end_effector_only)
+            })?;
+            Some((device, ch))
+        })
+        .collect()
+}
+
+fn pair_robot_channels_by_order<'a>(
+    channels: &[(&'a BinaryDeviceConfig, &'a DeviceChannelConfigV2)],
+) -> Option<(
+    &'a BinaryDeviceConfig,
+    &'a DeviceChannelConfigV2,
+    &'a BinaryDeviceConfig,
+    &'a DeviceChannelConfigV2,
+)> {
+    match channels {
+        [a, b, ..] => Some((a.0, a.1, b.0, b.1)),
+        _ => None,
+    }
 }
 
 fn build_setup_ui_spec(
@@ -1551,6 +1906,13 @@ struct SetupIpc {
         iceoryx2::port::subscriber::Subscriber<ipc::Service, SetupCommandMessage, ()>,
     setup_state_publisher:
         iceoryx2::port::publisher::Publisher<ipc::Service, SetupStateMessage, ()>,
+    control_publisher: iceoryx2::port::publisher::Publisher<ipc::Service, ControlEvent, ()>,
+    channel_mode_publishers: RefCell<
+        BTreeMap<
+            String,
+            iceoryx2::port::publisher::Publisher<ipc::Service, DeviceChannelMode, ()>,
+        >,
+    >,
 }
 
 impl SetupIpc {
@@ -1577,10 +1939,21 @@ impl SetupIpc {
             .max_nodes(16)
             .open_or_create()?;
 
+        let control_service_name: ServiceName = CONTROL_EVENTS_SERVICE.try_into()?;
+        let control_service = node
+            .service_builder(&control_service_name)
+            .publish_subscribe::<ControlEvent>()
+            .max_publishers(4)
+            .max_subscribers(16)
+            .max_nodes(16)
+            .open_or_create()?;
+
         Ok(Self {
             _node: node,
             setup_command_subscriber: command_service.subscriber_builder().create()?,
             setup_state_publisher: state_service.publisher_builder().create()?,
+            control_publisher: control_service.publisher_builder().create()?,
+            channel_mode_publishers: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -1607,45 +1980,88 @@ impl SetupIpc {
             .send_copy(SetupStateMessage::new(json))?;
         Ok(())
     }
+
+    fn send_shutdown(&self) -> Result<(), Box<dyn Error>> {
+        self.control_publisher.send_copy(ControlEvent::Shutdown)?;
+        Ok(())
+    }
+
+    fn publish_channel_mode(
+        &self,
+        bus_root: &str,
+        channel_type: &str,
+        mode: DeviceChannelMode,
+    ) -> Result<(), Box<dyn Error>> {
+        let key = channel_mode_control_service_name(bus_root, channel_type);
+        if !self.channel_mode_publishers.borrow().contains_key(&key) {
+            let service_name: ServiceName = key.as_str().try_into()?;
+            let service = self
+                ._node
+                .service_builder(&service_name)
+                .publish_subscribe::<DeviceChannelMode>()
+                .max_publishers(16)
+                .max_subscribers(16)
+                .max_nodes(16)
+                .open_or_create()?;
+            let publisher = service.publisher_builder().create()?;
+            self.channel_mode_publishers
+                .borrow_mut()
+                .insert(key.clone(), publisher);
+        }
+        if let Some(publisher) = self.channel_mode_publishers.borrow().get(&key) {
+            publisher.send_copy(mode)?;
+        }
+        Ok(())
+    }
 }
 
-fn available_devices_from_config(config: &Config) -> Vec<AvailableDevice> {
-    config
+fn available_devices_from_project(project: &ProjectConfig) -> Vec<AvailableDevice> {
+    project
         .devices
         .iter()
-        .map(|device| AvailableDevice {
-            name: available_device_key_from_config(device),
-            display_name: canonical_device_display_name(
-                device.device_type,
-                &device.driver,
-                device.dof,
-                device.stream.as_deref(),
-                device.channel,
-            ),
-            device_type: device.device_type,
-            driver: device.driver.clone(),
-            id: device.id.clone(),
-            camera_profiles: if device.device_type == DeviceType::Camera {
-                vec![CameraProfile {
-                    width: device.width.unwrap_or_default(),
-                    height: device.height.unwrap_or_default(),
-                    fps: device.fps.unwrap_or_default(),
-                    pixel_format: device.pixel_format.unwrap_or(PixelFormat::Rgb24),
-                    stream: device.stream.clone(),
-                    channel: device.channel,
-                }]
-            } else {
-                Vec::new()
-            },
-            supported_modes: device.mode.into_iter().collect(),
-            current: device.clone(),
+        .flat_map(|device| {
+            device.channels.iter().filter_map(|channel| {
+                let current = row_current_from_binary_channel(device, channel)?;
+                let device_type = channel.kind;
+                let camera_profiles = if device_type == DeviceType::Camera {
+                    channel
+                        .profile
+                        .as_ref()
+                        .map(|profile| CameraProfile {
+                            width: profile.width,
+                            height: profile.height,
+                            fps: profile.fps,
+                            pixel_format: profile.pixel_format,
+                            native_pixel_format: profile.native_pixel_format.clone(),
+                            stream: split_camera_channel_type(&channel.channel_type)
+                                .0
+                                .map(ToOwned::to_owned),
+                            channel: split_camera_channel_type(&channel.channel_type).1,
+                        })
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let supported_modes = supported_modes_from_project_channel(device, channel);
+                Some(AvailableDevice {
+                    name: available_device_key_from_binary(&current),
+                    display_name: display_name_for_binary_channel(device, channel),
+                    device_type,
+                    driver: device.driver.clone(),
+                    id: device.id.clone(),
+                    camera_profiles,
+                    supported_modes,
+                    current,
+                })
+            })
         })
         .collect()
 }
 
 fn available_devices_from_discoveries(
     discoveries: &[DiscoveredDevice],
-    config: &Config,
+    project: &ProjectConfig,
 ) -> Result<Vec<AvailableDevice>, Box<dyn Error>> {
     let mut available = Vec::new();
 
@@ -1655,11 +2071,11 @@ fn available_devices_from_discoveries(
                 let profile = discovery.camera_profiles.first().cloned().ok_or_else(|| {
                     format!("camera \"{}\" exposed no supported profiles", discovery.id)
                 })?;
-                let current = config
+                let mut current = project
                     .devices
                     .iter()
                     .find(|device| {
-                        device_matches_discovery(
+                        device_matches_discovery_binary(
                             device,
                             discovery,
                             profile.stream.as_deref(),
@@ -1673,22 +2089,17 @@ fn available_devices_from_discoveries(
                             discovery.display_name, discovery.id
                         )
                     })?;
-                available.push(AvailableDevice {
-                    name: available_device_key_from_config(&current),
-                    display_name: discovery.display_name.clone(),
-                    device_type: DeviceType::Camera,
-                    driver: discovery.driver.clone(),
-                    id: discovery.id.clone(),
-                    camera_profiles: discovery.camera_profiles.clone(),
-                    supported_modes: Vec::new(),
-                    current,
-                });
+                enrich_current_device_from_discovery(&mut current, discovery);
+                let rows = available_rows_from_discovery(&current, discovery);
+                for row in rows {
+                    available.push(row);
+                }
             }
             DeviceType::Robot => {
-                let current = config
+                let mut current = project
                     .devices
                     .iter()
-                    .find(|device| device_matches_discovery(device, discovery, None, None))
+                    .find(|device| device_matches_discovery_binary(device, discovery, None, None))
                     .cloned()
                     .ok_or_else(|| {
                         format!(
@@ -1696,16 +2107,11 @@ fn available_devices_from_discoveries(
                             discovery.display_name, discovery.id
                         )
                     })?;
-                available.push(AvailableDevice {
-                    name: available_device_key_from_config(&current),
-                    display_name: discovery.display_name.clone(),
-                    device_type: DeviceType::Robot,
-                    driver: discovery.driver.clone(),
-                    id: discovery.id.clone(),
-                    camera_profiles: Vec::new(),
-                    supported_modes: discovery.supported_modes.clone(),
-                    current,
-                });
+                enrich_current_device_from_discovery(&mut current, discovery);
+                let rows = available_rows_from_discovery(&current, discovery);
+                for row in rows {
+                    available.push(row);
+                }
             }
         }
     }
@@ -1713,117 +2119,139 @@ fn available_devices_from_discoveries(
     Ok(available)
 }
 
+fn available_rows_from_discovery(
+    current: &BinaryDeviceConfig,
+    discovery: &DiscoveredDevice,
+) -> Vec<AvailableDevice> {
+    current
+        .channels
+        .iter()
+        .filter_map(|channel| {
+            let row_current = row_current_from_binary_channel(current, channel)?;
+            let device_type = channel.kind;
+            let camera_profiles = if device_type == DeviceType::Camera {
+                discovery
+                    .camera_profiles
+                    .iter()
+                    .filter(|profile| {
+                        camera_channel_type_for_profile(profile) == channel.channel_type
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Some(AvailableDevice {
+                name: available_device_key_from_binary(&row_current),
+                display_name: display_name_for_binary_channel(current, channel),
+                device_type,
+                driver: current.driver.clone(),
+                id: current.id.clone(),
+                camera_profiles,
+                supported_modes: supported_modes_from_discovery(discovery, channel),
+                current: row_current,
+            })
+        })
+        .collect()
+}
+
+fn row_current_from_binary_channel(
+    device: &BinaryDeviceConfig,
+    channel: &DeviceChannelConfigV2,
+) -> Option<BinaryDeviceConfig> {
+    let mut current = device.clone();
+    current.channels = vec![channel.clone()];
+    Some(current)
+}
+
+fn supported_modes_from_project_channel(
+    device: &BinaryDeviceConfig,
+    channel: &DeviceChannelConfigV2,
+) -> Vec<RobotMode> {
+    if channel.kind != DeviceType::Robot {
+        return Vec::new();
+    }
+    match device.driver.as_str() {
+        "airbot-play" => default_supported_robot_modes(),
+        _ => channel.mode.into_iter().collect(),
+    }
+}
+
+fn supported_modes_from_discovery(
+    discovery: &DiscoveredDevice,
+    channel: &DeviceChannelConfigV2,
+) -> Vec<RobotMode> {
+    if channel.kind != DeviceType::Robot {
+        return Vec::new();
+    }
+    discovery
+        .supported_modes_by_channel
+        .get(&channel.channel_type)
+        .cloned()
+        .unwrap_or_else(|| match discovery.driver.as_str() {
+            "airbot-play" => default_supported_robot_modes(),
+            _ => channel.mode.into_iter().collect(),
+        })
+}
+
+fn split_camera_channel_type(channel_type: &str) -> (Option<&str>, Option<u32>) {
+    channel_type
+        .rsplit_once('_')
+        .and_then(|(stream, suffix)| suffix.parse::<u32>().ok().map(|channel| (stream, channel)))
+        .map(|(stream, channel)| (Some(stream), Some(channel)))
+        .unwrap_or((Some(channel_type), None))
+}
+
+fn display_name_for_binary_channel(
+    device: &BinaryDeviceConfig,
+    channel: &DeviceChannelConfigV2,
+) -> String {
+    match (channel.kind, device.driver.as_str(), channel.channel_type.as_str()) {
+        (DeviceType::Robot, "airbot-play", "e2") => "AIRBOT E2".into(),
+        (DeviceType::Robot, "airbot-play", "g2") => "AIRBOT G2".into(),
+        (DeviceType::Camera, _, channel_type) => {
+            let (stream, camera_channel) = split_camera_channel_type(channel_type);
+            canonical_device_display_name(
+                DeviceType::Camera,
+                &device.driver,
+                None,
+                stream,
+                camera_channel,
+            )
+        }
+        _ => canonical_device_display_name(
+            channel.kind,
+            &device.driver,
+            channel.dof,
+            None,
+            None,
+        ),
+    }
+}
+
 fn discover_devices(
     workspace_root: &Path,
     current_exe_dir: &Path,
     options: DiscoveryOptions,
 ) -> Result<(Vec<DiscoveredDevice>, Vec<String>), Box<dyn Error>> {
+    let (probe_entries, mut probe_errors) =
+        discover_probe_entries(workspace_root, current_exe_dir, options, DISCOVERY_TIMEOUT)?;
     let mut discoveries = Vec::new();
-    let mut probe_errors = Vec::new();
 
-    for driver in known_drivers() {
-        extend_driver_discoveries(
-            *driver,
-            &[],
+    for entry in probe_entries {
+        match build_discovered_device(
+            entry.driver,
+            &entry.probe_entry,
+            &entry.program,
             workspace_root,
-            current_exe_dir,
-            &mut discoveries,
-            &mut probe_errors,
-        );
-    }
-
-    if options.simulated_cameras > 0 {
-        let simulated_camera_args = vec![
-            OsString::from("--count"),
-            OsString::from(options.simulated_cameras.to_string()),
-        ];
-        extend_driver_discoveries(
-            KnownDriver {
-                device_type: DeviceType::Camera,
-                driver: "pseudo",
-                probe_args: &[],
-            },
-            &simulated_camera_args,
-            workspace_root,
-            current_exe_dir,
-            &mut discoveries,
-            &mut probe_errors,
-        );
-    }
-
-    if options.simulated_arms > 0 {
-        let simulated_robot_args = vec![
-            OsString::from("--count"),
-            OsString::from(options.simulated_arms.to_string()),
-        ];
-        extend_driver_discoveries(
-            KnownDriver {
-                device_type: DeviceType::Robot,
-                driver: "pseudo",
-                probe_args: &[],
-            },
-            &simulated_robot_args,
-            workspace_root,
-            current_exe_dir,
-            &mut discoveries,
-            &mut probe_errors,
-        );
-    }
-
-    if discoveries.is_empty() && !probe_errors.is_empty() {
-        return Err(probe_errors.join("; ").into());
+            DISCOVERY_TIMEOUT,
+        ) {
+            Ok(device) => discoveries.push(device),
+            Err(error) => probe_errors.push(format!("{}: {error}", entry.driver.driver)),
+        }
     }
 
     Ok((discoveries, probe_errors))
-}
-
-fn extend_driver_discoveries(
-    driver: KnownDriver,
-    extra_probe_args: &[OsString],
-    workspace_root: &Path,
-    current_exe_dir: &Path,
-    discoveries: &mut Vec<DiscoveredDevice>,
-    probe_errors: &mut Vec<String>,
-) {
-    let program = resolve_device_program(
-        driver.device_type,
-        driver.driver,
-        workspace_root,
-        current_exe_dir,
-    );
-    let mut probe_args = vec![OsString::from("probe")];
-    probe_args.extend(driver.probe_args.iter().map(OsString::from));
-    probe_args.extend(extra_probe_args.iter().cloned());
-
-    let probe_output =
-        match run_driver_json(&program, &probe_args, workspace_root, DISCOVERY_TIMEOUT) {
-            Ok(value) => value,
-            Err(DriverCommandError::NotFound { .. }) => return,
-            Err(error) => {
-                probe_errors.push(format!("{}: {error}", driver.driver));
-                return;
-            }
-        };
-
-    let Some(entries) = probe_output.as_array() else {
-        probe_errors.push(format!(
-            "{}: probe output must be a JSON array, got {}",
-            driver.driver, probe_output
-        ));
-        return;
-    };
-
-    for entry in entries {
-        match build_discovered_device(driver, entry, &program, workspace_root, DISCOVERY_TIMEOUT) {
-            Ok(device) => {
-                discoveries.push(device.clone());
-                if let Some(derived) = derive_attached_airbot_eef_discovery(&device) {
-                    discoveries.push(derived);
-                }
-            }
-            Err(error) => probe_errors.push(format!("{}: {error}", driver.driver)),
-        }
-    }
 }
 
 fn build_discovered_device(
@@ -1833,19 +2261,35 @@ fn build_discovered_device(
     workspace_root: &Path,
     timeout: Duration,
 ) -> Result<DiscoveredDevice, Box<dyn Error>> {
-    let id = value_as_string(probe_entry.get("id"))
+    let id = probe_entry
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value_as_string(probe_entry.get("id")))
         .ok_or_else(|| format!("probe entry missing id: {probe_entry}"))?;
-    let capabilities = run_driver_json(
+    let query = run_driver_json(
         program,
-        &[OsString::from("capabilities"), OsString::from(&id)],
+        &[
+            OsString::from("query"),
+            OsString::from("--json"),
+            OsString::from(&id),
+        ],
         workspace_root,
         timeout,
     )?;
+    let query_device = query
+        .get("devices")
+        .and_then(Value::as_array)
+        .and_then(|devices| {
+            devices
+                .iter()
+                .find(|device| value_as_string(device.get("id")).as_deref() == Some(id.as_str()))
+                .or_else(|| devices.first())
+        })
+        .ok_or_else(|| format!("query returned no devices for id {id}: {query}"))?;
 
     match driver.device_type {
         DeviceType::Camera => {
-            let camera_profiles =
-                normalize_camera_profiles(driver.driver, parse_camera_capabilities(&capabilities));
+            let camera_profiles = parse_query_camera_profiles(driver.driver, query_device);
             let display_name = canonical_device_display_name(
                 DeviceType::Camera,
                 driver.driver,
@@ -1861,21 +2305,24 @@ fn build_discovered_device(
                 id,
                 display_name,
                 camera_profiles,
+                supported_modes_by_channel: BTreeMap::new(),
                 dof: None,
                 supported_modes: Vec::new(),
                 default_frequency_hz: None,
-                transport: value_as_string(capabilities.get("transport"))
+                transport: query_metadata_string(query_device, "transport")
                     .or_else(|| value_as_string(probe_entry.get("transport"))),
-                interface: value_as_string(capabilities.get("interface"))
+                interface: query_metadata_string(query_device, "interface")
                     .or_else(|| value_as_string(probe_entry.get("interface"))),
-                product_variant: value_as_string(capabilities.get("product_variant"))
+                product_variant: query_metadata_string(query_device, "product_variant")
                     .or_else(|| value_as_string(probe_entry.get("product_variant"))),
-                end_effector: value_as_string(capabilities.get("end_effector"))
+                end_effector: query_metadata_string(query_device, "end_effector")
                     .or_else(|| value_as_string(probe_entry.get("end_effector"))),
             })
         }
         DeviceType::Robot => {
-            let dof = value_as_u32(capabilities.get("dof"))
+            let primary_channel = query_primary_robot_channel(query_device)?;
+            let supported_modes_by_channel = parse_query_robot_modes_by_channel(query_device);
+            let dof = value_as_u32(primary_channel.get("dof"))
                 .or_else(|| value_as_u32(probe_entry.get("dof")));
             let display_name =
                 canonical_device_display_name(DeviceType::Robot, driver.driver, dof, None, None);
@@ -1885,52 +2332,54 @@ fn build_discovered_device(
                 id,
                 display_name,
                 camera_profiles: Vec::new(),
+                supported_modes_by_channel,
                 dof,
-                supported_modes: parse_robot_modes(
-                    capabilities
-                        .get("supported_modes")
-                        .or_else(|| probe_entry.get("supported_modes")),
-                ),
-                default_frequency_hz: value_as_f64(capabilities.get("default_frequency_hz"))
-                    .or_else(|| value_as_f64(capabilities.get("control_frequency_hz"))),
-                transport: value_as_string(capabilities.get("transport"))
+                supported_modes: parse_query_robot_modes(primary_channel),
+                default_frequency_hz: value_as_f64(primary_channel.get("default_control_frequency_hz"))
+                    .or_else(|| value_as_f64(primary_channel.get("control_frequency_hz"))),
+                transport: query_metadata_string(query_device, "transport")
                     .or_else(|| value_as_string(probe_entry.get("transport"))),
-                interface: value_as_string(capabilities.get("interface"))
+                interface: query_metadata_string(query_device, "interface")
                     .or_else(|| value_as_string(probe_entry.get("interface"))),
-                product_variant: value_as_string(capabilities.get("product_variant"))
+                product_variant: query_metadata_string(query_device, "product_variant")
                     .or_else(|| value_as_string(probe_entry.get("product_variant"))),
-                end_effector: value_as_string(capabilities.get("end_effector"))
+                end_effector: query_robot_end_effector(query_device)
                     .or_else(|| value_as_string(probe_entry.get("end_effector"))),
             })
         }
     }
 }
 
-fn validate_existing_config(
-    config: &Config,
+fn validate_existing_project(
+    project: &ProjectConfig,
     workspace_root: &Path,
     current_exe_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    for device in &config.devices {
-        validate_device_hardware(device, workspace_root, current_exe_dir)?;
+    for device in &project.devices {
+        validate_binary_device_hardware(device, workspace_root, current_exe_dir)?;
     }
     Ok(())
 }
 
-fn validate_device_hardware(
-    device: &DeviceConfig,
+fn validate_binary_device_hardware(
+    device: &BinaryDeviceConfig,
     workspace_root: &Path,
     current_exe_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let program = resolve_device_program(
-        device.device_type,
-        &device.driver,
-        workspace_root,
-        current_exe_dir,
-    );
+    let executable_name = device
+        .executable
+        .clone()
+        .unwrap_or_else(|| default_device_executable_name(&device.driver));
+    let program = resolve_registered_program(&executable_name, workspace_root, current_exe_dir);
+    let mut args = vec![OsString::from("validate"), OsString::from(&device.id)];
+    for channel in device.channels.iter().filter(|channel| channel.enabled) {
+        args.push(OsString::from("--channel-type"));
+        args.push(OsString::from(&channel.channel_type));
+    }
+    args.push(OsString::from("--json"));
     let report = run_driver_json(
         &program,
-        &[OsString::from("validate"), OsString::from(&device.id)],
+        &args,
         workspace_root,
         VALIDATION_TIMEOUT,
     )?;
@@ -1948,8 +2397,8 @@ fn validate_device_hardware(
     Ok(())
 }
 
-fn build_discovery_config(discoveries: &[DiscoveredDevice]) -> Result<Config, Box<dyn Error>> {
-    let mut config = Config::draft_setup_template();
+fn build_discovery_config(discoveries: &[DiscoveredDevice]) -> Result<ProjectConfig, Box<dyn Error>> {
+    let mut config = ProjectConfig::draft_setup_template();
     let mut default_name_counts = BTreeMap::new();
     let mut arm_index = 0usize;
     let mut eef_index = 0usize;
@@ -1970,32 +2419,13 @@ fn build_discovery_config(discoveries: &[DiscoveredDevice]) -> Result<Config, Bo
                     ),
                     &mut default_name_counts,
                 );
-                config.devices.push(DeviceConfig {
-                    name,
-                    device_type: DeviceType::Camera,
-                    driver: discovery.driver.clone(),
-                    id: discovery.id.clone(),
-                    width: Some(profile.width),
-                    height: Some(profile.height),
-                    fps: Some(profile.fps),
-                    pixel_format: Some(profile.pixel_format),
-                    stream: profile.stream,
-                    channel: profile.channel,
-                    dof: None,
-                    mode: None,
-                    control_frequency_hz: None,
-                    transport: discovery.transport.clone(),
-                    interface: discovery.interface.clone(),
-                    product_variant: discovery.product_variant.clone(),
-                    end_effector: discovery.end_effector.clone(),
-                    model_path: None,
-                    gravity_comp_torque_scales: None,
-                    mit_kp: None,
-                    mit_kd: None,
-                    command_latency_ms: None,
-                    state_noise_stddev: None,
-                    extra: toml::Table::new(),
-                });
+                config
+                    .devices
+                    .push(binary_device_from_camera_discovery(
+                        discovery,
+                        &profile,
+                        name,
+                    ));
             }
             DeviceType::Robot => {
                 let is_eef = discovery.dof == Some(1);
@@ -2018,240 +2448,35 @@ fn build_discovery_config(discoveries: &[DiscoveredDevice]) -> Result<Config, Bo
                     ),
                     &mut default_name_counts,
                 );
-                config.devices.push(DeviceConfig {
+                config.devices.push(binary_device_from_robot_discovery(
+                    discovery,
                     name,
-                    device_type: DeviceType::Robot,
-                    driver: discovery.driver.clone(),
-                    id: discovery.id.clone(),
-                    width: None,
-                    height: None,
-                    fps: None,
-                    pixel_format: None,
-                    stream: None,
-                    channel: None,
-                    dof: discovery.dof.or(Some(6)),
-                    mode: Some(select_supported_mode(
-                        &discovery.supported_modes,
-                        preferred_mode,
-                    )),
-                    control_frequency_hz: discovery.default_frequency_hz,
-                    transport: discovery.transport.clone(),
-                    interface: discovery.interface.clone(),
-                    product_variant: discovery.product_variant.clone(),
-                    end_effector: discovery.end_effector.clone(),
-                    model_path: None,
-                    gravity_comp_torque_scales: None,
-                    mit_kp: None,
-                    mit_kd: None,
-                    command_latency_ms: Some(20),
-                    state_noise_stddev: Some(0.0),
-                    extra: toml::Table::new(),
-                });
+                    preferred_mode,
+                ));
             }
         }
     }
 
-    config.pairing = build_default_pairings(&config.devices);
-    config.mode = if config.pairing.is_empty() {
+    config.pairings = build_default_channel_pairings(&config.devices);
+    config.mode = if config.pairings.is_empty() {
         CollectionMode::Intervention
     } else {
         CollectionMode::Teleop
     };
-    config.validate()?;
+    config
+        .validate()
+        .map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
     Ok(config)
 }
 
-fn build_default_pairings(devices: &[DeviceConfig]) -> Vec<PairConfig> {
-    let mut pairings = Vec::new();
-    let arms = devices
-        .iter()
-        .filter(|device| {
-            device.device_type == DeviceType::Robot && device.dof.unwrap_or_default() != 1
-        })
-        .collect::<Vec<_>>();
-    let eefs = devices
-        .iter()
-        .filter(|device| device.device_type == DeviceType::Robot && device.dof == Some(1))
-        .collect::<Vec<_>>();
-
-    for (leader, follower) in [pair_devices_by_order(&arms), pair_devices_by_order(&eefs)]
-        .into_iter()
-        .flatten()
-    {
-        let dof = follower.dof.unwrap_or_default();
-        pairings.push(PairConfig {
-            leader: leader.name.clone(),
-            follower: follower.name.clone(),
-            mapping: MappingStrategy::DirectJoint,
-            joint_index_map: (0..dof).collect(),
-            joint_scales: vec![1.0; dof as usize],
-        });
-    }
-    pairings
-}
-
-fn save_config(config: &Config, output_path: &Path) -> Result<(), Box<dyn Error>> {
+fn save_project_config(project: &ProjectConfig, output_path: &Path) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    fs::write(output_path, toml::to_string_pretty(config)?)?;
+    fs::write(output_path, toml::to_string_pretty(project)?)?;
     Ok(())
-}
-
-fn known_drivers() -> &'static [KnownDriver] {
-    &[
-        KnownDriver {
-            device_type: DeviceType::Camera,
-            driver: "realsense",
-            probe_args: &[],
-        },
-        KnownDriver {
-            device_type: DeviceType::Camera,
-            driver: "v4l2",
-            probe_args: &[],
-        },
-        KnownDriver {
-            device_type: DeviceType::Robot,
-            driver: "airbot-play",
-            probe_args: &[],
-        },
-    ]
-}
-
-fn derive_attached_airbot_eef_discovery(arm: &DiscoveredDevice) -> Option<DiscoveredDevice> {
-    if arm.device_type != DeviceType::Robot || arm.driver != "airbot-play" {
-        return None;
-    }
-
-    let interface = arm.interface.as_deref()?.trim();
-    if interface.is_empty() {
-        return None;
-    }
-
-    let (driver, id_suffix, product_variant, end_effector) =
-        match normalize_attached_airbot_eef(arm.end_effector.as_deref()) {
-            Some(values) => values,
-            None => return None,
-        };
-
-    Some(DiscoveredDevice {
-        device_type: DeviceType::Robot,
-        driver: driver.to_owned(),
-        id: format!("{interface}:{id_suffix}"),
-        display_name: canonical_device_display_name(DeviceType::Robot, driver, Some(1), None, None),
-        camera_profiles: Vec::new(),
-        dof: Some(1),
-        supported_modes: vec![RobotMode::FreeDrive, RobotMode::CommandFollowing],
-        default_frequency_hz: Some(250.0),
-        transport: arm.transport.clone().or_else(|| Some("can".to_owned())),
-        interface: Some(interface.to_owned()),
-        product_variant: Some(product_variant.to_owned()),
-        end_effector: Some(end_effector.to_owned()),
-    })
-}
-
-fn normalize_attached_airbot_eef(
-    value: Option<&str>,
-) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
-    match value?.trim().to_ascii_lowercase().as_str() {
-        "e2" | "e2b" => Some(("airbot-e2", "e2", "e2", "e2")),
-        "g2" => Some(("airbot-g2", "g2", "g2", "g2")),
-        _ => None,
-    }
-}
-
-fn run_driver_json(
-    program: &OsString,
-    args: &[OsString],
-    working_directory: &Path,
-    timeout: Duration,
-) -> Result<Value, DriverCommandError> {
-    let program_name = os_string_lossy(program);
-    let args_display = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut child = Command::new(program)
-        .args(args)
-        .current_dir(working_directory)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                DriverCommandError::NotFound {
-                    program: program_name.clone(),
-                }
-            } else {
-                DriverCommandError::Io {
-                    program: program_name.clone(),
-                    source,
-                }
-            }
-        })?;
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(DriverCommandError::Timeout {
-                        program: program_name,
-                        args: args_display,
-                    });
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(source) => {
-                return Err(DriverCommandError::Io {
-                    program: program_name,
-                    source,
-                });
-            }
-        }
-    };
-
-    let stdout = read_child_pipe(child.stdout.take()).map_err(|source| DriverCommandError::Io {
-        program: program_name.clone(),
-        source,
-    })?;
-    let stderr = read_child_pipe(child.stderr.take()).map_err(|source| DriverCommandError::Io {
-        program: program_name.clone(),
-        source,
-    })?;
-
-    if !status.success() {
-        let details = if stderr.trim().is_empty() {
-            stdout.trim().to_owned()
-        } else {
-            stderr.trim().to_owned()
-        };
-        return Err(DriverCommandError::Failed {
-            program: program_name,
-            args: args_display,
-            details,
-        });
-    }
-
-    serde_json::from_str(stdout.trim()).map_err(|source| DriverCommandError::InvalidJson {
-        program: program_name,
-        source,
-        stdout,
-    })
-}
-
-fn read_child_pipe(mut pipe: Option<impl Read>) -> Result<String, std::io::Error> {
-    let mut output = String::new();
-    if let Some(pipe) = pipe.as_mut() {
-        pipe.read_to_string(&mut output)?;
-    }
-    Ok(output)
 }
 
 fn parse_camera_capabilities(capabilities: &Value) -> Vec<CameraProfile> {
@@ -2295,11 +2520,196 @@ fn parse_camera_capabilities(capabilities: &Value) -> Vec<CameraProfile> {
                 height,
                 fps,
                 pixel_format,
+                native_pixel_format: value_as_string(profile.get("native_pixel_format")),
                 stream,
                 channel: channel.filter(|channel| *channel > 0),
             })
         })
         .collect()
+}
+
+fn parse_query_camera_profiles(driver: &str, device: &Value) -> Vec<CameraProfile> {
+    let profiles = device
+        .get("channels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|channel| {
+            value_as_string(channel.get("kind")).as_deref() == Some("camera")
+                && channel
+                    .get("available")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+        })
+        .flat_map(|channel| {
+            let channel_type = value_as_string(channel.get("channel_type"));
+            channel
+                .get("profiles")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |profile| {
+                    let width = value_as_u32(profile.get("width"))?;
+                    let height = value_as_u32(profile.get("height"))?;
+                    let fps = value_as_u32(profile.get("fps")).or_else(|| {
+                        value_as_f64(profile.get("fps")).map(|fps| fps.round() as u32)
+                    })?;
+                    let pixel_format = value_as_string(profile.get("pixel_format"))
+                        .and_then(|value| parse_pixel_format_name(&value))
+                        .unwrap_or(PixelFormat::Rgb24);
+                    Some(CameraProfile {
+                        width,
+                        height,
+                        fps,
+                        pixel_format,
+                        native_pixel_format: value_as_string(profile.get("native_pixel_format")),
+                        stream: channel_type.clone(),
+                        channel: None,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    normalize_camera_profiles(driver, profiles)
+}
+
+fn query_primary_robot_channel<'a>(device: &'a Value) -> Result<&'a Value, Box<dyn Error>> {
+    device
+        .get("channels")
+        .and_then(Value::as_array)
+        .and_then(|channels| {
+            channels
+                .iter()
+                .find(|channel| value_as_string(channel.get("channel_type")).as_deref() == Some("arm"))
+                .or_else(|| {
+                    channels.iter().find(|channel| {
+                        value_as_string(channel.get("kind")).as_deref() == Some("robot")
+                    })
+                })
+        })
+        .ok_or_else(|| "query returned no robot channels".into())
+}
+
+fn parse_query_robot_modes(channel: &Value) -> Vec<RobotMode> {
+    channel
+        .get("modes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .filter_map(|mode| match mode {
+            "free-drive" => Some(RobotMode::FreeDrive),
+            "command-following" => Some(RobotMode::CommandFollowing),
+            "identifying" => Some(RobotMode::Identifying),
+            "disabled" => Some(RobotMode::Disabled),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_query_robot_modes_by_channel(device: &Value) -> BTreeMap<String, Vec<RobotMode>> {
+    device
+        .get("channels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|channel| value_as_string(channel.get("kind")).as_deref() == Some("robot"))
+        .filter_map(|channel| {
+            let channel_type = value_as_string(channel.get("channel_type"))?;
+            Some((channel_type, parse_query_robot_modes(channel)))
+        })
+        .collect()
+}
+
+fn query_metadata_string(device: &Value, key: &str) -> Option<String> {
+    value_as_string(device.get(key)).or_else(|| {
+        device
+            .get("optional_info")
+            .and_then(|optional| optional.get(key))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn query_robot_end_effector(device: &Value) -> Option<String> {
+    device
+        .get("channels")
+        .and_then(Value::as_array)
+        .and_then(|channels| {
+            channels.iter().find_map(|channel| {
+                let channel_type = value_as_string(channel.get("channel_type"))?;
+                match channel_type.as_str() {
+                    "e2" | "g2" => Some(channel_type),
+                    _ => None,
+                }
+            })
+        })
+        .or_else(|| query_metadata_string(device, "end_effector"))
+}
+
+fn enrich_current_device_from_discovery(
+    current: &mut BinaryDeviceConfig,
+    discovery: &DiscoveredDevice,
+) {
+    merge_discovery_extra(&mut current.extra, discovery);
+    if discovery.device_type != DeviceType::Camera {
+        return;
+    }
+    let Some(channel) = current
+        .channels
+        .iter_mut()
+        .find(|channel| channel.kind == DeviceType::Camera)
+    else {
+        return;
+    };
+    let Some(profile) = channel.profile.as_mut() else {
+        return;
+    };
+    if profile.native_pixel_format.is_some() {
+        return;
+    }
+    let matched = discovery.camera_profiles.iter().find(|candidate| {
+        candidate.width == profile.width
+            && candidate.height == profile.height
+            && candidate.fps == profile.fps
+            && candidate.pixel_format == profile.pixel_format
+            && camera_channel_type_for_profile(candidate) == channel.channel_type
+    });
+    if let Some(matched) = matched {
+        profile.native_pixel_format = matched.native_pixel_format.clone();
+    }
+}
+
+fn merge_discovery_extra(extra: &mut toml::Table, discovery: &DiscoveredDevice) {
+    if let Some(transport) = &discovery.transport {
+        extra.insert("transport".into(), toml::Value::String(transport.clone()));
+    }
+    if let Some(interface) = &discovery.interface {
+        extra.insert("interface".into(), toml::Value::String(interface.clone()));
+    }
+    if let Some(product_variant) = &discovery.product_variant {
+        extra.insert(
+            "product_variant".into(),
+            toml::Value::String(product_variant.clone()),
+        );
+    }
+    if let Some(end_effector) = &discovery.end_effector {
+        extra.insert(
+            "end_effector".into(),
+            toml::Value::String(end_effector.clone()),
+        );
+    }
+}
+
+fn parse_pixel_format_name(value: &str) -> Option<PixelFormat> {
+    match value {
+        "rgb24" => Some(PixelFormat::Rgb24),
+        "bgr24" => Some(PixelFormat::Bgr24),
+        "yuyv" => Some(PixelFormat::Yuyv),
+        "mjpeg" => Some(PixelFormat::Mjpeg),
+        "depth16" => Some(PixelFormat::Depth16),
+        "gray8" => Some(PixelFormat::Gray8),
+        _ => None,
+    }
 }
 
 fn normalize_camera_profiles(driver: &str, profiles: Vec<CameraProfile>) -> Vec<CameraProfile> {
@@ -2334,9 +2744,20 @@ fn parse_robot_modes(value: Option<&Value>) -> Vec<RobotMode> {
         .filter_map(|mode| match mode.as_str() {
             "free-drive" => Some(RobotMode::FreeDrive),
             "command-following" => Some(RobotMode::CommandFollowing),
+            "identifying" => Some(RobotMode::Identifying),
+            "disabled" => Some(RobotMode::Disabled),
             _ => None,
         })
         .collect()
+}
+
+fn default_supported_robot_modes() -> Vec<RobotMode> {
+    vec![
+        RobotMode::FreeDrive,
+        RobotMode::CommandFollowing,
+        RobotMode::Identifying,
+        RobotMode::Disabled,
+    ]
 }
 
 fn parse_pixel_format(value: &str) -> Option<PixelFormat> {
@@ -2395,47 +2816,56 @@ fn select_supported_mode(supported_modes: &[RobotMode], preferred: RobotMode) ->
     }
 }
 
-fn device_identity_from_available(device: &AvailableDevice) -> DeviceIdentity {
-    device_identity_from_config(&device.current)
-}
-
-fn device_identity_from_config(device: &DeviceConfig) -> DeviceIdentity {
+fn device_identity_from_binary(device: &BinaryDeviceConfig) -> DeviceIdentity {
+    let ch = device
+        .channels
+        .first()
+        .expect("setup devices always include a primary channel");
     DeviceIdentity {
-        device_type: device.device_type,
+        device_type: ch.kind,
         driver: device.driver.clone(),
         id: device.id.clone(),
-        stream: device.stream.clone(),
-        channel: device.channel,
+        channel_type: ch.channel_type.clone(),
     }
 }
 
-fn device_matches_discovery(
-    device: &DeviceConfig,
+fn discovery_camera_channel_key(stream: Option<&str>, channel: Option<u32>) -> String {
+    let base = stream.unwrap_or("color").to_string();
+    match channel {
+        Some(ch) if ch > 0 => format!("{base}_{ch}"),
+        _ => base,
+    }
+}
+
+fn device_matches_discovery_binary(
+    device: &BinaryDeviceConfig,
     discovery: &DiscoveredDevice,
     stream: Option<&str>,
     channel: Option<u32>,
 ) -> bool {
-    device_identity_from_config(device)
+    let channel_type = match discovery.device_type {
+        DeviceType::Camera => discovery_camera_channel_key(stream, channel),
+        DeviceType::Robot => robot_default_channel_type(&discovery.driver),
+    };
+    device_identity_from_binary(device)
         == DeviceIdentity {
             device_type: discovery.device_type,
             driver: discovery.driver.clone(),
             id: discovery.id.clone(),
-            stream: stream.map(ToOwned::to_owned),
-            channel,
+            channel_type,
         }
 }
 
-fn available_device_key_from_config(device: &DeviceConfig) -> String {
-    let kind = match device.device_type {
+fn available_device_key_from_binary(device: &BinaryDeviceConfig) -> String {
+    let ch = device
+        .channels
+        .first()
+        .expect("setup devices always include a primary channel");
+    let kind = match ch.kind {
         DeviceType::Camera => "camera",
         DeviceType::Robot => "robot",
     };
-    let stream = device.stream.as_deref().unwrap_or("-");
-    let channel = device
-        .channel
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".into());
-    format!("{kind}|{}|{}|{stream}|{channel}", device.driver, device.id)
+    format!("{kind}|{}|{}|{}|-", device.driver, device.id, ch.channel_type)
 }
 
 fn canonical_device_display_name(
@@ -2509,15 +2939,6 @@ fn next_default_device_name(base: String, counts: &mut BTreeMap<String, usize>) 
     resolved
 }
 
-fn pair_devices_by_order<'a>(
-    devices: &[&'a DeviceConfig],
-) -> Option<(&'a DeviceConfig, &'a DeviceConfig)> {
-    match devices {
-        [leader, follower, ..] => Some((leader, follower)),
-        _ => None,
-    }
-}
-
 fn group_default_mode(index: usize) -> RobotMode {
     match index {
         0 => RobotMode::FreeDrive,
@@ -2526,16 +2947,36 @@ fn group_default_mode(index: usize) -> RobotMode {
     }
 }
 
-fn os_string_lossy(value: &OsStr) -> String {
-    value.to_string_lossy().into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+
+    fn project_camera_device_names(p: &ProjectConfig) -> Vec<String> {
+        p.devices
+            .iter()
+            .filter(|d| {
+                d.channels
+                    .iter()
+                    .any(|c| c.kind == DeviceType::Camera && c.enabled)
+            })
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
+    fn project_robot_device_names(p: &ProjectConfig) -> Vec<String> {
+        p.devices
+            .iter()
+            .filter(|d| {
+                d.channels
+                    .iter()
+                    .any(|c| c.kind == DeviceType::Robot && c.enabled)
+            })
+            .map(|d| d.name.clone())
+            .collect()
+    }
 
     fn camera_discovery(id: &str) -> DiscoveredDevice {
         DiscoveredDevice {
@@ -2548,9 +2989,11 @@ mod tests {
                 height: 480,
                 fps: 30,
                 pixel_format: PixelFormat::Rgb24,
+                native_pixel_format: None,
                 stream: Some("color".into()),
                 channel: None,
             }],
+            supported_modes_by_channel: BTreeMap::new(),
             dof: None,
             supported_modes: Vec::new(),
             default_frequency_hz: None,
@@ -2568,8 +3011,12 @@ mod tests {
             id: id.into(),
             display_name: id.into(),
             camera_profiles: Vec::new(),
+            supported_modes_by_channel: BTreeMap::from([(
+                "arm".into(),
+                default_supported_robot_modes(),
+            )]),
             dof: Some(dof),
-            supported_modes: vec![RobotMode::FreeDrive, RobotMode::CommandFollowing],
+            supported_modes: default_supported_robot_modes(),
             default_frequency_hz: Some(60.0),
             transport: Some("simulated".into()),
             interface: None,
@@ -2579,14 +3026,25 @@ mod tests {
     }
 
     fn airbot_play_discovery(end_effector: Option<&str>) -> DiscoveredDevice {
+        let mut supported_modes_by_channel = BTreeMap::from([(
+            "arm".into(),
+            default_supported_robot_modes(),
+        )]);
+        if let Some(channel_type) = end_effector.map(|value| value.to_ascii_lowercase()) {
+            supported_modes_by_channel.insert(
+                channel_type,
+                default_supported_robot_modes(),
+            );
+        }
         DiscoveredDevice {
             device_type: DeviceType::Robot,
             driver: "airbot-play".into(),
             id: "PZ123".into(),
             display_name: "AIRBOT Play".into(),
             camera_profiles: Vec::new(),
+            supported_modes_by_channel,
             dof: Some(6),
-            supported_modes: vec![RobotMode::FreeDrive, RobotMode::CommandFollowing],
+            supported_modes: default_supported_robot_modes(),
             default_frequency_hz: Some(250.0),
             transport: Some("can".into()),
             interface: Some("can0".into()),
@@ -2621,18 +3079,18 @@ mod tests {
         .expect("config should build");
 
         assert_eq!(
-            config.camera_names(),
+            project_camera_device_names(&config),
             vec!["pseudo_camera", "pseudo_camera_2"]
         );
         assert_eq!(
-            config.robot_names(),
+            project_robot_device_names(&config),
             vec!["pseudo_arm", "pseudo_arm_2", "pseudo_eef", "pseudo_eef_2"]
         );
-        assert_eq!(config.pairing.len(), 2);
-        assert_eq!(config.pairing[0].leader, "pseudo_arm");
-        assert_eq!(config.pairing[0].follower, "pseudo_arm_2");
-        assert_eq!(config.pairing[1].leader, "pseudo_eef");
-        assert_eq!(config.pairing[1].follower, "pseudo_eef_2");
+        assert_eq!(config.pairings.len(), 2);
+        assert_eq!(config.pairings[0].leader_device, "pseudo_arm");
+        assert_eq!(config.pairings[0].follower_device, "pseudo_arm_2");
+        assert_eq!(config.pairings[1].leader_device, "pseudo_eef");
+        assert_eq!(config.pairings[1].follower_device, "pseudo_eef_2");
     }
 
     #[test]
@@ -2678,6 +3136,7 @@ mod tests {
                     height: 480,
                     fps: 30,
                     pixel_format: PixelFormat::Mjpeg,
+                    native_pixel_format: Some("MJPG".into()),
                     stream: None,
                     channel: None,
                 },
@@ -2686,6 +3145,7 @@ mod tests {
                     height: 480,
                     fps: 30,
                     pixel_format: PixelFormat::Yuyv,
+                    native_pixel_format: Some("YUYV".into()),
                     stream: None,
                     channel: None,
                 },
@@ -2694,6 +3154,7 @@ mod tests {
                     height: 720,
                     fps: 30,
                     pixel_format: PixelFormat::Yuyv,
+                    native_pixel_format: Some("YUYV".into()),
                     stream: None,
                     channel: None,
                 },
@@ -2708,6 +3169,16 @@ mod tests {
                     height: 480,
                     fps: 30,
                     pixel_format: PixelFormat::Rgb24,
+                    native_pixel_format: Some("MJPG".into()),
+                    stream: Some("color".into()),
+                    channel: None,
+                },
+                CameraProfile {
+                    width: 640,
+                    height: 480,
+                    fps: 30,
+                    pixel_format: PixelFormat::Rgb24,
+                    native_pixel_format: Some("YUYV".into()),
                     stream: Some("color".into()),
                     channel: None,
                 },
@@ -2716,6 +3187,7 @@ mod tests {
                     height: 720,
                     fps: 30,
                     pixel_format: PixelFormat::Rgb24,
+                    native_pixel_format: Some("YUYV".into()),
                     stream: Some("color".into()),
                     channel: None,
                 },
@@ -2724,7 +3196,79 @@ mod tests {
     }
 
     #[test]
-    fn build_setup_bridge_config_preserves_visible_devices_and_overrides_port() {
+    fn available_devices_from_discoveries_merges_airbot_interface_into_existing_config() {
+        let discovery = airbot_play_discovery(Some("e2"));
+        let mut config = build_discovery_config(std::slice::from_ref(&discovery))
+            .expect("config should build");
+        config.devices[0].extra.clear();
+
+        let available = available_devices_from_discoveries(&[discovery], &config)
+            .expect("available devices should build");
+
+        assert_eq!(
+            available[0]
+                .current
+                .extra
+                .get("interface")
+                .and_then(|value| value.as_str()),
+            Some("can0")
+        );
+        assert_eq!(
+            available[0]
+                .current
+                .extra
+                .get("end_effector")
+                .and_then(|value| value.as_str()),
+            Some("e2")
+        );
+    }
+
+    #[test]
+    fn available_devices_from_discoveries_splits_airbot_channels_into_rows() {
+        let discovery = airbot_play_discovery(Some("e2"));
+        let config = build_discovery_config(std::slice::from_ref(&discovery))
+            .expect("config should build");
+
+        let available = available_devices_from_discoveries(&[discovery], &config)
+            .expect("available devices should build");
+
+        assert_eq!(available.len(), 2);
+        assert_eq!(available[0].current.channels.len(), 1);
+        assert_eq!(available[0].current.channels[0].channel_type, "arm");
+        assert_eq!(available[0].display_name, "AIRBOT Play");
+        assert_eq!(available[1].current.channels.len(), 1);
+        assert_eq!(available[1].current.channels[0].channel_type, "e2");
+        assert_eq!(available[1].display_name, "AIRBOT E2");
+        assert_eq!(available[0].current.name, available[1].current.name);
+    }
+
+    #[test]
+    fn toggle_device_selection_disables_only_selected_airbot_channel() {
+        let mut session = setup_session(&[airbot_play_discovery(Some("e2"))]);
+        let e2_name = session
+            .available_devices
+            .iter()
+            .find(|device| device.current.channels[0].channel_type == "e2")
+            .expect("e2 row should exist")
+            .name
+            .clone();
+
+        assert!(session
+            .toggle_device_selection(&e2_name)
+            .expect("toggle should succeed"));
+
+        let device = session
+            .config
+            .devices
+            .iter()
+            .find(|device| device.driver == "airbot-play")
+            .expect("physical airbot device should remain configured");
+        assert!(device.channel_named("arm").is_some_and(|channel| channel.enabled));
+        assert!(device.channel_named("e2").is_some_and(|channel| !channel.enabled));
+    }
+
+    #[test]
+    fn setup_bridge_project_overrides_visualizer_port() {
         let config = build_discovery_config(&[
             camera_discovery("cam0"),
             camera_discovery("cam1"),
@@ -2733,11 +3277,18 @@ mod tests {
         ])
         .expect("config should build");
 
-        let bridge = build_setup_bridge_config(&config, 42424);
+        let mut bridge = config.clone();
+        bridge.visualizer.port = 42424;
 
         assert_eq!(bridge.visualizer.port, 42424);
-        assert_eq!(bridge.camera_names(), config.camera_names());
-        assert_eq!(bridge.robot_names(), config.robot_names());
+        assert_eq!(
+            project_camera_device_names(&bridge),
+            project_camera_device_names(&config)
+        );
+        assert_eq!(
+            project_robot_device_names(&bridge),
+            project_robot_device_names(&config)
+        );
     }
 
     #[test]
@@ -2850,27 +3401,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(drivers, vec!["realsense", "v4l2", "airbot-play"]);
-    }
-
-    #[test]
-    fn derive_attached_airbot_eef_discovery_matches_reported_mount() {
-        let e2 = derive_attached_airbot_eef_discovery(&airbot_play_discovery(Some("E2B")))
-            .expect("E2B mount should produce a derived discovery");
-        assert_eq!(e2.driver, "airbot-e2");
-        assert_eq!(e2.id, "can0:e2");
-        assert_eq!(e2.display_name, "AIRBOT E2");
-        assert_eq!(e2.dof, Some(1));
-        assert_eq!(e2.end_effector.as_deref(), Some("e2"));
-
-        let g2 = derive_attached_airbot_eef_discovery(&airbot_play_discovery(Some("g2")))
-            .expect("G2 mount should produce a derived discovery");
-        assert_eq!(g2.driver, "airbot-g2");
-        assert_eq!(g2.id, "can0:g2");
-
-        assert!(derive_attached_airbot_eef_discovery(&airbot_play_discovery(None)).is_none());
-        assert!(
-            derive_attached_airbot_eef_discovery(&airbot_play_discovery(Some("none"))).is_none()
-        );
     }
 
     #[cfg(unix)]

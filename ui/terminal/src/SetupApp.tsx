@@ -8,6 +8,8 @@ import {
   encodeSetupCommand,
   type CommandAction,
   type SetupAvailableDevice,
+  type SetupBinaryDeviceConfig,
+  type SetupDeviceChannelV2,
   type SetupStateMessage,
 } from "./lib/protocol.js";
 import { getTerminalMetrics } from "./lib/terminal-geometry.js";
@@ -121,7 +123,7 @@ export function SetupApp({
     [setupState],
   );
   const selectedDeviceKeys = useMemo(
-    () => new Set(selectedDevices.map((device) => deviceIdentityKey(device))),
+    () => new Set(enabledChannelIdentityKeys(selectedDevices)),
     [selectedDevices],
   );
   const identifyDevice = useMemo(
@@ -144,7 +146,7 @@ export function SetupApp({
       case "devices":
         return setupState.available_devices.length;
       case "pairing":
-        return setupState.config.pairing.length;
+        return setupState.config.pairings.length;
       case "storage":
         return settingsFields.length;
       case "preview":
@@ -208,7 +210,7 @@ export function SetupApp({
     if (setupState.step === "devices") {
       return `devices:${setupState.identify_device ?? "idle"}`;
     }
-    return `preview:${selectedDevices.map((device) => device.name).join("|")}`;
+    return `preview:${enabledChannelNames(selectedDevices).join("|")}`;
   }, [selectedDevices, setupState]);
   const livePanelRows = useMemo(() => {
     if (!showLivePanels) {
@@ -221,15 +223,18 @@ export function SetupApp({
       return [];
     }
     if (setupState.step === "preview") {
-      return selectedDevices
-        .filter((device) => device.type === "camera")
-        .map((device) => device.name);
+      return enabledCameraNames(selectedDevices);
     }
     if (
       setupState.step === "devices" &&
       identifyDevice?.device_type === "camera"
     ) {
-      return [identifyDevice.current.name];
+      const channel = primaryChannel(identifyDevice.current);
+      return [
+        channel
+          ? `${identifyDevice.current.name}/${channel.channel_type}`
+          : identifyDevice.current.name,
+      ];
     }
     return [];
   }, [identifyDevice, selectedDevices, setupState]);
@@ -571,7 +576,7 @@ function buildPreviewActions(setupState: SetupStateMessage | null): PreviewActio
     { kind: "jump", label: "Edit settings", targetStep: "storage" },
   ];
 
-  if (setupState.config.mode === "teleop" && setupState.config.pairing.length > 0) {
+  if (setupState.config.mode === "teleop" && setupState.config.pairings.length > 0) {
     actions.push({
       kind: "jump",
       label: "Edit pairings",
@@ -730,19 +735,22 @@ function buildDetailLines(
       ];
     }
     case "pairing":
-      return setupState.config.pairing.length > 0
+      return setupState.config.pairings.length > 0
         ? [
             textLine(
               "pairing-title",
               "Review teleoperation mappings for leader/follower pairs.",
               { color: "cyan", bold: true },
             ),
-            ...setupState.config.pairing.map((pair, index) =>
+            ...setupState.config.pairings.map((pair, index) =>
               buildDetailLine(`pair:${index}`, [
                 focusPrefix(index === focusedIndex),
-                textSegment(`${pair.leader} -> ${pair.follower}`, {
-                  bold: index === focusedIndex,
-                }),
+                textSegment(
+                  `${pair.leader_device}:${pair.leader_channel_type} -> ${pair.follower_device}:${pair.follower_channel_type}`,
+                  {
+                    bold: index === focusedIndex,
+                  },
+                ),
                 textSegment(` | ${pair.mapping}`, { color: "green" }),
               ]),
             ),
@@ -796,7 +804,7 @@ function buildDetailLines(
         buildDetailLine("preview-counts", [
           textSegment("Devices: ", { color: "cyan", bold: true }),
           textSegment(
-            `${setupState.config.devices.length} | Pairings: ${setupState.config.pairing.length}`,
+            `${setupState.config.devices.length} | Pairings: ${setupState.config.pairings.length}`,
           ),
         ]),
         ...previewActions.map((action, index) =>
@@ -886,19 +894,52 @@ function deviceNameFieldKey(field: EditableFieldId): string | null {
   return field.startsWith("device_name:") ? field.slice("device_name:".length) : null;
 }
 
-function deviceIdentityKey(
-  device: Pick<
-    SetupAvailableDevice["current"],
-    "type" | "driver" | "id" | "stream" | "channel"
-  >,
-): string {
-  return [
-    device.type,
-    device.driver,
-    device.id,
-    device.stream ?? "-",
-    device.channel ?? "-",
-  ].join("|");
+function primaryChannel(
+  device: SetupBinaryDeviceConfig,
+): SetupDeviceChannelV2 | undefined {
+  return device.channels[0];
+}
+
+function enabledChannelIdentityKeys(devices: SetupBinaryDeviceConfig[]): string[] {
+  return devices.flatMap((device) =>
+    device.channels
+      .filter((channel) => channel.enabled !== false)
+      .map((channel) =>
+        [channel.kind ?? "camera", device.driver, device.id, channel.channel_type, "-"].join(
+          "|",
+        ),
+      ),
+  );
+}
+
+function enabledChannelNames(devices: SetupBinaryDeviceConfig[]): string[] {
+  return devices.flatMap((device) =>
+    device.channels
+      .filter((channel) => channel.enabled !== false)
+      .map((channel) => `${device.name}/${channel.channel_type}`),
+  );
+}
+
+function enabledCameraNames(devices: SetupBinaryDeviceConfig[]): string[] {
+  return devices.flatMap((device) =>
+    device.channels
+      .filter((channel) => channel.enabled !== false && channel.kind === "camera")
+      .map((channel) => `${device.name}/${channel.channel_type}`),
+  );
+}
+
+function configuredChannelSummary(device: SetupBinaryDeviceConfig): string {
+  const channels = device.channels
+    .filter((channel) => channel.enabled !== false)
+    .map((channel) => channel.channel_type);
+  return channels.length > 0 ? channels.join(",") : "(none)";
+}
+
+function deviceIdentityKey(device: SetupBinaryDeviceConfig): string {
+  const ch = primaryChannel(device);
+  const kind = ch?.kind ?? "camera";
+  const channelType = ch?.channel_type ?? "-";
+  return [kind, device.driver, device.id, channelType, "-"].join("|");
 }
 
 function deviceRowLine(
@@ -912,6 +953,7 @@ function deviceRowLine(
   const rowDim = !selected;
   const isEditing = editingField === deviceNameFieldId(device.name);
   const renderedName = isEditing ? `${draftValue}|` : device.current.name;
+  const channelSummary = configuredChannelSummary(device.current);
   return buildDetailLine(`device:${device.name}`, [
     focusPrefix(focused, rowDim),
     textSegment("[", { dimColor: rowDim }),
@@ -943,6 +985,10 @@ function deviceRowLine(
     isEditing
       ? textSegment(" [Enter save, Esc cancel]", { color: "cyan" })
       : null,
+    textSegment(` | channels=${channelSummary}`, {
+      color: selected ? undefined : "gray",
+      dimColor: rowDim,
+    }),
     textSegment(` | ${deviceConfigurationSummary(device)}`, {
       color: selected ? undefined : "gray",
       dimColor: rowDim,
@@ -955,21 +1001,22 @@ function deviceDetails(
   selected: boolean,
   identifying: boolean,
 ): DetailLine[] {
+  const channelSummary = configuredChannelSummary(device.current);
   if (device.device_type === "camera") {
+    const ch = primaryChannel(device.current);
+    const transport = extraString(device.current.extra, "transport");
+    const iface = extraString(device.current.extra, "interface");
     return [
       buildDetailLine("focused-camera", [
         textSegment("Focused camera: ", { color: "cyan", bold: true }),
         textSegment(
           [
             `driver=${device.driver}`,
-            `stream=${device.current.stream ?? "default"}`,
-            `pixel=${device.current.pixel_format ?? "unknown"}`,
-            device.current.transport
-              ? `transport=${device.current.transport}`
-              : null,
-            device.current.interface
-              ? `interface=${device.current.interface}`
-              : null,
+            `channels=${channelSummary}`,
+            `channel=${ch?.channel_type ?? "default"}`,
+            `pixel=${cameraProfileFormatLabel(ch?.profile)}`,
+            transport ? `transport=${transport}` : null,
+            iface ? `interface=${iface}` : null,
           ]
             .filter(Boolean)
             .join(" | "),
@@ -1011,16 +1058,18 @@ function deviceDetails(
     ];
   }
 
-  const isAirbot = device.driver.startsWith("airbot-");
+  const transport = extraString(device.current.extra, "transport");
+  const iface = extraString(device.current.extra, "interface");
+  const productVariant = extraString(device.current.extra, "product_variant");
+  const endEffector = extraString(device.current.extra, "end_effector");
   const robotIdentity = [
     `driver=${device.driver}`,
-    isAirbot ? `sn=${device.id}` : `id=${device.id}`,
-    `interface=${device.current.interface ?? "n/a"}`,
-    `transport=${device.current.transport ?? "n/a"}`,
-    device.current.product_variant
-      ? `variant=${device.current.product_variant}`
-      : null,
-    device.current.end_effector ? `eef=${device.current.end_effector}` : null,
+    `id=${device.id}`,
+    `channels=${channelSummary}`,
+    `interface=${iface ?? "n/a"}`,
+    `transport=${transport ?? "n/a"}`,
+    productVariant ? `variant=${productVariant}` : null,
+    endEffector ? `eef=${endEffector}` : null,
   ]
     .filter(Boolean)
     .join(" | ");
@@ -1044,32 +1093,18 @@ function deviceDetails(
         ),
     selected
       ? identifying
-        ? isAirbot
-          ? noticeLine(
-              "robot-identify-active-airbot",
-              "Identify active",
-              "AIRBOT is in free-drive with the LED blinking orange.",
-              "yellow",
-            )
-          : noticeLine(
-              "robot-identify-active",
-              "Identify active",
-              "Live robot state is shown below.",
-              "yellow",
-            )
-        : isAirbot
-          ? noticeLine(
-              "robot-identify-hint-airbot",
-              "Identify",
-              "Press i to enter free-drive and blink the AIRBOT LED orange.",
-              "cyan",
-            )
-          : noticeLine(
-              "robot-identify-hint",
-              "Identify",
-              "Press i to start identify for the focused selected robot.",
-              "cyan",
-            )
+        ? noticeLine(
+            "robot-identify-active",
+            "Identify active",
+            "The focused robot channel is running in identifying mode.",
+            "yellow",
+          )
+        : noticeLine(
+            "robot-identify-hint",
+            "Identify",
+            "Press i to switch the focused selected robot channel into identifying mode.",
+            "cyan",
+          )
       : noticeLine(
           "robot-identify-disabled",
           "Identify locked",
@@ -1079,16 +1114,35 @@ function deviceDetails(
   ];
 }
 
+function extraString(extra: Record<string, unknown> | undefined, key: string): string | null {
+  const v = extra?.[key];
+  return typeof v === "string" ? v : null;
+}
+
+function cameraProfileFormatLabel(
+  profile:
+    | { pixel_format?: string | null; native_pixel_format?: string | null }
+    | null
+    | undefined,
+): string {
+  const outputFormat = profile?.pixel_format ?? "unknown";
+  const nativeFormat = profile?.native_pixel_format ?? null;
+  return nativeFormat && nativeFormat.toLowerCase() !== outputFormat.toLowerCase()
+    ? `${nativeFormat}->${outputFormat}`
+    : outputFormat;
+}
+
 function deviceConfigurationSummary(device: SetupAvailableDevice): string {
+  const ch = primaryChannel(device.current);
   if (device.device_type === "camera") {
-    const current = device.current;
-    return `${current.width ?? "?"}x${current.height ?? "?"} ${current.fps ?? "?"}fps ${current.pixel_format ?? "unknown"}`;
+    const p = ch?.profile;
+    return `${p?.width ?? "?"}x${p?.height ?? "?"} ${p?.fps ?? "?"}fps ${cameraProfileFormatLabel(p)}`;
   }
   const controlRate =
-    device.current.control_frequency_hz != null
-      ? `${device.current.control_frequency_hz}Hz`
+    ch?.control_frequency_hz != null
+      ? `${ch.control_frequency_hz}Hz`
       : "driver default";
-  return `${device.current.mode ?? "free-drive"} @ ${controlRate}`;
+  return `${ch?.mode ?? "free-drive"} @ ${controlRate}`;
 }
 
 function storageSummary(setupState: SetupStateMessage): string {

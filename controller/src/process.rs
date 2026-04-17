@@ -105,7 +105,6 @@ pub fn terminate_children(
     timeout: Duration,
     poll_interval: Duration,
 ) -> io::Result<()> {
-    request_graceful_shutdown(children)?;
     let deadline = Instant::now() + timeout;
 
     loop {
@@ -126,6 +125,29 @@ pub fn terminate_children(
         thread::sleep(poll_interval);
     }
 
+    request_terminate(children)?;
+    let terminate_grace = std::cmp::max(
+        poll_interval.checked_mul(5).unwrap_or(poll_interval),
+        Duration::from_secs(2),
+    );
+    let terminate_deadline = Instant::now() + terminate_grace;
+
+    loop {
+        let mut remaining_children = 0usize;
+        for child in children.iter_mut() {
+            if child.child.try_wait()?.is_none() {
+                remaining_children += 1;
+            }
+        }
+        if remaining_children == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= terminate_deadline {
+            break;
+        }
+        thread::sleep(poll_interval);
+    }
+
     for child in children.iter_mut() {
         if child.child.try_wait()?.is_none() {
             let _ = child.child.kill();
@@ -136,7 +158,7 @@ pub fn terminate_children(
     Ok(())
 }
 
-fn request_graceful_shutdown(children: &mut [ManagedChild]) -> io::Result<()> {
+fn request_terminate(children: &mut [ManagedChild]) -> io::Result<()> {
     for child in children.iter_mut() {
         if child.child.try_wait()?.is_none() {
             send_terminate_signal(child.child.id());

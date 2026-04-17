@@ -47,8 +47,12 @@ export interface WebSocketState {
   send: (msg: string) => void;
 }
 
-const RECONNECT_DELAYS = [1000, 2000, 4000, 10000]; // exponential backoff
+// First delay is 0: `rollio setup` identify swaps the visualizer, so the socket drops
+// briefly; a 1s first backoff made reconnect feel frozen (~1s close→open).
+const RECONNECT_DELAYS = [0, 200, 800, 3000, 10000];
 const BATCH_INTERVAL_MS = 16; // ~60fps state flush
+/** Cap queued commands while the socket is down (setup preview swap, reconnect). */
+const MAX_PENDING_OUTBOUND = 256;
 
 /**
  * React hook that manages a WebSocket connection to the Visualizer.
@@ -83,11 +87,17 @@ export function useWebSocket(url: string): WebSocketState {
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
+  const pendingOutboundRef = useRef<string[]>([]);
 
   const send = useCallback((msg: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(msg);
+      return;
     }
+    while (pendingOutboundRef.current.length >= MAX_PENDING_OUTBOUND) {
+      pendingOutboundRef.current.shift();
+    }
+    pendingOutboundRef.current.push(msg);
   }, []);
 
   useEffect(() => {
@@ -123,19 +133,37 @@ export function useWebSocket(url: string): WebSocketState {
       }
     }, 1000);
 
+    function flushPendingOutbound() {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const q = pendingOutboundRef.current;
+      while (q.length > 0) {
+        const m = q.shift();
+        if (m) {
+          ws.send(m);
+        }
+      }
+    }
+
     function clearLiveState() {
       framesRef.current = new Map();
       robotStatesRef.current = new Map();
       streamInfoRef.current = null;
       episodeStatusRef.current = null;
-      setupStateRef.current = null;
+      // Keep the last setup_state on disconnect. During `rollio setup`, the
+      // controller swaps the bridge visualizer for the preview stack when
+      // entering identify/preview; the socket drops briefly and reconnects.
+      // Clearing setup state would null React state and disable all keyboard
+      // handling in SetupApp until the next state message (useInput bails on
+      // !setupState). Fresh state still arrives after reconnect via polling.
       frameSequenceRef.current = 0;
       dirtyRef.current = true;
       setFrames(new Map());
       setRobotStates(new Map());
       setStreamInfo(null);
       setEpisodeStatus(null);
-      setSetupState(null);
       setGauge("ws.frame_count", 0);
       setGauge("ws.robot_state_count", 0);
     }
@@ -154,6 +182,7 @@ export function useWebSocket(url: string): WebSocketState {
         setConnected(true);
         setGauge("ws.connected", "Connected");
         ws.send(encodeCommand("get_stream_info"));
+        flushPendingOutbound();
       });
 
       ws.on("message", (data: Buffer | string, isBinary: boolean) => {
@@ -259,6 +288,7 @@ export function useWebSocket(url: string): WebSocketState {
 
     return () => {
       mountedRef.current = false;
+      pendingOutboundRef.current = [];
       clearInterval(flushInterval);
       clearInterval(streamInfoInterval);
       if (reconnectTimerRef.current) {

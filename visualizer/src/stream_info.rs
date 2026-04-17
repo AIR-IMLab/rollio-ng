@@ -24,27 +24,27 @@ pub struct StreamInfoRegistry {
 struct CameraRuntimeInfo {
     source_width: Option<u32>,
     source_height: Option<u32>,
-    latest_timestamp_ns: Option<u64>,
+    latest_timestamp_ms: Option<u64>,
     latest_frame_index: Option<u64>,
     source_fps_estimate: Option<f64>,
     published_fps_estimate: Option<f64>,
     last_source_sample: Option<FpsSample>,
     last_published_sample: Option<FpsSample>,
     published_frame_count: u64,
-    last_published_timestamp_ns: Option<u64>,
+    last_published_timestamp_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct FpsSample {
     counter: u64,
-    timestamp_ns: u64,
+    timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamInfoSnapshot {
     #[serde(rename = "type")]
     pub msg_type: &'static str,
-    pub server_timestamp_ns: u64,
+    pub server_timestamp_ms: u64,
     pub configured_preview_fps: u32,
     pub max_preview_width: u32,
     pub max_preview_height: u32,
@@ -61,11 +61,11 @@ pub struct CameraInfoSnapshot {
     pub name: String,
     pub source_width: Option<u32>,
     pub source_height: Option<u32>,
-    pub latest_timestamp_ns: Option<u64>,
+    pub latest_timestamp_ms: Option<u64>,
     pub latest_frame_index: Option<u64>,
     pub source_fps_estimate: Option<f64>,
     pub published_fps_estimate: Option<f64>,
-    pub last_published_timestamp_ns: Option<u64>,
+    pub last_published_timestamp_ms: Option<u64>,
 }
 
 impl StreamInfoRegistry {
@@ -106,26 +106,26 @@ impl StreamInfoRegistry {
         let camera = self.camera_entry(name);
         camera.source_width = Some(header.width);
         camera.source_height = Some(header.height);
-        camera.latest_timestamp_ns = Some(header.timestamp_ns);
+        camera.latest_timestamp_ms = Some(header.timestamp_ms);
         camera.latest_frame_index = Some(header.frame_index);
         update_fps_estimate(
             &mut camera.source_fps_estimate,
             &mut camera.last_source_sample,
             header.frame_index,
-            header.timestamp_ns,
+            header.timestamp_ms,
         );
     }
 
     pub fn observe_published_frame(&mut self, name: &str) {
         let camera = self.camera_entry(name);
         camera.published_frame_count = camera.published_frame_count.saturating_add(1);
-        let now_ns = wall_time_ns();
-        camera.last_published_timestamp_ns = Some(now_ns);
+        let now_ms = wall_time_ms();
+        camera.last_published_timestamp_ms = Some(now_ms);
         update_fps_estimate(
             &mut camera.published_fps_estimate,
             &mut camera.last_published_sample,
             camera.published_frame_count,
-            now_ns,
+            now_ms,
         );
     }
 
@@ -137,18 +137,18 @@ impl StreamInfoRegistry {
                 name: name.clone(),
                 source_width: camera.and_then(|info| info.source_width),
                 source_height: camera.and_then(|info| info.source_height),
-                latest_timestamp_ns: camera.and_then(|info| info.latest_timestamp_ns),
+                latest_timestamp_ms: camera.and_then(|info| info.latest_timestamp_ms),
                 latest_frame_index: camera.and_then(|info| info.latest_frame_index),
                 source_fps_estimate: camera.and_then(|info| info.source_fps_estimate),
                 published_fps_estimate: camera.and_then(|info| info.published_fps_estimate),
-                last_published_timestamp_ns: camera
-                    .and_then(|info| info.last_published_timestamp_ns),
+                last_published_timestamp_ms: camera
+                    .and_then(|info| info.last_published_timestamp_ms),
             });
         }
 
         StreamInfoSnapshot {
             msg_type: "stream_info",
-            server_timestamp_ns: wall_time_ns(),
+            server_timestamp_ms: wall_time_ms(),
             configured_preview_fps: self.configured_preview_fps,
             max_preview_width: self.max_preview_width,
             max_preview_height: self.max_preview_height,
@@ -177,13 +177,13 @@ fn update_fps_estimate(
     fps_estimate: &mut Option<f64>,
     last_sample: &mut Option<FpsSample>,
     counter: u64,
-    timestamp_ns: u64,
+    timestamp_ms: u64,
 ) {
     if let Some(previous) = last_sample {
         let counter_delta = counter.saturating_sub(previous.counter);
-        let time_delta_ns = timestamp_ns.saturating_sub(previous.timestamp_ns);
-        if counter_delta > 0 && time_delta_ns > 0 {
-            let instant_fps = counter_delta as f64 / (time_delta_ns as f64 / 1_000_000_000.0);
+        let time_delta_ms = timestamp_ms.saturating_sub(previous.timestamp_ms);
+        if counter_delta > 0 && time_delta_ms > 0 {
+            let instant_fps = counter_delta as f64 / (time_delta_ms as f64 / 1_000.0);
             *fps_estimate = Some(match *fps_estimate {
                 Some(current) => current * (1.0 - FPS_EMA_ALPHA) + instant_fps * FPS_EMA_ALPHA,
                 None => instant_fps,
@@ -193,13 +193,13 @@ fn update_fps_estimate(
 
     *last_sample = Some(FpsSample {
         counter,
-        timestamp_ns,
+        timestamp_ms,
     });
 }
 
-fn wall_time_ns() -> u64 {
+fn wall_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos() as u64
+        .as_millis() as u64
 }
