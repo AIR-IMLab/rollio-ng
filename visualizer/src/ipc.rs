@@ -25,6 +25,8 @@ pub enum IpcMessage {
         state_kind: RobotStateKind,
         timestamp_ms: u64,
         values: Vec<f64>,
+        value_min: Vec<f64>,
+        value_max: Vec<f64>,
     },
 }
 
@@ -44,6 +46,8 @@ struct CameraSubscriber {
 struct RobotSubscriber {
     name: String,
     state_kind: RobotStateKind,
+    value_min: Vec<f64>,
+    value_max: Vec<f64>,
     subscriber: RobotStateSubscriber,
 }
 
@@ -121,8 +125,15 @@ impl IpcPoller {
 
             log::info!("subscribed to robot: {service_name_str}");
             robot_subs.push(RobotSubscriber {
-                name: robot_source_name(source),
+                // Always key on the channel id so the UI can group every
+                // state-kind belonging to one channel into a single panel.
+                // The previous "channel_id/<state_kind>" naming made grouping
+                // ambiguous and forced consumers to special-case
+                // joint_position vs the rest.
+                name: source.channel_id.clone(),
                 state_kind: source.state_kind,
+                value_min: source.value_min.clone(),
+                value_max: source.value_max.clone(),
                 subscriber,
             });
         }
@@ -191,6 +202,8 @@ impl IpcPoller {
                                 state_kind: robot.state_kind,
                                 timestamp_ms: payload.timestamp_ms,
                                 values: payload.values[..payload.len as usize].to_vec(),
+                                value_min: robot.value_min.clone(),
+                                value_max: robot.value_max.clone(),
                             });
                         }
                         Ok(None) => break,
@@ -207,6 +220,8 @@ impl IpcPoller {
                                 state_kind: robot.state_kind,
                                 timestamp_ms: payload.timestamp_ms,
                                 values: payload.values[..payload.len as usize].to_vec(),
+                                value_min: robot.value_min.clone(),
+                                value_max: robot.value_max.clone(),
                             });
                         }
                         Ok(None) => break,
@@ -223,6 +238,8 @@ impl IpcPoller {
                                 state_kind: robot.state_kind,
                                 timestamp_ms: payload.timestamp_ms,
                                 values: payload.values.to_vec(),
+                                value_min: robot.value_min.clone(),
+                                value_max: robot.value_max.clone(),
                             });
                         }
                         Ok(None) => break,
@@ -267,9 +284,3 @@ impl IpcPoller {
     }
 }
 
-fn robot_source_name(source: &VisualizerRobotSourceConfig) -> String {
-    match source.state_kind {
-        RobotStateKind::JointPosition => source.channel_id.clone(),
-        other => format!("{}/{}", source.channel_id, other.topic_suffix()),
-    }
-}

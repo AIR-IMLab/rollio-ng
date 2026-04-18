@@ -22,9 +22,9 @@ publish_states = []
 recorded_states = []
 
 [devices.channels.profile]
-width = 640
-height = 480
-fps = 60
+width = 1920
+height = 1080
+fps = 30
 pixel_format = "rgb24"
 
 [devices.channels.command_defaults]
@@ -42,9 +42,9 @@ publish_states = []
 recorded_states = []
 
 [devices.channels.profile]
-width = 1280
-height = 720
-fps = 30
+width = 640
+height = 480
+fps = 90
 pixel_format = "depth16"
 
 [devices.channels.command_defaults]
@@ -63,7 +63,7 @@ recorded_states = []
 
 [devices.channels.profile]
 width = 1280
-height = 720
+height = 800
 fps = 30
 pixel_format = "gray8"
 
@@ -91,7 +91,7 @@ recorded_states = []
 
 [devices.channels.profile]
 width = 1280
-height = 720
+height = 960
 fps = 30
 pixel_format = "rgb24"
 native_pixel_format = "MJPG"
@@ -119,8 +119,8 @@ publish_states = []
 recorded_states = []
 
 [devices.channels.profile]
-width = 1280
-height = 720
+width = 1920
+height = 1080
 fps = 30
 pixel_format = "rgb24"
 native_pixel_format = "MJPG"
@@ -145,7 +145,7 @@ transport = "can"
 channel_type = "arm"
 kind = "robot"
 enabled = true
-name = "airbot_play_arm_1"
+name = "airbot_play_arm"
 channel_label = "AIRBOT Play"
 mode = "free-drive"
 dof = 6
@@ -203,7 +203,7 @@ transport = "can"
 channel_type = "arm"
 kind = "robot"
 enabled = true
-name = "airbot_play_arm_2"
+name = "airbot_play_arm"
 channel_label = "AIRBOT Play"
 mode = "command-following"
 dof = 6
@@ -297,7 +297,7 @@ encoded_handoff = "file"
 
 [storage]
 backend = "local"
-output_path = "./output_2"
+output_path = "./output_123"
 queue_size = 32
 
 [monitor]
@@ -317,7 +317,7 @@ jpeg_quality = 30
 preview_fps = 60
 
 [ui]
-http_host = "0.0.0.0"
+http_host = "127.0.0.1"
 http_port = 3000
 start_key = "s"
 stop_key = "e"

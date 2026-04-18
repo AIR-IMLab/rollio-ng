@@ -71,20 +71,55 @@ interface PreparedRaster {
   height: number;
 }
 
+/// Aspect ratio (width / height) every camera tile should honour.
+/// Matches the user-spec "16:10 viewing box" requirement so each tile
+/// always presents the same shape regardless of how many cameras are
+/// active or how the terminal is sized.
+const CAMERA_BOX_ASPECT = 16 / 10;
+/// Minimum cell width inside a tile so the bar / label / image still
+/// renders legibly when the available space is small.
+const MIN_CAMERA_CELL_COLUMNS = 8;
+const MIN_CAMERA_CELL_ROWS = 4;
+
 function describeCameraCellGrid(
   totalWidth: number,
   panelHeight: number,
   numCameras: number,
+  cellGeometry: AsciiCellGeometry,
 ): Pick<CameraPreviewRaster, "columns" | "rows"> {
   const safeCameraCount = Math.max(1, numCameras);
   const innerSeparators = safeCameraCount - 1;
-  return {
-    columns: Math.max(
-      4,
-      Math.floor((totalWidth - 2 - innerSeparators) / safeCameraCount),
-    ),
-    rows: Math.max(1, panelHeight - 2),
-  };
+  const availableColumns = Math.max(
+    MIN_CAMERA_CELL_COLUMNS,
+    Math.floor((totalWidth - 2 - innerSeparators) / safeCameraCount),
+  );
+  const availableRows = Math.max(MIN_CAMERA_CELL_ROWS, panelHeight - 2);
+  // Convert the requested 16:10 *visual* aspect into a cell-grid columns:rows
+  // ratio. Terminal cells are typically taller than they are wide
+  // (pixelHeight > pixelWidth), so a 16:10 visual box needs more columns
+  // than rows in the grid: cols/rows = aspect * (cellPixelHeight / cellPixelWidth).
+  const cellPixelAspect =
+    cellGeometry.pixelHeight > 0 && cellGeometry.pixelWidth > 0
+      ? cellGeometry.pixelHeight / cellGeometry.pixelWidth
+      : 2;
+  const targetColsPerRow = CAMERA_BOX_ASPECT * cellPixelAspect;
+  // Try the height-bound layout first (use all available rows, derive cols)
+  // and fall back to the width-bound layout if it would overflow available
+  // columns. The smaller of the two wins so we never exceed the panel.
+  const heightBoundCols = Math.floor(availableRows * targetColsPerRow);
+  let columns: number;
+  let rows: number;
+  if (heightBoundCols <= availableColumns) {
+    columns = Math.max(MIN_CAMERA_CELL_COLUMNS, heightBoundCols);
+    rows = availableRows;
+  } else {
+    columns = availableColumns;
+    rows = Math.max(
+      MIN_CAMERA_CELL_ROWS,
+      Math.floor(availableColumns / targetColsPerRow),
+    );
+  }
+  return { columns, rows };
 }
 
 export function describeCameraPreviewRaster(
@@ -94,7 +129,7 @@ export function describeCameraPreviewRaster(
   cellGeometry: AsciiCellGeometry,
   rendererId: AsciiRendererId,
 ): CameraPreviewRaster {
-  const grid = describeCameraCellGrid(totalWidth, panelHeight, numCameras);
+  const grid = describeCameraCellGrid(totalWidth, panelHeight, numCameras, cellGeometry);
   const raster = createAsciiRendererBackend(rendererId, {
     cellGeometry,
   }).describeRaster({
@@ -842,6 +877,12 @@ async function resizePreparedRaster(
   targetHeight: number,
   channels: 1 | 3,
 ): Promise<PreparedRaster> {
+  // `fit: "contain"` keeps the source image's native aspect ratio inside
+  // the camera tile and pads the unused area with the black background
+  // configured below. This honours the user-spec "no stretching" rule:
+  // the 16:10 viewing box is fixed by the cell-grid layout while the
+  // captured frame is letterboxed/pillarboxed inside it instead of being
+  // cropped or distorted.
   let pipeline = sharp(data, {
     raw: {
       width: sourceWidth,
@@ -850,7 +891,7 @@ async function resizePreparedRaster(
     },
   })
     .resize(targetWidth, targetHeight, {
-      fit: "cover",
+      fit: "contain",
       position: "centre",
       background: BLACK_BACKGROUND,
       kernel: sharp.kernel.nearest,

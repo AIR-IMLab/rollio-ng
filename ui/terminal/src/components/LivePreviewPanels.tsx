@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef } from "react";
 import { Box } from "ink";
-import { encodeSetPreviewSize, type RobotStateMessage, type StreamInfoMessage } from "../lib/protocol.js";
-import type { CameraFrame } from "../lib/websocket.js";
+import { encodeSetPreviewSize, type StreamInfoMessage } from "../lib/protocol.js";
+import type { AggregatedRobotChannel, CameraFrame } from "../lib/websocket.js";
 import { resolveCameraNames } from "../lib/camera-layout.js";
 import { CameraRow, describeCameraPreviewRaster } from "./StreamPanel.js";
 import { InfoPanel } from "./InfoPanel.js";
@@ -10,7 +10,7 @@ import type { AsciiCellGeometry, AsciiRendererId } from "../lib/renderers/index.
 
 interface LivePreviewPanelsProps {
   frames: Map<string, CameraFrame>;
-  robotStates: Map<string, RobotStateMessage>;
+  robotChannels: Map<string, AggregatedRobotChannel>;
   streamInfo: StreamInfoMessage | null;
   connected: boolean;
   send: (msg: string) => void;
@@ -24,7 +24,7 @@ interface LivePreviewPanelsProps {
 
 export function LivePreviewPanels({
   frames,
-  robotStates,
+  robotChannels,
   streamInfo,
   connected,
   send,
@@ -109,8 +109,9 @@ export function LivePreviewPanels({
             : "n/a";
       lines.push(pad(`  ${name}  ${resolution}`) + "│");
     }
-    for (const [name, state] of robotStates) {
-      lines.push(pad(`  ${name}  ${state.num_joints} DoF`) + "│");
+    for (const [name, channel] of robotChannels) {
+      const dof = inferDofForInfoLine(channel);
+      lines.push(pad(`  ${name}  ${dof} DoF`) + "│");
     }
     lines.push(pad("") + "│");
     lines.push(pad(` WS: ${connected ? "Connected" : "Disconnected"}`) + "│");
@@ -129,9 +130,9 @@ export function LivePreviewPanels({
     frames,
     infoPanelWidth,
     isWide,
-    robotStates,
+    robotChannels,
   ]);
-  const robotEntries = Array.from(robotStates.entries());
+  const robotEntries = Array.from(robotChannels.entries());
 
   useEffect(() => {
     if (!connected) {
@@ -185,24 +186,20 @@ export function LivePreviewPanels({
 
       <Box flexDirection="column">
         {robotEntries.length > 0 ? (
-          robotEntries.map(([name, state]) => (
+          robotEntries.map(([name, channel]) => (
             <RobotStatePanel
               key={name}
-              name={name}
-              numJoints={state.num_joints}
-              positions={state.positions}
-              endEffectorStatus={state.end_effector_status}
-              endEffectorFeedbackValid={state.end_effector_feedback_valid}
+              channel={channel}
               panelWidth={contentWidth}
             />
           ))
         ) : hideEmptyRobotPanel ? null : (
           <RobotStatePanel
-            name="robot_0"
-            numJoints={0}
-            positions={[]}
-            endEffectorStatus={undefined}
-            endEffectorFeedbackValid={undefined}
+            channel={{
+              name: "robot_0",
+              states: {},
+              lastTimestampMs: 0,
+            }}
             panelWidth={contentWidth}
           />
         )}
@@ -211,7 +208,7 @@ export function LivePreviewPanels({
       {!isWide && (
         <InfoPanel
           frames={frames}
-          robotStates={robotStates}
+          robotChannels={robotChannels}
           streamInfo={streamInfo}
           connected={connected}
           orientation="horizontal"
@@ -233,4 +230,20 @@ function mergePreferredCameraNames(
     }
   }
   return names;
+}
+
+function inferDofForInfoLine(channel: AggregatedRobotChannel): number {
+  const sample =
+    channel.states.joint_position ??
+    channel.states.parallel_position ??
+    channel.states.end_effector_pose;
+  if (sample) {
+    return sample.numJoints || sample.values.length;
+  }
+  for (const value of Object.values(channel.states)) {
+    if (value) {
+      return value.numJoints || value.values.length;
+    }
+  }
+  return 0;
 }

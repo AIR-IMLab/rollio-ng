@@ -22,7 +22,8 @@ import {
 type StaticEditableFieldId =
   | "project_name"
   | "storage_output_path"
-  | "storage_endpoint";
+  | "storage_endpoint"
+  | "ui_http_host";
 type EditableFieldId = StaticEditableFieldId | `device_name:${string}`;
 
 type SettingsField = {
@@ -111,7 +112,7 @@ export function SetupApp({
     connected: previewConnected,
     send: sendPreview,
     frames,
-    robotStates,
+    robotChannels,
     streamInfo,
   } = usePreviewSocket(previewWebsocketUrl, previewExpected);
   // The wizard is "connected" in the user's eyes if the control plane is up;
@@ -487,7 +488,7 @@ export function SetupApp({
           <LivePreviewPanels
             key={livePanelsKey}
             frames={frames}
-            robotStates={robotStates}
+            robotChannels={robotChannels}
             streamInfo={streamInfo}
             connected={previewConnected}
             send={sendPreview}
@@ -560,14 +561,20 @@ function buildSettingsFields(setupState: SetupStateMessage | null): SettingsFiel
     {
       id: "video_codec",
       label: "RGB codec",
-      value: setupState.config.encoder.video_codec,
+      value: formatCodecBackend(
+        setupState.config.encoder.video_codec,
+        setupState.config.encoder.video_backend ?? setupState.config.encoder.backend,
+      ),
       kind: "cycle",
       action: "setup_cycle_video_codec",
     },
     {
       id: "depth_codec",
       label: "Depth codec",
-      value: setupState.config.encoder.depth_codec,
+      value: formatCodecBackend(
+        setupState.config.encoder.depth_codec,
+        setupState.config.encoder.depth_backend ?? setupState.config.encoder.backend,
+      ),
       kind: "cycle",
       action: "setup_cycle_depth_codec",
     },
@@ -594,7 +601,30 @@ function buildSettingsFields(setupState: SetupStateMessage | null): SettingsFiel
           ? "storage_output_path"
           : "storage_endpoint",
     },
+    {
+      id: "ui_http_host",
+      label: "UI host",
+      value: setupState.config.ui?.http_host ?? "",
+      kind: "text",
+      editableFieldId: "ui_http_host",
+    },
   ];
+}
+
+/** Render an `(EncoderCodec, EncoderBackend)` pair as a single human-readable
+ *  label, e.g. `"av1 (nvidia)"`. The wizard cycles through this combined
+ *  value so the operator can pick a specific encoder implementation in one
+ *  step. The backend is omitted when unset (e.g. very old configs that only
+ *  carried the legacy global `backend = auto`) so the label degrades to
+ *  just the codec name. */
+function formatCodecBackend(
+  codec: string,
+  backend: string | undefined,
+): string {
+  if (!backend) {
+    return codec;
+  }
+  return `${codec} (${backend})`;
 }
 
 function buildPreviewActions(setupState: SetupStateMessage | null): PreviewAction[] {
@@ -910,6 +940,7 @@ function editCommandForField(
   | "setup_set_project_name"
   | "setup_set_storage_output_path"
   | "setup_set_storage_endpoint"
+  | "setup_set_ui_http_host"
 > {
   switch (field) {
     case "project_name":
@@ -918,6 +949,8 @@ function editCommandForField(
       return "setup_set_storage_output_path";
     case "storage_endpoint":
       return "setup_set_storage_endpoint";
+    case "ui_http_host":
+      return "setup_set_ui_http_host";
   }
 }
 

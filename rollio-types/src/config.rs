@@ -254,13 +254,21 @@ impl Config {
         self.camera_devices()
             .map(|camera| {
                 let codec = self.encoder.codec_for_camera(camera);
+                let backend = camera
+                    .pixel_format
+                    .map(|pixel_format| self.encoder.backend_for_pixel_format(pixel_format))
+                    .unwrap_or(if camera.uses_depth_codec() {
+                        self.encoder.depth_backend
+                    } else {
+                        self.encoder.video_backend
+                    });
                 EncoderRuntimeConfig {
                     process_id: encoder_process_id(&camera.name),
                     camera_name: Some(camera.name.clone()),
                     frame_topic: Some(camera_frames_topic(&camera.name)),
                     output_dir: encoder_output_dir(&self.assembler.staging_dir, &camera.name),
                     codec,
-                    backend: self.encoder.backend,
+                    backend,
                     artifact_format: self.encoder.resolved_artifact_format_for(codec),
                     queue_size: self.encoder.queue_size,
                     fps: camera.fps.unwrap_or(self.episode.fps),
@@ -1418,8 +1426,21 @@ pub struct EncoderCapabilityReport {
 pub struct EncoderConfig {
     pub video_codec: EncoderCodec,
     pub depth_codec: EncoderCodec,
+    /// Legacy global backend hint. New code should prefer `video_backend`
+    /// and `depth_backend`; this field is preserved so older configs keep
+    /// loading and so the per-codec backends fall back to it when unset.
     #[serde(default)]
     pub backend: EncoderBackend,
+    /// Backend used for color (and Gray8 fallback) streams. Defaults to
+    /// `backend` when omitted from the saved TOML so existing configs keep
+    /// the same semantics.
+    #[serde(default)]
+    pub video_backend: EncoderBackend,
+    /// Backend used for depth streams. RVL is CPU-only by construction;
+    /// validation rejects non-CPU pairings with `Rvl` to catch
+    /// misconfiguration early.
+    #[serde(default)]
+    pub depth_backend: EncoderBackend,
     #[serde(default)]
     pub artifact_format: EncoderArtifactFormat,
     #[serde(default = "default_queue_size")]
@@ -1437,6 +1458,10 @@ struct EncoderConfigSerde {
     #[serde(default)]
     backend: EncoderBackend,
     #[serde(default)]
+    video_backend: Option<EncoderBackend>,
+    #[serde(default)]
+    depth_backend: Option<EncoderBackend>,
+    #[serde(default)]
     artifact_format: EncoderArtifactFormat,
     #[serde(default = "default_queue_size")]
     queue_size: u32,
@@ -1450,13 +1475,38 @@ impl From<EncoderConfigSerde> for EncoderConfig {
             .depth_codec
             .or(legacy_codec)
             .unwrap_or_else(default_depth_codec);
+        // Per-codec backends inherit from the legacy global field so
+        // existing TOML files keep producing exactly the same encoder
+        // configuration. The wizard always fills the per-codec fields
+        // explicitly going forward.
+        let video_backend = value.video_backend.unwrap_or(value.backend);
+        let depth_backend = value
+            .depth_backend
+            .unwrap_or_else(|| default_backend_for_codec(depth_codec, value.backend));
         Self {
             video_codec,
             depth_codec,
             backend: value.backend,
+            video_backend,
+            depth_backend,
             artifact_format: value.artifact_format,
             queue_size: value.queue_size,
         }
+    }
+}
+
+/// Pick a default backend for a codec when the saved TOML does not specify
+/// one explicitly. RVL has no GPU acceleration path, so we force CPU even
+/// when the legacy global `backend` requests something else; this avoids a
+/// validation error on a project that was migrated from the
+/// pre-per-codec-backend schema.
+fn default_backend_for_codec(codec: EncoderCodec, fallback: EncoderBackend) -> EncoderBackend {
+    if codec == EncoderCodec::Rvl
+        && matches!(fallback, EncoderBackend::Nvidia | EncoderBackend::Vaapi)
+    {
+        EncoderBackend::Cpu
+    } else {
+        fallback
     }
 }
 
@@ -1466,10 +1516,15 @@ fn default_queue_size() -> u32 {
 
 impl Default for EncoderConfig {
     fn default() -> Self {
+        let video_codec = EncoderCodec::default();
+        let depth_codec = default_depth_codec();
+        let backend = EncoderBackend::default();
         Self {
-            video_codec: EncoderCodec::default(),
-            depth_codec: default_depth_codec(),
-            backend: EncoderBackend::default(),
+            video_codec,
+            depth_codec,
+            backend,
+            video_backend: backend,
+            depth_backend: default_backend_for_codec(depth_codec, backend),
             artifact_format: EncoderArtifactFormat::default(),
             queue_size: default_queue_size(),
         }
@@ -1499,6 +1554,25 @@ impl EncoderConfig {
             // with `rvl requires depth16 frames, got Gray8`.
             PixelFormat::Gray8 => self.depth_codec_with_gray8_fallback(),
             _ => self.video_codec,
+        }
+    }
+
+    /// Resolve the encoder backend that should be paired with the codec
+    /// produced by [`Self::codec_for_pixel_format`]. Color streams use
+    /// `video_backend`; depth streams use `depth_backend`. Gray8 fallbacks
+    /// follow the same rule as the codec fallback so an infrared channel
+    /// re-routed to the video codec also gets the video backend.
+    pub fn backend_for_pixel_format(&self, pixel_format: PixelFormat) -> EncoderBackend {
+        match pixel_format {
+            PixelFormat::Depth16 => self.depth_backend,
+            PixelFormat::Gray8 => {
+                if self.depth_codec == EncoderCodec::Rvl {
+                    self.video_backend
+                } else {
+                    self.depth_backend
+                }
+            }
+            _ => self.video_backend,
         }
     }
 
@@ -1536,18 +1610,23 @@ impl EncoderConfig {
                 "encoder: queue_size must be > 0".into(),
             ));
         }
-        self.validate_codec("video_codec", self.video_codec)?;
-        self.validate_codec("depth_codec", self.depth_codec)?;
+        self.validate_codec("video_codec", self.video_codec, self.video_backend)?;
+        self.validate_codec("depth_codec", self.depth_codec, self.depth_backend)?;
         Ok(())
     }
 
-    fn validate_codec(&self, field_name: &str, codec: EncoderCodec) -> Result<(), ConfigError> {
-        if codec == EncoderCodec::Rvl && self.backend == EncoderBackend::Vaapi {
+    fn validate_codec(
+        &self,
+        field_name: &str,
+        codec: EncoderCodec,
+        backend: EncoderBackend,
+    ) -> Result<(), ConfigError> {
+        if codec == EncoderCodec::Rvl && backend == EncoderBackend::Vaapi {
             return Err(ConfigError::Validation(format!(
                 "encoder: {field_name}=rvl only supports cpu or auto backends"
             )));
         }
-        if codec == EncoderCodec::Rvl && self.backend == EncoderBackend::Nvidia {
+        if codec == EncoderCodec::Rvl && backend == EncoderBackend::Nvidia {
             return Err(ConfigError::Validation(format!(
                 "encoder: {field_name}=rvl only supports cpu or auto backends"
             )));
@@ -1607,6 +1686,8 @@ impl EncoderRuntimeConfig {
             video_codec: self.codec,
             depth_codec: self.codec,
             backend: self.backend,
+            video_backend: self.backend,
+            depth_backend: self.backend,
             artifact_format: self.artifact_format,
             queue_size: self.queue_size,
         }
@@ -1667,6 +1748,8 @@ impl EncoderRuntimeConfig {
             video_codec: self.codec,
             depth_codec: self.codec,
             backend: self.backend,
+            video_backend: self.backend,
+            depth_backend: self.backend,
             artifact_format: self.artifact_format,
             queue_size: self.queue_size,
         }
@@ -1966,7 +2049,10 @@ pub struct UiRuntimeConfig {
 }
 
 fn default_ui_http_host() -> String {
-    "127.0.0.1".into()
+    // `0.0.0.0` so the UI server is reachable from every interface by
+    // default. Operators that want to lock it down to loopback can edit
+    // the field in the wizard's settings step (or the saved TOML).
+    "0.0.0.0".into()
 }
 
 fn default_ui_http_port() -> u16 {
@@ -2427,6 +2513,11 @@ pub struct DeviceChannelConfigV2 {
     pub profile: Option<CameraChannelProfile>,
     #[serde(default)]
     pub command_defaults: ChannelCommandDefaults,
+    /// Hardware-reported value limits for each published state kind.
+    /// Persisted in the project config so the visualization layer can render
+    /// limit-aware bars without re-querying the device on every restart.
+    #[serde(default)]
+    pub value_limits: Vec<StateValueLimitsEntry>,
     #[serde(flatten, default)]
     pub extra: toml::Table,
 }
@@ -2634,9 +2725,13 @@ impl ChannelCommandDefaults {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RobotStateKind {
+    /// `JointPosition` is the default so `StateValueLimitsEntry::default()`
+    /// (used by serde when the entry is absent or partially specified) does
+    /// not silently bind the wrong kind.
+    #[default]
     JointPosition,
     JointVelocity,
     JointEffort,
@@ -2702,6 +2797,50 @@ impl RobotCommandKind {
 
     pub fn uses_pose_payload(self) -> bool {
         matches!(self, Self::EndPose)
+    }
+}
+
+/// Per-state value limits for visualization and (future) safety checks.
+///
+/// Each entry binds a `RobotStateKind` to per-element `min`/`max` bounds.
+/// Lengths should match `RobotStateKind::value_len(dof)` when the limits
+/// originate from the robot driver, but consumers must tolerate empty or
+/// shorter slices and fall back to sensible defaults (the visualization
+/// layer treats missing values as "unknown" and uses fallback ranges).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct StateValueLimitsEntry {
+    pub state_kind: RobotStateKind,
+    #[serde(default)]
+    pub min: Vec<f64>,
+    #[serde(default)]
+    pub max: Vec<f64>,
+}
+
+impl StateValueLimitsEntry {
+    pub fn new(state_kind: RobotStateKind, min: Vec<f64>, max: Vec<f64>) -> Self {
+        Self {
+            state_kind,
+            min,
+            max,
+        }
+    }
+
+    /// Symmetric ±`bound` limits of length `len` (e.g. ±π for joint position).
+    pub fn symmetric(state_kind: RobotStateKind, bound: f64, len: usize) -> Self {
+        Self {
+            state_kind,
+            min: vec![-bound; len],
+            max: vec![bound; len],
+        }
+    }
+
+    /// Asymmetric `[min, max]` limits applied uniformly to every element.
+    pub fn uniform(state_kind: RobotStateKind, min: f64, max: f64, len: usize) -> Self {
+        Self {
+            state_kind,
+            min: vec![min; len],
+            max: vec![max; len],
+        }
     }
 }
 
@@ -2851,6 +2990,13 @@ pub struct VisualizerRobotSourceConfig {
     pub channel_id: String,
     pub state_kind: RobotStateKind,
     pub state_topic: String,
+    /// Optional per-element value bounds for this state kind. The visualizer
+    /// forwards them to the UI so bars can be normalized against the real
+    /// hardware envelope instead of an arbitrary fallback.
+    #[serde(default)]
+    pub value_min: Vec<f64>,
+    #[serde(default)]
+    pub value_max: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2917,6 +3063,27 @@ pub struct TeleopRuntimeConfigV2 {
     pub leader_state_topic: String,
     pub follower_command_kind: RobotCommandKind,
     pub follower_command_topic: String,
+    /// Optional follower-state subscription used by the initial syncing
+    /// phase so the router can ramp commands toward the leader at
+    /// `sync_max_step_rad` per cycle until the follower is within
+    /// `sync_complete_threshold_rad` on every joint. Set to `None` for
+    /// pure pass-through behaviour (legacy).
+    #[serde(default)]
+    pub follower_state_kind: Option<RobotStateKind>,
+    #[serde(default)]
+    pub follower_state_topic: Option<String>,
+    /// Maximum per-cycle step (rad) while the follower is still syncing
+    /// toward the leader. Defaults to 0.005 rad (~0.29°).
+    #[serde(default)]
+    pub sync_max_step_rad: Option<f64>,
+    /// Once `max(|leader[i] - follower[i]|) <= threshold` for every joint,
+    /// the router exits the syncing phase and forwards leader targets
+    /// directly. Defaults to 0.05 rad (~2.86°) — large enough that an
+    /// operator does not have to perfectly align the two arms before
+    /// teleop kicks in, but still tight enough that the follower has
+    /// visibly reached the leader's pose by the time pass-through engages.
+    #[serde(default)]
+    pub sync_complete_threshold_rad: Option<f64>,
     #[serde(default = "default_mapping")]
     pub mapping: MappingStrategy,
     #[serde(default)]
@@ -2926,6 +3093,29 @@ pub struct TeleopRuntimeConfigV2 {
     #[serde(default)]
     pub command_defaults: ChannelCommandDefaults,
 }
+
+/// Default maximum per-cycle joint step (rad) while syncing the follower
+/// toward the leader. Conservative value chosen to avoid jerky motion at
+/// 250 Hz control rates (~1.25 rad/s peak slewing speed).
+pub const DEFAULT_TELEOP_SYNC_MAX_STEP_RAD: f64 = 0.005;
+/// Default per-joint distance under which the syncing phase is considered
+/// complete and pass-through forwarding takes over. Picked to be loose
+/// enough that operators do not have to align the leader and follower
+/// arms perfectly before teleop engages, while still tight enough that
+/// the follower has visibly tracked the leader by the time the router
+/// switches modes.
+pub const DEFAULT_TELEOP_SYNC_COMPLETE_THRESHOLD_RAD: f64 = 0.05;
+
+/// Maximum number of camera channels exposed to the live preview pipeline.
+///
+/// The visualizer subscribes to at most this many camera channels and the
+/// terminal / web UIs render at most this many tiles. Configuring more
+/// camera channels keeps them in the recording pipeline (encoder + assembler
+/// still subscribe to every enabled channel) but the visual feedback area
+/// stays compact and bounded so each tile keeps the requested 16:10 box
+/// without becoming unreadably small. Encoded as a `u32` for trivial FFI
+/// compatibility with the C++ camera drivers.
+pub const MAX_PREVIEW_CAMERAS: usize = 3;
 
 impl TeleopRuntimeConfigV2 {
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
@@ -2998,6 +3188,8 @@ impl EncoderRuntimeConfigV2 {
             video_codec: self.codec,
             depth_codec: self.codec,
             backend: self.backend,
+            video_backend: self.backend,
+            depth_backend: self.backend,
             artifact_format: self.artifact_format,
             queue_size: self.queue_size,
         }
@@ -3044,6 +3236,8 @@ impl EncoderRuntimeConfigV2 {
             video_codec: self.codec,
             depth_codec: self.codec,
             backend: self.backend,
+            video_backend: self.backend,
+            depth_backend: self.backend,
             artifact_format: self.artifact_format,
             queue_size: self.queue_size,
         }
@@ -3196,6 +3390,11 @@ pub struct DeviceQueryChannel {
     pub direct_joint_compatibility: DirectJointCompatibility,
     #[serde(default)]
     pub defaults: ChannelCommandDefaults,
+    /// Per-state value limits reported by the driver. The controller
+    /// persists these on the channel config so the visualizer can render
+    /// limit-aware bars and (later) the safety layer can clip targets.
+    #[serde(default)]
+    pub value_limits: Vec<StateValueLimitsEntry>,
     #[serde(default)]
     pub optional_info: toml::Table,
 }
@@ -3243,6 +3442,7 @@ pub struct ResolvedRobotChannel {
     pub recorded_states: Vec<RobotStateKind>,
     pub control_frequency_hz: f64,
     pub command_defaults: ChannelCommandDefaults,
+    pub value_limits: Vec<StateValueLimitsEntry>,
 }
 
 impl ProjectConfig {
@@ -3402,6 +3602,7 @@ impl ProjectConfig {
                     recorded_states,
                     control_frequency_hz: channel.control_frequency_hz.unwrap_or(60.0),
                     command_defaults: channel.command_defaults.clone(),
+                    value_limits: channel.value_limits.clone(),
                 });
             }
         }
@@ -3418,9 +3619,15 @@ impl ProjectConfig {
     }
 
     pub fn visualizer_runtime_config_v2(&self) -> VisualizerRuntimeConfigV2 {
+        // Cap preview camera sources at MAX_PREVIEW_CAMERAS so the per-tile
+        // raster stays large enough to honour the 16:10 box constraint. The
+        // encoder / assembler runtime configs are unaffected, so every
+        // enabled camera is still recorded — only the live preview tiles
+        // shrink to a bounded set.
         let camera_sources = self
             .resolved_camera_channels()
             .into_iter()
+            .take(MAX_PREVIEW_CAMERAS)
             .map(|camera| VisualizerCameraSourceConfig {
                 channel_id: camera.channel_id,
                 frame_topic: camera.frame_topic,
@@ -3431,12 +3638,20 @@ impl ProjectConfig {
             .into_iter()
             .flat_map(|robot| {
                 let channel_id = robot.channel_id.clone();
+                let value_limits = robot.value_limits.clone();
                 robot.state_topics
                     .into_iter()
-                    .map(move |(state_kind, state_topic)| VisualizerRobotSourceConfig {
-                        channel_id: channel_id.clone(),
-                        state_kind,
-                        state_topic,
+                    .map(move |(state_kind, state_topic)| {
+                        let entry = value_limits
+                            .iter()
+                            .find(|entry| entry.state_kind == state_kind);
+                        VisualizerRobotSourceConfig {
+                            channel_id: channel_id.clone(),
+                            state_kind,
+                            state_topic,
+                            value_min: entry.map(|e| e.min.clone()).unwrap_or_default(),
+                            value_max: entry.map(|e| e.max.clone()).unwrap_or_default(),
+                        }
                     })
             })
             .collect();
@@ -3457,13 +3672,17 @@ impl ProjectConfig {
             .into_iter()
             .map(|camera| {
                 let codec = self.encoder.codec_for_pixel_format(camera.pixel_format);
+                // Per-codec backend so a project that wants e.g. nvidia
+                // for color and cpu for depth gets each encoder bound to
+                // the right device — no global field is good enough here.
+                let backend = self.encoder.backend_for_pixel_format(camera.pixel_format);
                 EncoderRuntimeConfigV2 {
                     process_id: encoder_process_id_v2(&camera.channel_id),
                     channel_id: camera.channel_id.clone(),
                     frame_topic: camera.frame_topic,
                     output_dir: encoder_output_dir_v2(&self.assembler.staging_dir, &camera.channel_id),
                     codec,
-                    backend: self.encoder.backend,
+                    backend,
                     artifact_format: self.encoder.resolved_artifact_format_for(codec),
                     queue_size: self.encoder.queue_size,
                     fps: camera.fps,
@@ -3558,6 +3777,29 @@ impl ProjectConfig {
                 let leader_device = self.device_named(&pairing.leader_device)?;
                 let follower_device = self.device_named(&pairing.follower_device)?;
                 let follower_channel = follower_device.channel_named(&pairing.follower_channel_type)?;
+                // Pick the follower state-kind that matches the command kind so
+                // the router can compute joint-space deltas during the initial
+                // sync phase (rate-limited steps until follower catches up).
+                let follower_state_kind = match pairing.follower_command {
+                    RobotCommandKind::JointPosition | RobotCommandKind::JointMit => {
+                        Some(RobotStateKind::JointPosition)
+                    }
+                    RobotCommandKind::ParallelPosition | RobotCommandKind::ParallelMit => {
+                        Some(RobotStateKind::ParallelPosition)
+                    }
+                    RobotCommandKind::EndPose => Some(RobotStateKind::EndEffectorPose),
+                };
+                let follower_state_topic = follower_state_kind.and_then(|kind| {
+                    if follower_channel.publish_states.contains(&kind) {
+                        Some(robot_state_topic_v2(
+                            &follower_device.bus_root,
+                            &pairing.follower_channel_type,
+                            kind,
+                        ))
+                    } else {
+                        None
+                    }
+                });
                 Some(TeleopRuntimeConfigV2 {
                     process_id: format!(
                         "teleop.{}.{}.to.{}.{}",
@@ -3586,6 +3828,12 @@ impl ProjectConfig {
                         &pairing.follower_channel_type,
                         pairing.follower_command,
                     ),
+                    follower_state_kind: follower_state_topic.is_some().then_some(
+                        follower_state_kind.expect("follower_state_kind set when topic resolved"),
+                    ),
+                    follower_state_topic,
+                    sync_max_step_rad: Some(DEFAULT_TELEOP_SYNC_MAX_STEP_RAD),
+                    sync_complete_threshold_rad: Some(DEFAULT_TELEOP_SYNC_COMPLETE_THRESHOLD_RAD),
                     mapping: pairing.mapping,
                     joint_index_map: pairing.joint_index_map.clone(),
                     joint_scales: pairing.joint_scales.clone(),

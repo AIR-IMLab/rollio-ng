@@ -28,6 +28,7 @@ import {
   parseBinaryMessage,
   parseJsonMessage,
   type EpisodeStatusMessage,
+  type RobotStateKind,
   type RobotStateMessage,
   type SetupStateMessage,
   type StreamInfoMessage,
@@ -48,6 +49,31 @@ export interface CameraFrame {
   frameIndex: number;
   receivedAtWallTimeMs: number;
   sequence: number;
+}
+
+/** A single state-kind sample retained for an aggregated robot channel. */
+export interface RobotChannelSample {
+  values: number[];
+  valueMin: number[];
+  valueMax: number[];
+  timestampMs: number;
+  numJoints: number;
+}
+
+/**
+ * Per-channel snapshot built from the per-state-kind `robot_state` messages.
+ * The UI renders one panel per `AggregatedRobotChannel` instead of one panel
+ * per (channel, state_kind) pair so joint position / velocity / effort rows
+ * for the same arm collapse into a single visual block.
+ */
+export interface AggregatedRobotChannel {
+  name: string;
+  states: Partial<Record<RobotStateKind, RobotChannelSample>>;
+  /** Latest non-zero timestamp across all kinds; useful for sorting. */
+  lastTimestampMs: number;
+  /** Optional end-effector lifecycle metadata reused from the legacy field. */
+  endEffectorStatus?: RobotStateMessage["end_effector_status"];
+  endEffectorFeedbackValid?: boolean;
 }
 
 /** Backoff schedule for both hooks. First retry is immediate so the preview
@@ -286,7 +312,7 @@ export interface PreviewSocketState {
   connected: boolean;
   send: (msg: string) => void;
   frames: Map<string, CameraFrame>;
-  robotStates: Map<string, RobotStateMessage>;
+  robotChannels: Map<string, AggregatedRobotChannel>;
   streamInfo: StreamInfoMessage | null;
 }
 
@@ -298,13 +324,15 @@ export function usePreviewSocket(
   const [frames, setFrames] = useState<Map<string, CameraFrame>>(
     () => new Map(),
   );
-  const [robotStates, setRobotStates] = useState<
-    Map<string, RobotStateMessage>
+  const [robotChannels, setRobotChannels] = useState<
+    Map<string, AggregatedRobotChannel>
   >(() => new Map());
   const [streamInfo, setStreamInfo] = useState<StreamInfoMessage | null>(null);
 
   const framesRef = useRef<Map<string, CameraFrame>>(new Map());
-  const robotStatesRef = useRef<Map<string, RobotStateMessage>>(new Map());
+  const robotChannelsRef = useRef<Map<string, AggregatedRobotChannel>>(
+    new Map(),
+  );
   const streamInfoRef = useRef<StreamInfoMessage | null>(null);
   const dirtyRef = useRef(false);
   const frameSequenceRef = useRef(0);
@@ -319,7 +347,7 @@ export function usePreviewSocket(
         // When the preview socket flaps, drop the live data; control state
         // is intentionally untouched (it's owned by the other socket).
         framesRef.current = new Map();
-        robotStatesRef.current = new Map();
+        robotChannelsRef.current = new Map();
         streamInfoRef.current = null;
         frameSequenceRef.current = 0;
         dirtyRef.current = true;
@@ -364,10 +392,10 @@ export function usePreviewSocket(
       const msg = parseJsonMessage(text);
       recordTiming("ws.parse.json", nowMs() - parseStartMs);
       if (msg?.type === "robot_state") {
-        robotStatesRef.current.set(msg.name, msg);
+        applyRobotStateSample(robotChannelsRef.current, msg);
         dirtyRef.current = true;
         incrementGauge("ws.robot_messages_total");
-        setGauge("ws.robot_state_count", robotStatesRef.current.size);
+        setGauge("ws.robot_state_count", robotChannelsRef.current.size);
       } else if (msg?.type === "stream_info") {
         streamInfoRef.current = msg;
         dirtyRef.current = true;
@@ -391,11 +419,11 @@ export function usePreviewSocket(
       const flushStartMs = nowMs();
       dirtyRef.current = false;
       setFrames(new Map(framesRef.current));
-      setRobotStates(new Map(robotStatesRef.current));
+      setRobotChannels(new Map(robotChannelsRef.current));
       setStreamInfo(streamInfoRef.current);
       recordTiming("ws.flush", nowMs() - flushStartMs);
       setGauge("ws.frame_count", framesRef.current.size);
-      setGauge("ws.robot_state_count", robotStatesRef.current.size);
+      setGauge("ws.robot_state_count", robotChannelsRef.current.size);
     }, BATCH_INTERVAL_MS);
 
     const streamInfoInterval = setInterval(() => {
@@ -411,5 +439,40 @@ export function usePreviewSocket(
     };
   }, [send]);
 
-  return { connected, send, frames, robotStates, streamInfo };
+  return { connected, send, frames, robotChannels, streamInfo };
+}
+
+/**
+ * Mutate `channels` in-place to merge a new per-state-kind sample.
+ *
+ * The visualizer emits one message per (channel, state_kind) pair, so we
+ * accumulate all kinds belonging to the same channel id under a single
+ * `AggregatedRobotChannel` entry. Old kinds for that channel are preserved
+ * across updates (joint_position arriving doesn't drop the last
+ * joint_velocity sample).
+ */
+function applyRobotStateSample(
+  channels: Map<string, AggregatedRobotChannel>,
+  msg: RobotStateMessage,
+): void {
+  const existing = channels.get(msg.name);
+  const sample: RobotChannelSample = {
+    values: msg.values,
+    valueMin: msg.value_min ?? [],
+    valueMax: msg.value_max ?? [],
+    timestampMs: msg.timestamp_ms,
+    numJoints: msg.num_joints,
+  };
+  const states: AggregatedRobotChannel["states"] = existing
+    ? { ...existing.states }
+    : {};
+  states[msg.state_kind] = sample;
+  channels.set(msg.name, {
+    name: msg.name,
+    states,
+    lastTimestampMs: Math.max(existing?.lastTimestampMs ?? 0, msg.timestamp_ms),
+    endEffectorStatus: msg.end_effector_status ?? existing?.endEffectorStatus,
+    endEffectorFeedbackValid:
+      msg.end_effector_feedback_valid ?? existing?.endEffectorFeedbackValid,
+  });
 }

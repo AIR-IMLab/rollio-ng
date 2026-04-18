@@ -4,6 +4,7 @@ use iceoryx2::prelude::*;
 use rollio_bus::CONTROL_EVENTS_SERVICE;
 use rollio_types::config::{
     MappingStrategy, RobotCommandKind, RobotStateKind, TeleopRuntimeConfigV2,
+    DEFAULT_TELEOP_SYNC_COMPLETE_THRESHOLD_RAD, DEFAULT_TELEOP_SYNC_MAX_STEP_RAD,
 };
 use rollio_types::messages::{
     ControlEvent, JointMitCommand15, JointVector15, ParallelMitCommand2, ParallelVector2, Pose7,
@@ -78,6 +79,131 @@ enum LeaderState {
     Pose(Pose7),
 }
 
+/// Two-phase teleop ramp:
+///
+/// 1. **Initial syncing** — every published command is clamped to within
+///    `max_step_rad` of the follower's current joint position so the arm
+///    eases into the leader's pose without snapping. Active until the
+///    follower lies within `complete_threshold_rad` of the leader on every
+///    joint, at which point the router transitions to pass-through.
+/// 2. **Pass-through** — the leader target is forwarded to the follower
+///    untouched, including jumps larger than `complete_threshold_rad`. The
+///    rationale (see user spec) is that smoothing big diffs at this stage
+///    would inject lag that the operator can't predict, which is more
+///    dangerous than letting the follower's lower-level controller decide
+///    how to track the new target.
+///
+/// Sync is automatically disabled when the configured kind is not joint /
+/// parallel position, or when no follower state subscription is available.
+struct SyncState {
+    synced: bool,
+    enabled: bool,
+    max_step: f64,
+    complete_threshold: f64,
+}
+
+impl SyncState {
+    fn new(config: &TeleopRuntimeConfigV2) -> Self {
+        let kind = config.follower_state_kind;
+        let supports_kind = matches!(
+            kind,
+            Some(RobotStateKind::JointPosition) | Some(RobotStateKind::ParallelPosition),
+        );
+        let has_topic = config.follower_state_topic.is_some();
+        let supports_command = matches!(
+            config.follower_command_kind,
+            RobotCommandKind::JointPosition
+                | RobotCommandKind::JointMit
+                | RobotCommandKind::ParallelPosition
+                | RobotCommandKind::ParallelMit,
+        );
+        let enabled = has_topic && supports_kind && supports_command;
+        Self {
+            synced: false,
+            enabled,
+            max_step: config
+                .sync_max_step_rad
+                .unwrap_or(DEFAULT_TELEOP_SYNC_MAX_STEP_RAD)
+                .abs()
+                .max(f64::EPSILON),
+            complete_threshold: config
+                .sync_complete_threshold_rad
+                .unwrap_or(DEFAULT_TELEOP_SYNC_COMPLETE_THRESHOLD_RAD)
+                .abs()
+                .max(0.0),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled && !self.synced
+    }
+
+    /// Mutate `command` in place so every joint is at most `max_step` away
+    /// from the corresponding follower joint, then mark the router as synced
+    /// once every joint difference is below `complete_threshold`.
+    fn apply(
+        &mut self,
+        command: &mut ForwardedCommand,
+        follower: Option<&LeaderState>,
+        _config: &TeleopRuntimeConfigV2,
+    ) {
+        let Some(follower_values) = follower_position_slice(follower) else {
+            // No follower feedback yet — fall back to pass-through this cycle
+            // and try again next time. We don't switch to "synced" because
+            // we still haven't proven the follower is close enough.
+            return;
+        };
+        let target = command_target_slice_mut(command);
+        let len = target.len().min(follower_values.len());
+        let mut max_diff = 0.0f64;
+        for i in 0..len {
+            let diff = target[i] - follower_values[i];
+            max_diff = max_diff.max(diff.abs());
+            let clamped = diff.clamp(-self.max_step, self.max_step);
+            target[i] = follower_values[i] + clamped;
+        }
+        if max_diff <= self.complete_threshold {
+            self.synced = true;
+            eprintln!(
+                "rollio-teleop-router: initial sync complete (max diff {:.4} rad <= threshold {:.4} rad)",
+                max_diff, self.complete_threshold
+            );
+        }
+    }
+}
+
+fn follower_position_slice(state: Option<&LeaderState>) -> Option<&[f64]> {
+    match state? {
+        LeaderState::Vector { values, .. } => Some(values.as_slice()),
+        LeaderState::Pose(_) => None,
+    }
+}
+
+/// Mutable view into the joint-target portion of a forwarded command. Pose
+/// commands are not rate-limited because the syncing phase only applies to
+/// joint-space mappings (see `SyncState::new`).
+fn command_target_slice_mut(command: &mut ForwardedCommand) -> &mut [f64] {
+    match command {
+        ForwardedCommand::JointPosition(payload) => {
+            let len = payload.len as usize;
+            &mut payload.values[..len]
+        }
+        ForwardedCommand::JointMit(payload) => {
+            let len = payload.len as usize;
+            &mut payload.position[..len]
+        }
+        ForwardedCommand::ParallelPosition(payload) => {
+            let len = payload.len as usize;
+            &mut payload.values[..len]
+        }
+        ForwardedCommand::ParallelMit(payload) => {
+            let len = payload.len as usize;
+            &mut payload.position[..len]
+        }
+        ForwardedCommand::EndPose(_) => &mut [],
+    }
+}
+
 pub fn run_cli() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     match cli.command {
@@ -104,6 +230,13 @@ pub fn run_router(config: TeleopRuntimeConfigV2) -> Result<(), Box<dyn Error>> {
 
     let leader_state_subscriber =
         create_state_subscriber(&node, &config.leader_state_topic, config.leader_state_kind)?;
+    let follower_state_subscriber = match (
+        config.follower_state_kind,
+        config.follower_state_topic.as_deref(),
+    ) {
+        (Some(kind), Some(topic)) => Some(create_state_subscriber(&node, topic, kind)?),
+        _ => None,
+    };
     let follower_command_publisher = create_command_publisher(
         &node,
         &config.follower_command_topic,
@@ -111,22 +244,44 @@ pub fn run_router(config: TeleopRuntimeConfigV2) -> Result<(), Box<dyn Error>> {
     )?;
     let control_subscriber = create_control_subscriber(&node)?;
     let mut last_forwarded_timestamp_ms = None;
+    let mut sync_state = SyncState::new(&config);
+    let mut follower_state: Option<LeaderState> = None;
 
     eprintln!(
-        "rollio-teleop-router: {} forwarding {} -> {} with {:?}",
-        config.process_id, config.leader_channel_id, config.follower_channel_id, config.mapping
+        "rollio-teleop-router: {} forwarding {} -> {} with {:?} (sync mode: {})",
+        config.process_id,
+        config.leader_channel_id,
+        config.follower_channel_id,
+        config.mapping,
+        if sync_state.enabled() {
+            "initial-ramp"
+        } else {
+            "pass-through"
+        }
     );
 
     loop {
         if drain_control_events(&control_subscriber)? {
             break;
         }
+        // Always drain the follower state subscriber so the syncing phase
+        // sees the freshest position. If the follower hasn't booted yet the
+        // drain is a no-op and `follower_state` simply stays at `None`.
+        if let Some(subscriber) = follower_state_subscriber.as_ref() {
+            if let Some(state) = drain_latest_state(subscriber)? {
+                follower_state = Some(state);
+            }
+        }
         if let Some(state) = drain_latest_state(&leader_state_subscriber)? {
             let timestamp_ms = state_timestamp_ms(&state);
             if last_forwarded_timestamp_ms == Some(timestamp_ms) {
                 continue;
             }
-            if let Some(forwarded) = map_leader_state(&config, &state)? {
+            let mapped = map_leader_state(&config, &state)?;
+            if let Some(mut forwarded) = mapped {
+                if sync_state.enabled() {
+                    sync_state.apply(&mut forwarded, follower_state.as_ref(), &config);
+                }
                 publish_command(&follower_command_publisher, forwarded)?;
                 last_forwarded_timestamp_ms = Some(timestamp_ms);
                 continue;
@@ -451,6 +606,10 @@ mod tests {
             leader_state_topic: "leader/arm/states/joint_position".into(),
             follower_command_kind: RobotCommandKind::JointPosition,
             follower_command_topic: "follower/arm/commands/joint_position".into(),
+            follower_state_kind: None,
+            follower_state_topic: None,
+            sync_max_step_rad: None,
+            sync_complete_threshold_rad: None,
             mapping: MappingStrategy::DirectJoint,
             joint_index_map: Vec::new(),
             joint_scales: Vec::new(),
@@ -541,5 +700,125 @@ mod tests {
             panic!("expected pose command");
         };
         assert_eq!(command.values, pose.values);
+    }
+
+    fn sync_config() -> TeleopRuntimeConfigV2 {
+        let mut config = direct_config();
+        config.follower_state_kind = Some(RobotStateKind::JointPosition);
+        config.follower_state_topic = Some("follower/arm/states/joint_position".into());
+        config.sync_max_step_rad = Some(0.005);
+        config.sync_complete_threshold_rad = Some(0.01);
+        config
+    }
+
+    #[test]
+    fn sync_disabled_when_no_follower_state_configured() {
+        let config = direct_config();
+        let sync_state = SyncState::new(&config);
+        assert!(!sync_state.enabled());
+    }
+
+    #[test]
+    fn sync_enabled_when_follower_state_configured() {
+        let config = sync_config();
+        let sync_state = SyncState::new(&config);
+        assert!(sync_state.enabled());
+    }
+
+    #[test]
+    fn sync_clamps_command_to_max_step_when_far_from_target() {
+        let config = sync_config();
+        let mut sync_state = SyncState::new(&config);
+        let mut command = ForwardedCommand::JointPosition(JointVector15::from_slice(
+            123,
+            &[0.5, -0.4, 0.3, 0.2, 0.1, 0.0],
+        ));
+        let follower = LeaderState::Vector {
+            timestamp_ms: 100,
+            values: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        sync_state.apply(&mut command, Some(&follower), &config);
+        let ForwardedCommand::JointPosition(command) = command else {
+            panic!("expected joint-position command");
+        };
+        // Each joint should be at most 0.005 away from the corresponding
+        // follower position (i.e. clamped from the leader's larger delta).
+        let positions = &command.values[..6];
+        for (i, value) in positions.iter().enumerate() {
+            assert!(
+                value.abs() <= 0.005 + f64::EPSILON,
+                "joint {} clamped to {}, expected within 0.005 of follower (0.0)",
+                i,
+                value,
+            );
+        }
+        // Sync remains active because the leader is still well above the
+        // 0.01 rad completion threshold.
+        assert!(sync_state.enabled());
+    }
+
+    #[test]
+    fn sync_completes_once_within_threshold() {
+        let config = sync_config();
+        let mut sync_state = SyncState::new(&config);
+        let mut command = ForwardedCommand::JointPosition(JointVector15::from_slice(
+            123,
+            &[0.005, 0.005, 0.005, 0.005, 0.005, 0.005],
+        ));
+        let follower = LeaderState::Vector {
+            timestamp_ms: 100,
+            values: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        sync_state.apply(&mut command, Some(&follower), &config);
+        // Once the difference is <= the configured threshold the router
+        // exits the syncing phase.
+        assert!(!sync_state.enabled());
+    }
+
+    #[test]
+    fn sync_passes_through_when_no_follower_feedback() {
+        // Even with sync configured, if the follower never reports a state
+        // we do *not* clamp (and we stay in syncing mode for next cycle).
+        let config = sync_config();
+        let mut sync_state = SyncState::new(&config);
+        let mut command = ForwardedCommand::JointPosition(JointVector15::from_slice(
+            123,
+            &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        ));
+        sync_state.apply(&mut command, None, &config);
+        let ForwardedCommand::JointPosition(command) = command else {
+            panic!("expected joint-position command");
+        };
+        assert_eq!(&command.values[..6], &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5]);
+        assert!(sync_state.enabled());
+    }
+
+    #[test]
+    fn sync_passes_through_after_completion_even_for_big_jumps() {
+        // Reflects the user spec: once sync completes, large diffs are
+        // forwarded as-is because rate-limiting at this stage would inject
+        // dangerous lag.
+        let config = sync_config();
+        let mut sync_state = SyncState::new(&config);
+        sync_state.synced = true;
+        let mut command = ForwardedCommand::JointPosition(JointVector15::from_slice(
+            123,
+            &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        ));
+        let follower = LeaderState::Vector {
+            timestamp_ms: 100,
+            values: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        };
+        // Even though `apply` is reachable when synced is true, the higher
+        // level loop only calls it while `enabled()` is true, so this test
+        // documents the invariant rather than executing the rate limiter.
+        assert!(!sync_state.enabled());
+        sync_state.apply(&mut command, Some(&follower), &config);
+        // Calling apply manually still clamps the values; the actual
+        // pass-through behaviour comes from `enabled()` gating.
+        let ForwardedCommand::JointPosition(command) = command else {
+            panic!("expected joint-position command");
+        };
+        assert!(command.values[0] <= 0.005 + f64::EPSILON);
     }
 }

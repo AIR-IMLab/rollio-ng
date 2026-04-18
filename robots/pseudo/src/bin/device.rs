@@ -8,6 +8,7 @@ use rollio_types::config::{
     BinaryDeviceConfig, CameraChannelProfile, ChannelCommandDefaults, DeviceQueryChannel,
     DeviceQueryDevice, DeviceQueryResponse, DeviceType, DirectJointCompatibility,
     DirectJointCompatibilityPeer, RobotCommandKind, RobotMode, RobotStateKind,
+    StateValueLimitsEntry,
 };
 use rollio_types::messages::{
     CameraFrameHeader, ControlEvent, DeviceChannelMode, JointMitCommand15, JointVector15,
@@ -741,6 +742,7 @@ fn query_pseudo_device(id: &str) -> Option<DeviceQueryDevice> {
                 default_control_frequency_hz: None,
                 direct_joint_compatibility: DirectJointCompatibility::default(),
                 defaults: ChannelCommandDefaults::default(),
+                value_limits: Vec::new(),
                 optional_info: Default::default(),
             }],
         })
@@ -801,12 +803,31 @@ fn query_pseudo_device(id: &str) -> Option<DeviceQueryDevice> {
                     parallel_mit_kp: Vec::new(),
                     parallel_mit_kd: Vec::new(),
                 },
+                value_limits: pseudo_robot_value_limits(dof),
                 optional_info: Default::default(),
             }],
         })
     } else {
         None
     }
+}
+
+/// Pseudo robot sweeps joints between -1 and 1 rad in `update_free_drive_state`,
+/// so a ±π envelope keeps a comfortable margin while making the bars
+/// meaningful. Velocity / effort use bounds matching the synthetic feedback
+/// behaviour (small noise + sinusoid).
+fn pseudo_robot_value_limits(dof: u32) -> Vec<StateValueLimitsEntry> {
+    let dof = dof as usize;
+    vec![
+        StateValueLimitsEntry::symmetric(RobotStateKind::JointPosition, std::f64::consts::PI, dof),
+        StateValueLimitsEntry::symmetric(RobotStateKind::JointVelocity, 1.0, dof),
+        StateValueLimitsEntry::symmetric(RobotStateKind::JointEffort, 1.0, dof),
+        StateValueLimitsEntry::new(
+            RobotStateKind::EndEffectorPose,
+            vec![-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        ),
+    ]
 }
 
 fn parse_robot_dof(id: &str) -> Option<u32> {

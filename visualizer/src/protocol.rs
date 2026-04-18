@@ -51,7 +51,12 @@ pub fn encode_camera_frame(
     buf
 }
 
-/// JSON message for robot state sent to the UI.
+/// JSON message for a single robot state-kind sample sent to the UI.
+///
+/// The visualizer emits one of these per (channel, state_kind) update so the
+/// UI can group them per channel and lay out joint position / velocity /
+/// effort rows independently. `value_min` / `value_max` carry the device's
+/// reported envelope (or empty arrays when the driver does not expose limits).
 #[derive(Serialize)]
 struct RobotStateJson<'a> {
     #[serde(rename = "type")]
@@ -59,29 +64,35 @@ struct RobotStateJson<'a> {
     name: &'a str,
     timestamp_ms: u64,
     num_joints: u32,
-    positions: &'a [f64],
-    velocities: &'a [f64],
-    efforts: &'a [f64],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state_kind: Option<&'a str>,
+    /// Element values for the named `state_kind`. The field name is kept as
+    /// `values` (not "positions") so it accurately describes velocity and
+    /// effort payloads without misleading readers.
+    values: &'a [f64],
+    state_kind: &'a str,
+    #[serde(skip_serializing_if = "<[f64]>::is_empty")]
+    value_min: &'a [f64],
+    #[serde(skip_serializing_if = "<[f64]>::is_empty")]
+    value_max: &'a [f64],
 }
 
 /// Encode a robot state into a JSON string for WebSocket text message.
 pub fn encode_robot_state(
     name: &str,
     timestamp_ms: u64,
-    positions: &[f64],
-    state_kind: Option<&str>,
+    values: &[f64],
+    state_kind: &str,
+    value_min: &[f64],
+    value_max: &[f64],
 ) -> String {
     let msg = RobotStateJson {
         msg_type: "robot_state",
         name,
         timestamp_ms,
-        num_joints: positions.len() as u32,
-        positions,
-        velocities: &[],
-        efforts: &[],
+        num_joints: values.len() as u32,
+        values,
         state_kind,
+        value_min,
+        value_max,
     };
     serde_json::to_string(&msg).unwrap_or_default()
 }
@@ -133,21 +144,39 @@ mod tests {
 
     #[test]
     fn encode_robot_state_includes_state_kind() {
-        let json = encode_robot_state("eef_g2", 123, &[0.042], Some("parallel_position"));
+        let json = encode_robot_state(
+            "eef_g2",
+            123,
+            &[0.042],
+            "parallel_position",
+            &[0.0],
+            &[0.07],
+        );
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("robot state should be valid JSON");
         assert_eq!(value["type"], "robot_state");
         assert_eq!(value["name"], "eef_g2");
-        assert_eq!(value["positions"][0], 0.042);
+        assert_eq!(value["values"][0], 0.042);
         assert_eq!(value["state_kind"], "parallel_position");
+        assert_eq!(value["value_min"][0], 0.0);
+        assert_eq!(value["value_max"][0], 0.07);
     }
 
     #[test]
-    fn encode_robot_state_omits_state_kind_when_not_set() {
-        let json = encode_robot_state("leader_arm", 456, &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], None);
+    fn encode_robot_state_omits_value_envelope_when_not_set() {
+        let json = encode_robot_state(
+            "leader_arm",
+            456,
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            "joint_position",
+            &[],
+            &[],
+        );
         let value: serde_json::Value =
             serde_json::from_str(&json).expect("robot state should be valid JSON");
         assert_eq!(value["type"], "robot_state");
-        assert!(value.get("state_kind").is_none());
+        assert_eq!(value["state_kind"], "joint_position");
+        assert!(value.get("value_min").is_none());
+        assert!(value.get("value_max").is_none());
     }
 }

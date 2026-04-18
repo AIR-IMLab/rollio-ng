@@ -14,7 +14,7 @@ use rollio_bus::{
 use rollio_types::config::{
     BinaryDeviceConfig, ChannelCommandDefaults, DeviceQueryChannel, DeviceQueryDevice,
     DeviceQueryResponse, DeviceType, DirectJointCompatibility, DirectJointCompatibilityPeer,
-    RobotCommandKind, RobotMode, RobotStateKind,
+    RobotCommandKind, RobotMode, RobotStateKind, StateValueLimitsEntry,
 };
 use rollio_types::messages::{
     ControlEvent, DeviceChannelMode, JointMitCommand15, JointVector15, ParallelMitCommand2,
@@ -29,6 +29,79 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DRIVER_NAME: &str = "airbot-play";
 const DEFAULT_PROBE_TIMEOUT_MS: u64 = 1000;
+
+// AIRBOT Play arm joint envelope (radians). Matches the analytical kinematics
+// limits in `airbot_play_rust::model::play_analytical`. Mirroring them here
+// keeps the controller / visualizer rendering accurate even when the model
+// crate is private. Velocity / effort bounds use conservative max-rate values
+// from the motor protocol — they're used purely for visualization clamping.
+const ARM_JOINT_POSITION_MIN: [f64; ARM_DOF] = [
+    -std::f64::consts::PI,
+    -2.9671,
+    -0.087266,
+    -3.0107,
+    -1.7628,
+    -3.0107,
+];
+const ARM_JOINT_POSITION_MAX: [f64; ARM_DOF] = [
+    2.0944,
+    0.17453,
+    std::f64::consts::PI,
+    3.0107,
+    1.7628,
+    3.0107,
+];
+const ARM_JOINT_VELOCITY_BOUND: f64 = std::f64::consts::PI; // ±180°/s
+const ARM_JOINT_EFFORT_BOUND: f64 = 50.0; // Nm; conservative upper envelope
+
+// EE pose: x/y/z in metres, qx/qy/qz/qw unit quaternion.
+const ARM_EE_POSE_MIN: [f64; 7] = [-0.6, -0.6, -0.1, -1.0, -1.0, -1.0, -1.0];
+const ARM_EE_POSE_MAX: [f64; 7] = [0.6, 0.6, 0.7, 1.0, 1.0, 1.0, 1.0];
+
+// Parallel gripper envelope (e2 / g2): position in metres, velocity m/s,
+// effort in newtons.
+const EEF_POSITION_MIN: f64 = 0.0;
+const EEF_POSITION_MAX: f64 = 0.07;
+const EEF_VELOCITY_BOUND: f64 = 0.5;
+const EEF_EFFORT_BOUND: f64 = 10.0;
+
+fn arm_value_limits() -> Vec<StateValueLimitsEntry> {
+    vec![
+        StateValueLimitsEntry::new(
+            RobotStateKind::JointPosition,
+            ARM_JOINT_POSITION_MIN.to_vec(),
+            ARM_JOINT_POSITION_MAX.to_vec(),
+        ),
+        StateValueLimitsEntry::symmetric(
+            RobotStateKind::JointVelocity,
+            ARM_JOINT_VELOCITY_BOUND,
+            ARM_DOF,
+        ),
+        StateValueLimitsEntry::symmetric(
+            RobotStateKind::JointEffort,
+            ARM_JOINT_EFFORT_BOUND,
+            ARM_DOF,
+        ),
+        StateValueLimitsEntry::new(
+            RobotStateKind::EndEffectorPose,
+            ARM_EE_POSE_MIN.to_vec(),
+            ARM_EE_POSE_MAX.to_vec(),
+        ),
+    ]
+}
+
+fn eef_value_limits() -> Vec<StateValueLimitsEntry> {
+    vec![
+        StateValueLimitsEntry::uniform(
+            RobotStateKind::ParallelPosition,
+            EEF_POSITION_MIN,
+            EEF_POSITION_MAX,
+            1,
+        ),
+        StateValueLimitsEntry::symmetric(RobotStateKind::ParallelVelocity, EEF_VELOCITY_BOUND, 1),
+        StateValueLimitsEntry::symmetric(RobotStateKind::ParallelEffort, EEF_EFFORT_BOUND, 1),
+    ]
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "rollio-device-airbot-play")]
@@ -289,6 +362,7 @@ async fn probe_devices(timeout: Duration) -> Result<Vec<DeviceQueryDevice>, Box<
                 }],
             },
             defaults: ChannelCommandDefaults::default(),
+            value_limits: arm_value_limits(),
             optional_info: Default::default(),
         }];
         let mounted = instance
@@ -332,6 +406,7 @@ async fn probe_devices(timeout: Duration) -> Result<Vec<DeviceQueryDevice>, Box<
                 default_control_frequency_hz: Some(250.0),
                 direct_joint_compatibility: DirectJointCompatibility::default(),
                 defaults,
+                value_limits: eef_value_limits(),
                 optional_info: Default::default(),
             });
         }

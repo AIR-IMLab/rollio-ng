@@ -63,7 +63,7 @@ export function App({
     connected: previewConnected,
     send: sendPreview,
     frames,
-    robotStates,
+    robotChannels,
     streamInfo,
   } = usePreviewSocket(previewWebsocketUrl);
   // Surface "fully connected" only when both planes are up. The episode
@@ -116,7 +116,7 @@ export function App({
   useEffect(() => {
     setGauge("ui.layout", `${columns}x${rows}`);
     setGauge("ui.camera_count", frames.size);
-    setGauge("ui.robot_count", robotStates.size);
+    setGauge("ui.robot_count", robotChannels.size);
     setGauge("ui.debug_enabled", showDebug ? "On" : "Off");
     setGauge("ui.camera_renderer", cameraRendererId);
     setGauge("ui.camera_renderer_label", rendererLabel);
@@ -142,7 +142,7 @@ export function App({
     columns,
     rows,
     frames.size,
-    robotStates.size,
+    robotChannels.size,
     showDebug,
     cameraRendererId,
     rendererLabel,
@@ -176,7 +176,7 @@ export function App({
 
       <LivePreviewPanels
         frames={frames}
-        robotStates={robotStates}
+        robotChannels={robotChannels}
         streamInfo={streamInfo}
         connected={previewConnected}
         send={sendPreview}

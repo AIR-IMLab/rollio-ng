@@ -56,6 +56,20 @@ fn parse_example_project_config() {
         teleop_configs[0].follower_command_topic,
         "follower_arm/arm/commands/joint_position"
     );
+    // The follower publishes joint_position state, so the controller must
+    // have wired the optional follower-state fields so the teleop router can
+    // run its initial syncing phase. Defaults match the user-spec values
+    // (0.005 rad max step, 0.05 rad completion threshold).
+    assert_eq!(
+        teleop_configs[0].follower_state_kind,
+        Some(RobotStateKind::JointPosition)
+    );
+    assert_eq!(
+        teleop_configs[0].follower_state_topic.as_deref(),
+        Some("follower_arm/arm/states/joint_position"),
+    );
+    assert_eq!(teleop_configs[0].sync_max_step_rad, Some(0.005));
+    assert_eq!(teleop_configs[0].sync_complete_threshold_rad, Some(0.05));
 
     let assembler_runtime = config.assembler_runtime_config_v2(toml_text.to_string());
     assert_eq!(assembler_runtime.cameras.len(), 2);
@@ -67,6 +81,154 @@ fn parse_example_project_config() {
     assert_eq!(storage_runtime.queue_size, 32);
 }
 
+/// The wizard binds the browser UI server to all interfaces by default so a
+/// fresh project can be opened from another machine on the LAN without
+/// hand-editing the TOML. Operators that want loopback-only access can
+/// edit the field in the wizard's settings step.
+#[test]
+fn ui_runtime_config_defaults_to_all_interfaces() {
+    assert_eq!(UiRuntimeConfig::default().http_host, "0.0.0.0");
+    let config = ProjectConfig::draft_setup_template();
+    assert_eq!(config.ui.http_host, "0.0.0.0");
+}
+
+/// Per-codec backends should default to inheriting the legacy global
+/// `backend` field so loading an older TOML produces the same encoder
+/// configuration. Reading a TOML with explicit per-codec backends must
+/// override the shared default.
+#[test]
+fn encoder_config_inherits_backend_per_codec_for_legacy_configs() {
+    let inherited: EncoderConfig = toml::from_str(
+        r#"
+video_codec = "h264"
+depth_codec = "rvl"
+backend = "nvidia"
+"#,
+    )
+    .expect("legacy encoder config should parse");
+    assert_eq!(inherited.video_backend, EncoderBackend::Nvidia);
+    // RVL has no GPU acceleration path; the migration path must downgrade
+    // depth_backend to CPU rather than emit an invalid Nvidia/RVL pair.
+    assert_eq!(inherited.depth_backend, EncoderBackend::Cpu);
+
+    let explicit: EncoderConfig = toml::from_str(
+        r#"
+video_codec = "av1"
+depth_codec = "h265"
+backend = "auto"
+video_backend = "vaapi"
+depth_backend = "nvidia"
+"#,
+    )
+    .expect("encoder config with per-codec backends should parse");
+    assert_eq!(explicit.video_backend, EncoderBackend::Vaapi);
+    assert_eq!(explicit.depth_backend, EncoderBackend::Nvidia);
+}
+
+/// `EncoderRuntimeConfigV2` is what the controller hands to each encoder
+/// child process. Its `backend` field must come from the per-codec
+/// `video_backend` / `depth_backend` selection instead of the shared
+/// fallback so an operator that picked, e.g., NVIDIA AV1 for color and
+/// CPU RVL for depth gets each encoder bound to the right device.
+#[test]
+fn encoder_runtime_configs_v2_use_per_pixel_format_backend() {
+    let toml_text = r#"
+project_name = "mixed-backends"
+mode = "intervention"
+
+[episode]
+format = "lerobot-v2.1"
+fps = 30
+
+[[devices]]
+name = "rs"
+driver = "realsense"
+id = "332322071743"
+bus_root = "rs"
+
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
+
+[[devices.channels]]
+channel_type = "depth"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "depth16" }
+
+[encoder]
+video_codec = "av1"
+video_backend = "nvidia"
+depth_codec = "rvl"
+depth_backend = "cpu"
+
+[storage]
+backend = "local"
+output_path = "./out"
+
+[visualizer]
+port = 19090
+"#;
+    let config = ProjectConfig::from_str(toml_text).expect("config should parse");
+    let encoders = config.encoder_runtime_configs_v2();
+    let color = encoders
+        .iter()
+        .find(|cfg| cfg.channel_id == "rs/color")
+        .expect("color encoder runtime should be derived");
+    assert_eq!(color.codec, EncoderCodec::Av1);
+    assert_eq!(color.backend, EncoderBackend::Nvidia);
+    let depth = encoders
+        .iter()
+        .find(|cfg| cfg.channel_id == "rs/depth")
+        .expect("depth encoder runtime should be derived");
+    assert_eq!(depth.codec, EncoderCodec::Rvl);
+    assert_eq!(depth.backend, EncoderBackend::Cpu);
+}
+
+/// Validation must catch an attempt to pair RVL with a GPU backend so the
+/// wizard never offers the operator a configuration that the encoder
+/// process would reject at startup.
+#[test]
+fn encoder_config_rejects_rvl_with_gpu_backend() {
+    let toml_text = r#"
+project_name = "rvl-vaapi"
+mode = "intervention"
+
+[episode]
+format = "lerobot-v2.1"
+fps = 30
+
+[[devices]]
+name = "rs"
+driver = "realsense"
+id = "332322071743"
+bus_root = "rs"
+
+[[devices.channels]]
+channel_type = "depth"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "depth16" }
+
+[encoder]
+video_codec = "h264"
+depth_codec = "rvl"
+depth_backend = "vaapi"
+
+[storage]
+backend = "local"
+output_path = "./out"
+
+[visualizer]
+port = 19090
+"#;
+    let error = ProjectConfig::from_str(toml_text)
+        .expect_err("rvl + vaapi should fail validation");
+    assert!(
+        error.to_string().contains("rvl only supports cpu"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn visualizer_runtime_config_v2_derives_sources_from_enabled_channels() {
     let config = include_str!("../../config/config.example.toml")
@@ -76,6 +238,102 @@ fn visualizer_runtime_config_v2_derives_sources_from_enabled_channels() {
     assert_eq!(visualizer.camera_sources.len(), 2);
     assert_eq!(visualizer.robot_sources.len(), 8);
     assert_eq!(visualizer.camera_sources[0].frame_topic, "camera_top/color/frames");
+}
+
+/// Configuring more than three camera channels keeps the recording pipeline
+/// intact (each camera still gets its own encoder) but the visualizer-bound
+/// preview list is truncated so the UI never has to render more than
+/// `MAX_PREVIEW_CAMERAS` tiles. This guarantees each tile keeps the 16:10
+/// box without shrinking below the readability threshold.
+#[test]
+fn visualizer_runtime_config_v2_caps_camera_sources_at_max_preview() {
+    let toml_text = r#"
+project_name = "many-cameras"
+mode = "intervention"
+
+[episode]
+format = "lerobot-v2.1"
+fps = 30
+
+[[devices]]
+name = "cam_a"
+driver = "pseudo"
+id = "pseudo_camera_a"
+bus_root = "cam_a"
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
+
+[[devices]]
+name = "cam_b"
+driver = "pseudo"
+id = "pseudo_camera_b"
+bus_root = "cam_b"
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
+
+[[devices]]
+name = "cam_c"
+driver = "pseudo"
+id = "pseudo_camera_c"
+bus_root = "cam_c"
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
+
+[[devices]]
+name = "cam_d"
+driver = "pseudo"
+id = "pseudo_camera_d"
+bus_root = "cam_d"
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
+
+[[devices]]
+name = "cam_e"
+driver = "pseudo"
+id = "pseudo_camera_e"
+bus_root = "cam_e"
+[[devices.channels]]
+channel_type = "color"
+kind = "camera"
+profile = { width = 640, height = 480, fps = 30, pixel_format = "rgb24" }
+
+[encoder]
+video_codec = "h264"
+depth_codec = "rvl"
+
+[storage]
+backend = "local"
+output_path = "./out"
+
+[visualizer]
+port = 19090
+"#;
+    let config = ProjectConfig::from_str(toml_text).expect("config should parse");
+    // Sanity check: every camera is still in the encoder pipeline so they
+    // all get recorded — the cap only affects the preview tiles.
+    let encoders = config.encoder_runtime_configs_v2();
+    assert_eq!(encoders.len(), 5, "every camera should still be recorded");
+
+    let visualizer = config.visualizer_runtime_config_v2();
+    assert_eq!(
+        visualizer.camera_sources.len(),
+        MAX_PREVIEW_CAMERAS,
+        "preview row should be capped at MAX_PREVIEW_CAMERAS"
+    );
+    let preview_names: Vec<_> = visualizer
+        .camera_sources
+        .iter()
+        .map(|source| source.channel_id.as_str())
+        .collect();
+    assert_eq!(preview_names, vec!["cam_a/color", "cam_b/color", "cam_c/color"]);
 }
 
 #[test]
@@ -169,6 +427,77 @@ fn gray8_infrared_uses_depth_codec_when_depth_codec_supports_it() {
         encoder.codec_for_pixel_format(PixelFormat::Gray8),
         EncoderCodec::H265,
     );
+}
+
+/// `value_limits` round-trips through TOML so the controller can persist
+/// driver-reported envelopes once and reuse them on subsequent sessions
+/// without re-querying. The visualizer pulls these into
+/// `VisualizerRobotSourceConfig.value_min` / `value_max` so the UI bars
+/// match the real hardware envelope.
+#[test]
+fn value_limits_round_trip_through_project_config() {
+    let toml_text = r#"
+project_name = "limits"
+mode = "intervention"
+
+[episode]
+format = "lerobot-v2.1"
+fps = 30
+
+[[devices]]
+name = "arm"
+driver = "pseudo"
+id = "pseudo_robot_0_dof_6"
+bus_root = "arm"
+
+[[devices.channels]]
+channel_type = "arm"
+kind = "robot"
+enabled = true
+mode = "free-drive"
+dof = 6
+publish_states = ["joint_position", "joint_velocity"]
+
+[[devices.channels.value_limits]]
+state_kind = "joint_position"
+min = [-3.14, -2.96, -0.087, -3.01, -1.76, -3.01]
+max = [2.094, 0.174, 3.14, 3.01, 1.76, 3.01]
+
+[[devices.channels.value_limits]]
+state_kind = "joint_velocity"
+min = [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
+max = [3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
+
+[encoder]
+video_codec = "h264"
+depth_codec = "rvl"
+
+[storage]
+backend = "local"
+output_path = "./out"
+
+[visualizer]
+port = 19090
+"#;
+    let config = ProjectConfig::from_str(toml_text).expect("config should parse");
+    let channel = &config.devices[0].channels[0];
+    assert_eq!(channel.value_limits.len(), 2);
+    assert_eq!(
+        channel.value_limits[0].state_kind,
+        RobotStateKind::JointPosition
+    );
+    assert_eq!(channel.value_limits[0].max[0], 2.094);
+
+    // The visualizer runtime config exposes per-source value envelopes so
+    // the WebSocket payload can carry them to the UI bars.
+    let visualizer = config.visualizer_runtime_config_v2();
+    let position_source = visualizer
+        .robot_sources
+        .iter()
+        .find(|source| source.state_kind == RobotStateKind::JointPosition)
+        .expect("joint_position source should be present");
+    assert_eq!(position_source.value_min[0], -3.14);
+    assert_eq!(position_source.value_max[0], 2.094);
 }
 
 #[test]

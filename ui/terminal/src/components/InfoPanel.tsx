@@ -1,11 +1,11 @@
 import React from "react";
 import { Box, Text } from "ink";
-import type { CameraFrame } from "../lib/websocket.js";
-import type { RobotStateMessage, StreamInfoMessage } from "../lib/protocol.js";
+import type { AggregatedRobotChannel, CameraFrame } from "../lib/websocket.js";
+import type { StreamInfoMessage } from "../lib/protocol.js";
 
 interface InfoPanelProps {
   frames: Map<string, CameraFrame>;
-  robotStates: Map<string, RobotStateMessage>;
+  robotChannels: Map<string, AggregatedRobotChannel>;
   streamInfo?: StreamInfoMessage | null;
   connected: boolean;
   orientation: "vertical" | "horizontal";
@@ -14,7 +14,7 @@ interface InfoPanelProps {
 
 export function InfoPanel({
   frames,
-  robotStates,
+  robotChannels,
   streamInfo = null,
   connected,
   orientation,
@@ -26,7 +26,7 @@ export function InfoPanel({
   const bottomBorder = `└${"─".repeat(panelWidth - 2)}┘`;
   const innerW = panelWidth - 2;
 
-  const hasData = frames.size > 0 || robotStates.size > 0;
+  const hasData = frames.size > 0 || robotChannels.size > 0;
 
   if (!hasData) {
     const msg = "No devices connected";
@@ -46,7 +46,6 @@ export function InfoPanel({
   const lines: string[] = [];
 
   if (orientation === "vertical") {
-    // Vertical: detailed list
     lines.push(padLine(" Devices", innerW));
 
     for (const [name, frame] of frames) {
@@ -55,8 +54,8 @@ export function InfoPanel({
       );
     }
 
-    for (const [name, state] of robotStates) {
-      lines.push(padLine(`  ${name}  ${state.num_joints} DoF`, innerW));
+    for (const [name, channel] of robotChannels) {
+      lines.push(padLine(`  ${name}  ${dofForChannel(channel)} DoF`, innerW));
     }
 
     lines.push(padLine("", innerW));
@@ -64,15 +63,14 @@ export function InfoPanel({
       padLine(` WS: ${connected ? "Connected" : "Disconnected"}`, innerW),
     );
   } else {
-    // Horizontal: compact 2-line strip
     const camParts: string[] = [];
     for (const [name, frame] of frames) {
       camParts.push(`${name}: ${cameraResolution(name, frame, streamInfo)}`);
     }
 
     const robotParts: string[] = [];
-    for (const [name, state] of robotStates) {
-      robotParts.push(`${name}: ${state.num_joints} DoF`);
+    for (const [name, channel] of robotChannels) {
+      robotParts.push(`${name}: ${dofForChannel(channel)} DoF`);
     }
 
     const line1 = ` ${camParts.join(" | ")}`;
@@ -91,6 +89,22 @@ export function InfoPanel({
       <Text dimColor>{bottomBorder}</Text>
     </Box>
   );
+}
+
+function dofForChannel(channel: AggregatedRobotChannel): number {
+  const sample =
+    channel.states.joint_position ??
+    channel.states.parallel_position ??
+    channel.states.end_effector_pose;
+  if (sample) {
+    return sample.numJoints || sample.values.length;
+  }
+  for (const value of Object.values(channel.states)) {
+    if (value) {
+      return value.numJoints || value.values.length;
+    }
+  }
+  return 0;
 }
 
 function padLine(text: string, width: number): string {

@@ -534,6 +534,7 @@ fn query_device(path: &str) -> Result<DeviceQueryResponse, DynError> {
                 default_control_frequency_hz: None,
                 direct_joint_compatibility: Default::default(),
                 defaults: Default::default(),
+                value_limits: Vec::new(),
                 optional_info: Default::default(),
             }],
         }],

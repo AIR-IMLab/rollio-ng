@@ -17,8 +17,9 @@ use rollio_bus::{
 };
 use rollio_types::config::{
     BinaryDeviceConfig, CameraChannelProfile, ChannelCommandDefaults, ChannelPairingConfig,
-    CollectionMode, DeviceChannelConfigV2, DeviceType, EncoderCodec, EpisodeFormat,
-    MappingStrategy, ProjectConfig, RobotCommandKind, RobotMode, RobotStateKind, StorageBackend,
+    CollectionMode, DeviceChannelConfigV2, DeviceType, EncoderBackend, EncoderCodec,
+    EpisodeFormat, MappingStrategy, ProjectConfig, RobotCommandKind, RobotMode, RobotStateKind,
+    StorageBackend,
 };
 use rollio_types::messages::{
     ControlEvent, DeviceChannelMode, PixelFormat, SetupCommandMessage, SetupStateMessage,
@@ -132,6 +133,12 @@ struct DiscoveredDevice {
 struct DiscoveredChannelMeta {
     channel_label: Option<String>,
     default_name: Option<String>,
+    /// Per-state value limits reported by the device driver (rad / rad·s⁻¹ /
+    /// Nm / m for parallel kinds). Captured from the channel's `query --json`
+    /// response so the visualizer can render limit-aware bars instead of
+    /// guessing the value envelope.
+    #[serde(default)]
+    value_limits: Vec<rollio_types::config::StateValueLimitsEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -872,16 +879,47 @@ impl SetupSession {
     }
 
     fn cycle_video_codec(&mut self, delta: i32) -> Result<bool, Box<dyn Error>> {
-        self.config.encoder.video_codec =
-            rotate_encoder_codec(self.config.encoder.video_codec, delta);
-        self.config.validate()?;
+        // RGB / IR streams should never be assigned the depth-only RVL codec
+        // (the libav encoder physically rejects non-depth16 frames). The
+        // cycle therefore iterates only the libav-backed codec/backend pairs
+        // and skips RVL entirely.
+        let (codec, backend) = rotate_encoder_codec_backend(
+            self.config.encoder.video_codec,
+            self.config.encoder.video_backend,
+            VIDEO_CODEC_BACKEND_OPTIONS,
+            delta,
+        );
+        let previous_codec = self.config.encoder.video_codec;
+        let previous_backend = self.config.encoder.video_backend;
+        self.config.encoder.video_codec = codec;
+        self.config.encoder.video_backend = backend;
+        if let Err(error) = self.config.validate() {
+            self.config.encoder.video_codec = previous_codec;
+            self.config.encoder.video_backend = previous_backend;
+            return Err(error.into());
+        }
         Ok(true)
     }
 
     fn cycle_depth_codec(&mut self, delta: i32) -> Result<bool, Box<dyn Error>> {
-        self.config.encoder.depth_codec =
-            rotate_encoder_codec(self.config.encoder.depth_codec, delta);
-        self.config.validate()?;
+        // Depth pipeline supports the in-repo RVL encoder (CPU only) plus
+        // every libav backend. The cycle therefore exposes RVL alongside the
+        // libav (codec, backend) pairs.
+        let (codec, backend) = rotate_encoder_codec_backend(
+            self.config.encoder.depth_codec,
+            self.config.encoder.depth_backend,
+            DEPTH_CODEC_BACKEND_OPTIONS,
+            delta,
+        );
+        let previous_codec = self.config.encoder.depth_codec;
+        let previous_backend = self.config.encoder.depth_backend;
+        self.config.encoder.depth_codec = codec;
+        self.config.encoder.depth_backend = backend;
+        if let Err(error) = self.config.validate() {
+            self.config.encoder.depth_codec = previous_codec;
+            self.config.encoder.depth_backend = previous_backend;
+            return Err(error.into());
+        }
         Ok(true)
     }
 
@@ -924,6 +962,29 @@ impl SetupSession {
         }
         self.config.storage.endpoint = Some(trimmed.into());
         self.config.validate()?;
+        Ok(true)
+    }
+
+    /// Update the host the browser UI server should bind to. Mutating the
+    /// field through the wizard avoids forcing the operator to hand-edit
+    /// the saved TOML when they need to expose the UI on a different
+    /// interface (e.g. switching the default `0.0.0.0` to `127.0.0.1` for
+    /// loopback-only access).
+    fn set_ui_http_host(&mut self, value: &str) -> Result<bool, Box<dyn Error>> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            self.message = Some("UI host must not be empty.".into());
+            return Ok(false);
+        }
+        if self.config.ui.http_host == trimmed {
+            return Ok(false);
+        }
+        let previous = std::mem::replace(&mut self.config.ui.http_host, trimmed.into());
+        if let Err(error) = self.config.validate() {
+            self.config.ui.http_host = previous;
+            self.message = Some(format!("UI host rejected: {error}"));
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -1059,6 +1120,14 @@ impl SetupSession {
                     self.set_storage_endpoint(value)?,
                 ))
             }
+            "setup_set_ui_http_host" => {
+                let Some(value) = command.value.as_deref() else {
+                    return Ok(SessionMutation::default());
+                };
+                Ok(SessionMutation::config_changed(
+                    self.set_ui_http_host(value)?,
+                ))
+            }
             "setup_save" => {
                 save_project_config(&self.config, &self.output_path)?;
                 self.mark_saved();
@@ -1095,6 +1164,66 @@ fn rotate_encoder_codec(current: EncoderCodec, delta: i32) -> EncoderCodec {
     options[rotate_index(current_index, options.len(), delta)]
 }
 
+/// Rotate through a flat `(codec, backend)` option table.
+///
+/// The wizard exposes the cross product as a single cycle so the operator can
+/// choose a specific encoder implementation in one go (e.g. "av1 (nvidia)"
+/// vs. "av1 (cpu)"). When the current value isn't in the table — for example
+/// after loading an older config that paired a codec with `Auto` — we
+/// snap to the first matching codec entry so the next cycle step still
+/// lands on a sensible neighbour.
+fn rotate_encoder_codec_backend(
+    current_codec: EncoderCodec,
+    current_backend: EncoderBackend,
+    options: &[(EncoderCodec, EncoderBackend)],
+    delta: i32,
+) -> (EncoderCodec, EncoderBackend) {
+    if options.is_empty() {
+        return (current_codec, current_backend);
+    }
+    let exact = options
+        .iter()
+        .position(|entry| *entry == (current_codec, current_backend));
+    let current_index = exact.unwrap_or_else(|| {
+        options
+            .iter()
+            .position(|(codec, _)| *codec == current_codec)
+            .unwrap_or(0)
+    });
+    options[rotate_index(current_index, options.len(), delta)]
+}
+
+/// Codec/backend cycle exposed for `video_codec` (color + IR fallback).
+/// RVL is depth-only and intentionally excluded so RGB streams never end up
+/// configured against an encoder that physically rejects their pixel format.
+const VIDEO_CODEC_BACKEND_OPTIONS: &[(EncoderCodec, EncoderBackend)] = &[
+    (EncoderCodec::H264, EncoderBackend::Cpu),
+    (EncoderCodec::H264, EncoderBackend::Nvidia),
+    (EncoderCodec::H264, EncoderBackend::Vaapi),
+    (EncoderCodec::H265, EncoderBackend::Cpu),
+    (EncoderCodec::H265, EncoderBackend::Nvidia),
+    (EncoderCodec::H265, EncoderBackend::Vaapi),
+    (EncoderCodec::Av1, EncoderBackend::Cpu),
+    (EncoderCodec::Av1, EncoderBackend::Nvidia),
+    (EncoderCodec::Av1, EncoderBackend::Vaapi),
+];
+
+/// Codec/backend cycle exposed for `depth_codec`. RVL leads the list because
+/// it's the lossless in-repo default; the libav (codec, backend) pairs are
+/// available for projects that want lossy depth compression.
+const DEPTH_CODEC_BACKEND_OPTIONS: &[(EncoderCodec, EncoderBackend)] = &[
+    (EncoderCodec::Rvl, EncoderBackend::Cpu),
+    (EncoderCodec::H264, EncoderBackend::Cpu),
+    (EncoderCodec::H264, EncoderBackend::Nvidia),
+    (EncoderCodec::H264, EncoderBackend::Vaapi),
+    (EncoderCodec::H265, EncoderBackend::Cpu),
+    (EncoderCodec::H265, EncoderBackend::Nvidia),
+    (EncoderCodec::H265, EncoderBackend::Vaapi),
+    (EncoderCodec::Av1, EncoderBackend::Cpu),
+    (EncoderCodec::Av1, EncoderBackend::Nvidia),
+    (EncoderCodec::Av1, EncoderBackend::Vaapi),
+];
+
 fn normalized_delta(delta: Option<i32>) -> i32 {
     match delta.unwrap_or(1).cmp(&0) {
         std::cmp::Ordering::Less => -1,
@@ -1113,7 +1242,7 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
         simulated_arms: args.sim_arms,
     };
 
-    let (config, available_devices, warnings, resume_mode) =
+    let (config, available_devices, mut warnings, resume_mode) =
         if let Some(existing_config) = args.load_project_config()? {
             existing_config.validate().map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
             validate_existing_project(&existing_config, &workspace_root, &current_exe_dir)?;
@@ -1130,6 +1259,13 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
             let available_devices = available_devices_from_discoveries(&discoveries, &config)?;
             (config, available_devices, warnings, false)
         };
+
+    // Surface any robot channel that publishes a state-kind without
+    // driver-supplied value_limits. The visualization layer treats limits as
+    // a hard requirement (no UI fallback); the warning prompts the operator
+    // to upgrade the device executable instead of silently rendering empty
+    // bars.
+    warnings.extend(missing_value_limit_warnings(&config));
 
     if args.accept_defaults {
         eprintln!("rollio: setup accepted defaults without launching the interactive wizard");
@@ -1707,6 +1843,7 @@ fn binary_device_from_camera_discovery(
                     native_pixel_format: channel.profile.native_pixel_format.clone(),
                 }),
                 command_defaults: ChannelCommandDefaults::default(),
+                value_limits: channel_meta.value_limits,
                 extra: toml::Table::new(),
             }
         })
@@ -1810,6 +1947,7 @@ fn binary_device_from_robot_discovery(
         control_frequency_hz: discovery.default_frequency_hz,
         profile: None,
         command_defaults,
+        value_limits: arm_meta.value_limits,
         extra: toml::Table::new(),
     }];
     if discovery.driver == "airbot-play" {
@@ -1838,6 +1976,7 @@ fn binary_device_from_robot_discovery(
                 control_frequency_hz: discovery.default_frequency_hz.or(Some(250.0)),
                 profile: None,
                 command_defaults: eef_defaults,
+                value_limits: eef_meta.value_limits,
                 extra: toml::Table::new(),
             });
         }
@@ -2330,6 +2469,42 @@ fn display_name_for_binary_channel(
     }
 }
 
+/// Build a list of human-readable warnings for every robot channel whose
+/// `publish_states` includes a kind that the driver did not report
+/// `value_limits` for. The renderer paints these cells with `?` placeholder
+/// bars (no fallback envelope), so flagging the misconfiguration during
+/// setup tells the operator they need to update their device executable
+/// rather than diagnose missing bars at run time.
+fn missing_value_limit_warnings(config: &ProjectConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for device in &config.devices {
+        for channel in &device.channels {
+            if channel.kind != DeviceType::Robot || !channel.enabled {
+                continue;
+            }
+            for state_kind in &channel.publish_states {
+                let entry = channel
+                    .value_limits
+                    .iter()
+                    .find(|entry| entry.state_kind == *state_kind);
+                let needs_warning = match entry {
+                    None => true,
+                    Some(entry) => entry.min.is_empty() || entry.max.is_empty(),
+                };
+                if needs_warning {
+                    warnings.push(format!(
+                        "device \"{}\" channel \"{}\": driver did not report value_limits for {}; bars will render as ??? until the device executable provides them",
+                        device.name,
+                        channel.channel_type,
+                        state_kind.topic_suffix()
+                    ));
+                }
+            }
+        }
+    }
+    warnings
+}
+
 fn discover_devices(
     workspace_root: &Path,
     current_exe_dir: &Path,
@@ -2774,15 +2949,47 @@ fn parse_query_channel_meta(device: &Value) -> BTreeMap<String, DiscoveredChanne
             let channel_type = value_as_string(channel.get("channel_type"))?;
             let channel_label = value_as_string(channel.get("channel_label"));
             let default_name = value_as_string(channel.get("default_name"));
+            let value_limits = parse_query_value_limits(channel.get("value_limits"));
             Some((
                 channel_type,
                 DiscoveredChannelMeta {
                     channel_label,
                     default_name,
+                    value_limits,
                 },
             ))
         })
         .collect()
+}
+
+fn parse_query_value_limits(
+    value: Option<&Value>,
+) -> Vec<rollio_types::config::StateValueLimitsEntry> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let state_kind_str = value_as_string(entry.get("state_kind"))?;
+            let state_kind: rollio_types::config::RobotStateKind =
+                serde_json::from_value(serde_json::Value::String(state_kind_str)).ok()?;
+            let min = value_as_f64_array(entry.get("min"));
+            let max = value_as_f64_array(entry.get("max"));
+            Some(rollio_types::config::StateValueLimitsEntry {
+                state_kind,
+                min,
+                max,
+            })
+        })
+        .collect()
+}
+
+fn value_as_f64_array(value: Option<&Value>) -> Vec<f64> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default()
 }
 
 fn parse_query_robot_modes_by_channel(device: &Value) -> BTreeMap<String, Vec<RobotMode>> {
@@ -2830,6 +3037,16 @@ fn enrich_current_device_from_discovery(
     discovery: &DiscoveredDevice,
 ) {
     merge_discovery_extra(&mut current.extra, discovery);
+    // Re-merge per-state value_limits from the latest query so a project
+    // saved before the driver started reporting limits picks them up on the
+    // next setup pass without manual editing.
+    for channel in current.channels.iter_mut() {
+        if let Some(meta) = discovery.channel_meta_by_channel.get(&channel.channel_type) {
+            if !meta.value_limits.is_empty() {
+                channel.value_limits = meta.value_limits.clone();
+            }
+        }
+    }
     if discovery.device_type != DeviceType::Camera {
         return;
     }
@@ -3216,6 +3433,7 @@ mod tests {
             DiscoveredChannelMeta {
                 channel_label: Some("AIRBOT Play".into()),
                 default_name: Some("airbot_play_arm".into()),
+                ..DiscoveredChannelMeta::default()
             },
         )]);
         if let Some(channel_type) = end_effector.map(|value| value.to_ascii_lowercase()) {
@@ -3233,6 +3451,7 @@ mod tests {
                 DiscoveredChannelMeta {
                     channel_label: Some(label.into()),
                     default_name: Some(name.into()),
+                    ..DiscoveredChannelMeta::default()
                 },
             );
         }
@@ -3661,6 +3880,7 @@ mod tests {
                 DiscoveredChannelMeta {
                     channel_label: Some("V4L2 Camera".into()),
                     default_name: Some("camera".into()),
+                    ..DiscoveredChannelMeta::default()
                 },
             )]),
             dof: None,
@@ -3801,8 +4021,151 @@ mod tests {
         assert_eq!(config.devices.len(), 2);
         assert_eq!(config.devices[0].name, "realsense");
         assert_eq!(config.devices[1].name, "realsense_2");
-        // Each device still exposes all three streams.
         assert_eq!(camera_channel_types(&config.devices[0]).len(), 3);
         assert_eq!(camera_channel_types(&config.devices[1]).len(), 3);
+    }
+
+    #[test]
+    fn missing_value_limit_warnings_flags_robot_channels_with_no_driver_limits() {
+        // The pseudo-style discovery in tests carries no value_limits because
+        // its `DiscoveredChannelMeta` is empty by default. This mirrors the
+        // case where a real driver has not been updated to report limits yet.
+        let config = build_discovery_config(&[robot_discovery("robot0", 6)])
+            .expect("config should build");
+
+        let warnings = missing_value_limit_warnings(&config);
+        // Three publish_states (joint position/velocity/effort) → three
+        // distinct warnings, one per kind.
+        assert_eq!(
+            warnings.len(),
+            3,
+            "expected one warning per missing kind, got: {:?}",
+            warnings
+        );
+        for kind in ["joint_position", "joint_velocity", "joint_effort"] {
+            assert!(
+                warnings.iter().any(|w| w.contains(kind)),
+                "missing warning for {kind}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_value_limit_warnings_silent_when_driver_supplied_limits() {
+        let mut config = build_discovery_config(&[robot_discovery("robot0", 6)])
+            .expect("config should build");
+        // Simulate the post-`enrich_current_device_from_discovery` state by
+        // populating value_limits on every published kind.
+        for device in &mut config.devices {
+            for channel in &mut device.channels {
+                channel.value_limits = channel
+                    .publish_states
+                    .iter()
+                    .map(|kind| rollio_types::config::StateValueLimitsEntry::symmetric(
+                        *kind,
+                        std::f64::consts::PI,
+                        channel.dof.unwrap_or(1) as usize,
+                    ))
+                    .collect();
+            }
+        }
+        assert!(
+            missing_value_limit_warnings(&config).is_empty(),
+            "no warnings expected when limits are present"
+        );
+    }
+
+    /// `setup_set_ui_http_host` should accept a new host string and persist
+    /// it to `config.ui.http_host`. An empty value is rejected with a
+    /// descriptive message instead of silently committing a useless config.
+    #[test]
+    fn set_ui_http_host_rejects_empty_and_persists_valid_values() {
+        let mut session = setup_session(&[camera_discovery("cam0")]);
+        // Default value comes from rollio_types::default_ui_http_host
+        // which now binds to all interfaces by default.
+        assert_eq!(session.config.ui.http_host, "0.0.0.0");
+
+        // A trimmed-empty value must not mutate the field and should set a
+        // visible error message for the wizard footer.
+        let changed = session
+            .set_ui_http_host("   ")
+            .expect("empty input should be reported via message, not error");
+        assert!(!changed, "blank UI host must not be persisted");
+        assert_eq!(session.config.ui.http_host, "0.0.0.0");
+        assert_eq!(
+            session.message.as_deref(),
+            Some("UI host must not be empty.")
+        );
+
+        // A valid value updates the field; identical re-submissions are
+        // a no-op so the wizard doesn't re-broadcast unchanged state.
+        session.message = None;
+        let changed = session
+            .set_ui_http_host("127.0.0.1")
+            .expect("valid host should be accepted");
+        assert!(changed);
+        assert_eq!(session.config.ui.http_host, "127.0.0.1");
+
+        let changed = session
+            .set_ui_http_host("127.0.0.1")
+            .expect("repeated host should be a no-op");
+        assert!(!changed);
+    }
+
+    /// The combined codec-backend cycle exposes `(codec, backend)` pairs for
+    /// every libav-backed RGB option so the operator can pick a specific
+    /// encoder implementation directly. RVL is intentionally excluded — it
+    /// would silently fall back to the libav codec for non-depth frames.
+    #[test]
+    fn cycle_video_codec_walks_codec_backend_pairs_in_order() {
+        let mut session = setup_session(&[camera_discovery("cam0")]);
+        // Snap to the first option in the table so we can predict the cycle
+        // order regardless of the saved default.
+        session.config.encoder.video_codec = EncoderCodec::H264;
+        session.config.encoder.video_backend = EncoderBackend::Cpu;
+
+        let expected = [
+            (EncoderCodec::H264, EncoderBackend::Nvidia),
+            (EncoderCodec::H264, EncoderBackend::Vaapi),
+            (EncoderCodec::H265, EncoderBackend::Cpu),
+            (EncoderCodec::H265, EncoderBackend::Nvidia),
+            (EncoderCodec::H265, EncoderBackend::Vaapi),
+            (EncoderCodec::Av1, EncoderBackend::Cpu),
+            (EncoderCodec::Av1, EncoderBackend::Nvidia),
+            (EncoderCodec::Av1, EncoderBackend::Vaapi),
+            (EncoderCodec::H264, EncoderBackend::Cpu),
+        ];
+        for (i, (codec, backend)) in expected.iter().enumerate() {
+            session
+                .cycle_video_codec(1)
+                .unwrap_or_else(|err| panic!("cycle step {i} failed: {err}"));
+            assert_eq!(session.config.encoder.video_codec, *codec, "step {i}");
+            assert_eq!(session.config.encoder.video_backend, *backend, "step {i}");
+        }
+    }
+
+    /// Depth cycle leads with RVL (the lossless in-repo default) and then
+    /// walks the libav (codec, backend) pairs. The wizard relies on this
+    /// ordering so the first forward cycle from the default puts the
+    /// operator on a familiar libav option.
+    #[test]
+    fn cycle_depth_codec_includes_rvl_and_libav_backends() {
+        let mut session = setup_session(&[camera_discovery("cam0")]);
+        session.config.encoder.depth_codec = EncoderCodec::Rvl;
+        session.config.encoder.depth_backend = EncoderBackend::Cpu;
+
+        session
+            .cycle_depth_codec(1)
+            .expect("forward cycle should succeed");
+        assert_eq!(session.config.encoder.depth_codec, EncoderCodec::H264);
+        assert_eq!(session.config.encoder.depth_backend, EncoderBackend::Cpu);
+
+        // Walk back to land on RVL again, proving it's reachable from both
+        // directions and the wrap-around is correct.
+        session
+            .cycle_depth_codec(-1)
+            .expect("reverse cycle should succeed");
+        assert_eq!(session.config.encoder.depth_codec, EncoderCodec::Rvl);
+        assert_eq!(session.config.encoder.depth_backend, EncoderBackend::Cpu);
     }
 }

@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import sharp from "sharp";
-import { resolveCameraNames } from "../src/lib/camera-layout.js";
+import {
+  MAX_PREVIEW_CAMERAS,
+  resolveCameraNames,
+} from "../src/lib/camera-layout.js";
 import { metricsFromWinsize } from "../src/lib/terminal-geometry.js";
 import {
   createAsciiRendererBackend,
   nextAsciiRendererId,
 } from "../src/lib/renderers/index.js";
-import { prepareRendererRaster } from "../src/components/StreamPanel.js";
+import {
+  describeCameraPreviewRaster,
+  prepareRendererRaster,
+} from "../src/components/StreamPanel.js";
 
 test("resolveCameraNames keeps configured streams visible", () => {
   assert.deepEqual(
@@ -23,6 +29,56 @@ test("resolveCameraNames appends unexpected active streams", () => {
   assert.deepEqual(
     resolveCameraNames(["camera_a"], ["camera_a", "camera_b"]),
     ["camera_a", "camera_b"],
+  );
+});
+
+test(`resolveCameraNames caps the preview row at ${MAX_PREVIEW_CAMERAS} channels`, () => {
+  const configured = ["cam_a", "cam_b", "cam_c", "cam_d", "cam_e"];
+  const names = resolveCameraNames(configured, []);
+  assert.equal(names.length, MAX_PREVIEW_CAMERAS);
+  assert.deepEqual(names, configured.slice(0, MAX_PREVIEW_CAMERAS));
+});
+
+test("describeCameraPreviewRaster keeps each tile within the 16:10 visual aspect envelope", () => {
+  // 1:2 cell geometry mimics a typical monospace terminal where each cell
+  // is twice as tall as it is wide. With three cameras sharing a wide
+  // preview row, the cell grid must compensate so each tile *visually*
+  // approximates the 16:10 box.
+  const cellGeometry = { pixelWidth: 1, pixelHeight: 2 };
+  const raster = describeCameraPreviewRaster(
+    /* totalWidth */ 240,
+    /* panelHeight */ 30,
+    /* numCameras */ 3,
+    cellGeometry,
+    "ts-half-block",
+  );
+  // visualAspect = (cols * cellPixelW) / (rows * cellPixelH).
+  // We tolerate a small rounding gap (the cell counts are integer-valued).
+  const visualAspect =
+    (raster.columns * cellGeometry.pixelWidth) /
+    (raster.rows * cellGeometry.pixelHeight);
+  assert.ok(
+    Math.abs(visualAspect - 16 / 10) < 0.25,
+    `expected ~16:10 visual aspect, got ${visualAspect.toFixed(3)} (cols=${raster.columns}, rows=${raster.rows})`,
+  );
+});
+
+test("describeCameraPreviewRaster honours the per-camera width budget when height is the limit", () => {
+  // Tall, narrow panel: the height-bound layout would emit columns that
+  // exceed the per-camera width budget, so the renderer falls back to
+  // width-bound sizing while preserving the 16:10 aspect ratio.
+  const cellGeometry = { pixelWidth: 1, pixelHeight: 2 };
+  const raster = describeCameraPreviewRaster(
+    /* totalWidth */ 60,
+    /* panelHeight */ 80,
+    /* numCameras */ 3,
+    cellGeometry,
+    "ts-half-block",
+  );
+  // perCameraColumnsBudget = floor((60 - 2 - 2) / 3) = 18.
+  assert.ok(
+    raster.columns <= 18,
+    `tile columns should respect the per-camera width budget; got ${raster.columns}`,
   );
 });
 
@@ -164,7 +220,10 @@ test("prepareRendererRaster keeps resized luma8 buffers single-channel", async (
   assert.equal(raster.data.length, 8 * 6);
 });
 
-test("prepareRendererRaster uses cover sizing so panels fill fully", async () => {
+test("prepareRendererRaster letterboxes the source so its native aspect ratio is preserved", async () => {
+  // 4:3 source rendered into an 8:2 target. With "contain" sizing the
+  // image is scaled to height=2 (preserving the 4:3 aspect → 3 px wide) and
+  // padded with black on the left / right so it never gets stretched.
   const encoded = await sharp({
     create: {
       width: 4,
@@ -180,5 +239,18 @@ test("prepareRendererRaster uses cover sizing so panels fill fully", async () =>
 
   assert.equal(raster.width, 8);
   assert.equal(raster.height, 2);
-  assert.ok(raster.data.every((value) => value === 255));
+  // At least one pixel column must remain black (letterbox padding).
+  // Pixels are RGB triples in row-major order. We sum the first row's
+  // values and look for any zero byte to prove the padding is present.
+  const firstRow = raster.data.subarray(0, raster.width * 3);
+  assert.ok(
+    firstRow.includes(0),
+    "expected letterbox padding (zero bytes) in the first row of the contain-fit output",
+  );
+  // Conversely, at least one pixel must remain at the source colour (255)
+  // so we know the actual image content survived the resize unaltered.
+  assert.ok(
+    firstRow.includes(255),
+    "expected source pixels to survive the contain-fit resize",
+  );
 });

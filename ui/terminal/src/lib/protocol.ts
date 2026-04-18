@@ -19,14 +19,46 @@ export interface CameraFrameMessage {
 /** Parsed robot state from a JSON WebSocket message. */
 export type EndEffectorStatus = "unknown" | "disabled" | "enabled";
 
+/**
+ * State-kind tag emitted by the visualizer on each `robot_state` message.
+ *
+ * The visualizer publishes one message per (channel, state_kind) pair so the
+ * UI can group rows belonging to the same channel into a single panel
+ * (joint position + velocity + effort + optional EE pose / parallel gripper
+ * channels). Lists every kind the rollio backend currently emits.
+ */
+export type RobotStateKind =
+  | "joint_position"
+  | "joint_velocity"
+  | "joint_effort"
+  | "end_effector_pose"
+  | "end_effector_twist"
+  | "end_effector_wrench"
+  | "parallel_position"
+  | "parallel_velocity"
+  | "parallel_effort";
+
+/**
+ * Single-state-kind sample emitted by the visualizer. The UI aggregates these
+ * by `name` into a {@link AggregatedRobotChannel} keyed by channel id and
+ * keyed-on `state_kind` entries.
+ */
 export interface RobotStateMessage {
   type: "robot_state";
   name: string;
-  timestamp_ns: number;
+  /** Backend timestamp in milliseconds (visualizer wire format). */
+  timestamp_ms: number;
   num_joints: number;
-  positions: number[];
-  velocities: number[];
-  efforts: number[];
+  /** Element values for `state_kind`. Unit depends on the kind: rad / rad·s⁻¹
+   *  / Nm for joint kinds, m / m·s⁻¹ / N for parallel kinds, mixed for poses.
+   */
+  values: number[];
+  state_kind: RobotStateKind;
+  /** Optional per-element envelope reported by the device driver.
+   *  Empty arrays mean "no driver-reported limits" — the UI should fall back
+   *  to sensible defaults (see RobotStatePanel). */
+  value_min?: number[];
+  value_max?: number[];
   end_effector_status?: EndEffectorStatus;
   end_effector_feedback_valid?: boolean;
 }
@@ -136,6 +168,9 @@ export interface SetupAvailableDevice {
   current: SetupBinaryDeviceConfig;
 }
 
+export type EncoderCodec = "h264" | "h265" | "av1" | "rvl";
+export type EncoderBackend = "auto" | "cpu" | "nvidia" | "vaapi";
+
 export interface SetupConfigSnapshot {
   project_name: string;
   mode: "teleop" | "intervention";
@@ -146,13 +181,28 @@ export interface SetupConfigSnapshot {
   devices: SetupBinaryDeviceConfig[];
   pairings: SetupChannelPairing[];
   encoder: {
-    video_codec: "h264" | "h265" | "av1" | "rvl";
-    depth_codec: "h264" | "h265" | "av1" | "rvl";
+    video_codec: EncoderCodec;
+    depth_codec: EncoderCodec;
+    /** Legacy global backend hint (kept for backwards compatibility). The
+     *  wizard now drives the per-codec backend via `video_backend` and
+     *  `depth_backend`; this field is the shared default the controller
+     *  falls back to when those are unset. */
+    backend?: EncoderBackend;
+    /** Backend used to encode color/IR streams (paired with `video_codec`). */
+    video_backend?: EncoderBackend;
+    /** Backend used to encode depth streams (paired with `depth_codec`). */
+    depth_backend?: EncoderBackend;
   };
   storage: {
     backend: "local" | "http";
     output_path: string;
     endpoint?: string | null;
+  };
+  /** Browser UI server runtime config. Defaults are filled in by the
+   *  controller when absent in the saved TOML. */
+  ui?: {
+    http_host: string;
+    http_port: number;
   };
 }
 
@@ -197,6 +247,7 @@ export type CommandAction =
   | "setup_set_project_name"
   | "setup_set_storage_output_path"
   | "setup_set_storage_endpoint"
+  | "setup_set_ui_http_host"
   | "setup_save"
   | "setup_cancel";
 
@@ -329,6 +380,7 @@ export function encodeSetupCommand(
     | "setup_set_project_name"
     | "setup_set_storage_output_path"
     | "setup_set_storage_endpoint"
+    | "setup_set_ui_http_host"
     | "setup_save"
     | "setup_cancel"
   >,

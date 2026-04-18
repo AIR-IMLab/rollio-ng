@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use iceoryx2::node::NodeWaitFailure;
 use rollio_types::config::{
-    RobotStateKind, VisualizerCameraSourceConfig, VisualizerRobotSourceConfig,
-    VisualizerRuntimeConfigV2,
+    VisualizerCameraSourceConfig, VisualizerRobotSourceConfig, VisualizerRuntimeConfigV2,
 };
 use tokio::sync::broadcast;
 
@@ -141,11 +140,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|source| source.channel_id.clone())
         .collect::<Vec<_>>();
-    let robot_names = runtime_config
-        .robot_sources
-        .iter()
-        .map(robot_source_name)
-        .collect::<Vec<_>>();
+    // Multiple state-kinds map to the same channel id (e.g. an arm publishes
+    // joint_position + joint_velocity + joint_effort), so de-duplicate before
+    // exposing the channel list to consumers like the stream info registry.
+    let robot_names = {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for source in &runtime_config.robot_sources {
+            if seen.insert(source.channel_id.clone()) {
+                names.push(source.channel_id.clone());
+            }
+        }
+        names
+    };
     let preview_workers = runtime_config
         .preview_workers
         .unwrap_or_else(|| default_preview_workers(camera_names.len()))
@@ -325,12 +332,16 @@ fn ipc_poll_loop(
                     state_kind,
                     timestamp_ms,
                     values,
+                    value_min,
+                    value_max,
                 } => {
                     let json = protocol::encode_robot_state(
                         &name,
                         timestamp_ms,
                         &values,
-                        Some(state_kind.topic_suffix()),
+                        state_kind.topic_suffix(),
+                        &value_min,
+                        &value_max,
                     );
                     let _ = broadcast_tx.send(BroadcastMessage::Text(Arc::new(json)));
                 }
@@ -420,9 +431,3 @@ state_topic = "leader_arm/arm/states/joint_velocity"
     }
 }
 
-fn robot_source_name(source: &VisualizerRobotSourceConfig) -> String {
-    match source.state_kind {
-        RobotStateKind::JointPosition => source.channel_id.clone(),
-        other => format!("{}/{}", source.channel_id, other.topic_suffix()),
-    }
-}
