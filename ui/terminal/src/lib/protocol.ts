@@ -165,6 +165,10 @@ export interface SetupAvailableDevice {
   id: string;
   camera_profiles: SetupCameraProfile[];
   supported_modes: Array<"free-drive" | "command-following" | "identifying">;
+  /** All robot state kinds the driver advertises it can publish on this
+   *  channel. The "States" sub-step uses this list to render the
+   *  toggleable publish/recorded options. Empty for camera channels. */
+  supported_states?: string[];
   current: SetupBinaryDeviceConfig;
 }
 
@@ -208,7 +212,7 @@ export interface SetupConfigSnapshot {
 
 export interface SetupStateMessage {
   type: "setup_state";
-  step: "devices" | "pairing" | "storage" | "preview";
+  step: "devices" | "states" | "pairing" | "storage" | "preview";
   step_index: number;
   step_name: string;
   total_steps: number;
@@ -239,6 +243,8 @@ export type CommandAction =
   | "setup_cycle_camera_profile"
   | "setup_cycle_robot_mode"
   | "setup_cycle_pair_mapping"
+  | "setup_toggle_publish_state"
+  | "setup_toggle_recorded_state"
   | "setup_cycle_episode_format"
   | "setup_cycle_storage_backend"
   | "setup_cycle_collection_mode"
@@ -372,6 +378,8 @@ export function encodeSetupCommand(
     | "setup_cycle_camera_profile"
     | "setup_cycle_robot_mode"
     | "setup_cycle_pair_mapping"
+    | "setup_toggle_publish_state"
+    | "setup_toggle_recorded_state"
     | "setup_cycle_episode_format"
     | "setup_cycle_storage_backend"
     | "setup_cycle_collection_mode"

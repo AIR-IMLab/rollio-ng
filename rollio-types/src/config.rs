@@ -2514,9 +2514,12 @@ pub struct DeviceChannelConfigV2 {
     #[serde(default)]
     pub command_defaults: ChannelCommandDefaults,
     /// Hardware-reported value limits for each published state kind.
-    /// Persisted in the project config so the visualization layer can render
-    /// limit-aware bars without re-querying the device on every restart.
-    #[serde(default)]
+    /// Skipped during (de)serialization: the controller refreshes these from
+    /// a fresh `query` invocation on every startup (setup and `collect`)
+    /// and feeds them to downstream consumers (visualizer) in-memory only.
+    /// Storing them in the TOML caused stale limits when drivers updated
+    /// and offered no operator value (operators never edit them).
+    #[serde(skip)]
     pub value_limits: Vec<StateValueLimitsEntry>,
     #[serde(flatten, default)]
     pub extra: toml::Table,

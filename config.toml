@@ -20,7 +20,6 @@ enabled = true
 name = "realsense_rgb"
 publish_states = []
 recorded_states = []
-value_limits = []
 
 [devices.channels.profile]
 width = 1920
@@ -41,7 +40,6 @@ enabled = false
 name = "realsense_depth"
 publish_states = []
 recorded_states = []
-value_limits = []
 
 [devices.channels.profile]
 width = 1280
@@ -62,7 +60,6 @@ enabled = false
 name = "realsense_ir"
 publish_states = []
 recorded_states = []
-value_limits = []
 
 [devices.channels.profile]
 width = 1280
@@ -91,7 +88,6 @@ name = "camera"
 channel_label = "V4L2 Camera"
 publish_states = []
 recorded_states = []
-value_limits = []
 
 [devices.channels.profile]
 width = 1280
@@ -121,7 +117,6 @@ name = "camera_2"
 channel_label = "V4L2 Camera"
 publish_states = []
 recorded_states = []
-value_limits = []
 
 [devices.channels.profile]
 width = 1280
@@ -172,84 +167,6 @@ joint_mit_kd = []
 parallel_mit_kp = []
 parallel_mit_kd = []
 
-[[devices.channels.value_limits]]
-state_kind = "joint_position"
-min = [
-    -3.141592653589793,
-    -2.9671,
-    -0.087266,
-    -3.0107,
-    -1.7628,
-    -3.0107,
-]
-max = [
-    2.0944,
-    0.17453,
-    3.141592653589793,
-    3.0107,
-    1.7628,
-    3.0107,
-]
-
-[[devices.channels.value_limits]]
-state_kind = "joint_velocity"
-min = [
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-]
-max = [
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-]
-
-[[devices.channels.value_limits]]
-state_kind = "joint_effort"
-min = [
-    -50.0,
-    -50.0,
-    -50.0,
-    -50.0,
-    -50.0,
-    -50.0,
-]
-max = [
-    50.0,
-    50.0,
-    50.0,
-    50.0,
-    50.0,
-    50.0,
-]
-
-[[devices.channels.value_limits]]
-state_kind = "end_effector_pose"
-min = [
-    -0.6,
-    -0.6,
-    -0.1,
-    -1.0,
-    -1.0,
-    -1.0,
-    -1.0,
-]
-max = [
-    0.6,
-    0.6,
-    0.7,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-]
-
 [[devices.channels]]
 channel_type = "e2"
 kind = "robot"
@@ -271,21 +188,6 @@ joint_mit_kp = []
 joint_mit_kd = []
 parallel_mit_kp = [0.0]
 parallel_mit_kd = [0.0]
-
-[[devices.channels.value_limits]]
-state_kind = "parallel_position"
-min = [0.0]
-max = [0.07]
-
-[[devices.channels.value_limits]]
-state_kind = "parallel_velocity"
-min = [-0.5]
-max = [0.5]
-
-[[devices.channels.value_limits]]
-state_kind = "parallel_effort"
-min = [-10.0]
-max = [10.0]
 
 [[devices]]
 name = "airbot_play_2"
@@ -323,84 +225,6 @@ joint_mit_kd = []
 parallel_mit_kp = []
 parallel_mit_kd = []
 
-[[devices.channels.value_limits]]
-state_kind = "joint_position"
-min = [
-    -3.141592653589793,
-    -2.9671,
-    -0.087266,
-    -3.0107,
-    -1.7628,
-    -3.0107,
-]
-max = [
-    2.0944,
-    0.17453,
-    3.141592653589793,
-    3.0107,
-    1.7628,
-    3.0107,
-]
-
-[[devices.channels.value_limits]]
-state_kind = "joint_velocity"
-min = [
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-    -3.141592653589793,
-]
-max = [
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-    3.141592653589793,
-]
-
-[[devices.channels.value_limits]]
-state_kind = "joint_effort"
-min = [
-    -50.0,
-    -50.0,
-    -50.0,
-    -50.0,
-    -50.0,
-    -50.0,
-]
-max = [
-    50.0,
-    50.0,
-    50.0,
-    50.0,
-    50.0,
-    50.0,
-]
-
-[[devices.channels.value_limits]]
-state_kind = "end_effector_pose"
-min = [
-    -0.6,
-    -0.6,
-    -0.1,
-    -1.0,
-    -1.0,
-    -1.0,
-    -1.0,
-]
-max = [
-    0.6,
-    0.6,
-    0.7,
-    1.0,
-    1.0,
-    1.0,
-    1.0,
-]
-
 [[devices.channels]]
 channel_type = "g2"
 kind = "robot"
@@ -422,21 +246,6 @@ joint_mit_kp = []
 joint_mit_kd = []
 parallel_mit_kp = [10.0]
 parallel_mit_kd = [0.5]
-
-[[devices.channels.value_limits]]
-state_kind = "parallel_position"
-min = [0.0]
-max = [0.07]
-
-[[devices.channels.value_limits]]
-state_kind = "parallel_velocity"
-min = [-0.5]
-max = [0.5]
-
-[[devices.channels.value_limits]]
-state_kind = "parallel_effort"
-min = [-10.0]
-max = [10.0]
 
 [[pairings]]
 leader_device = "airbot_play"

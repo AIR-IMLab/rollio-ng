@@ -4,7 +4,6 @@ use iceoryx2::prelude::*;
 use rollio_bus::CONTROL_EVENTS_SERVICE;
 use rollio_types::config::{
     MappingStrategy, RobotCommandKind, RobotStateKind, TeleopRuntimeConfigV2,
-    DEFAULT_TELEOP_SYNC_COMPLETE_THRESHOLD_RAD, DEFAULT_TELEOP_SYNC_MAX_STEP_RAD,
 };
 use rollio_types::messages::{
     ControlEvent, JointMitCommand15, JointVector15, ParallelMitCommand2, ParallelVector2, Pose7,
@@ -13,6 +12,57 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Initial-syncing ramp constants (intentionally not exposed via config).
+//
+// These values are safety-critical: they bound how aggressively the router
+// closes the gap between the leader and the follower at teleop startup. We
+// keep them as compile-time constants in the router crate so that operators
+// cannot accidentally widen them through a config tweak. If you really need
+// to tune them, adjust the constants here and rebuild.
+// ---------------------------------------------------------------------------
+
+/// Maximum per-cycle joint step (rad) while the joint-mapping ramp is
+/// active. Originally 0.005 rad/tick; bumped 5x to 0.025 rad/tick so the
+/// position-error torque (`KP * step`) is large enough to overcome the
+/// 40% un-compensated gravity term on the airbot-play's joints 1-3
+/// (see `gravity_coefficients` in airbot-play-rust). At a 250 Hz router
+/// loop this caps startup joint speed at ~6.25 rad/s (~358 deg/s).
+const SYNC_MAX_STEP_RAD: f64 = 0.025;
+/// Per-joint distance under which the joint-mapping ramp is considered
+/// complete and pass-through forwarding takes over. Sized at ~10x the
+/// per-tick step so the ramp has comfortable headroom to terminate even
+/// if the operator never aligns the two arms perfectly.
+const SYNC_COMPLETE_THRESHOLD_RAD: f64 = 0.25;
+/// Maximum per-cycle translational step (metres) while the cartesian ramp
+/// is active. The follower's published EE position is moved at most this
+/// far toward the leader each tick. Originally 0.001 m/tick; bumped 5x
+/// to 0.005 m/tick so the IK-projected joint deltas are large enough
+/// for the position loop (`KP * step`) to overcome the airbot-play's
+/// 40% un-compensated gravity term on joints 1-3. At a 250 Hz router
+/// loop this caps startup translational speed at ~1.25 m/s.
+const SYNC_MAX_STEP_M: f64 = 0.005;
+/// Maximum per-cycle rotational step (rad) while the cartesian ramp is
+/// active. The follower's published EE orientation is slerped toward the
+/// leader by at most this angle per tick. At a 250 Hz router loop this
+/// caps startup angular speed at ~2.5 rad/s (~143 deg/s) — chosen so the
+/// follower can keep up with normal operator hand rotation; lower values
+/// caused the ramp to permanently trail the leader by tens of degrees
+/// because the operator naturally rotates faster than the cap.
+const SYNC_MAX_STEP_ROT_RAD: f64 = 0.01;
+/// Translational error (metres) under which the cartesian ramp is
+/// considered complete (in conjunction with the rotational threshold).
+/// Sized at ~5x the per-tick step so the ramp has comfortable headroom
+/// to terminate.
+const SYNC_COMPLETE_THRESHOLD_M: f64 = 0.025;
+/// Rotational error (rad) under which the cartesian ramp is considered
+/// complete (in conjunction with the translational threshold). Sized at
+/// ~10x the per-tick rotational step (matching the joint-mapping
+/// headroom) so that pass-through can engage once the follower is
+/// approximately aligned (~5.7 deg) without requiring the operator to
+/// hold the leader within a fraction of a degree of the follower.
+const SYNC_COMPLETE_THRESHOLD_ROT_RAD: f64 = 0.1;
 
 type ControlSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::Service, ControlEvent, ()>;
 
@@ -79,81 +129,177 @@ enum LeaderState {
     Pose(Pose7),
 }
 
-/// Two-phase teleop ramp:
+/// Two-phase teleop ramp shared between the joint-mapping and cartesian
+/// teleop policies:
 ///
-/// 1. **Initial syncing** — every published command is clamped to within
-///    `max_step_rad` of the follower's current joint position so the arm
-///    eases into the leader's pose without snapping. Active until the
-///    follower lies within `complete_threshold_rad` of the leader on every
-///    joint, at which point the router transitions to pass-through.
+/// 1. **Initial syncing** — every published command is clamped so the
+///    follower eases toward the leader without snapping. Concretely:
+///    - For the *joint* variant, each joint target is at most
+///      [`SYNC_MAX_STEP_RAD`] away from the follower's reported joint
+///      position. The phase is considered complete once every joint
+///      difference is at or below [`SYNC_COMPLETE_THRESHOLD_RAD`].
+///    - For the *cartesian* variant, the EE position target moves at
+///      most [`SYNC_MAX_STEP_M`] per cycle and the orientation slerps by
+///      at most [`SYNC_MAX_STEP_ROT_RAD`] per cycle. The phase is
+///      considered complete once both translational and rotational error
+///      drop below [`SYNC_COMPLETE_THRESHOLD_M`] / [`SYNC_COMPLETE_THRESHOLD_ROT_RAD`].
 /// 2. **Pass-through** — the leader target is forwarded to the follower
-///    untouched, including jumps larger than `complete_threshold_rad`. The
-///    rationale (see user spec) is that smoothing big diffs at this stage
-///    would inject lag that the operator can't predict, which is more
-///    dangerous than letting the follower's lower-level controller decide
-///    how to track the new target.
+///    untouched, including jumps larger than the completion threshold.
+///    The rationale (see user spec) is that smoothing big diffs at this
+///    stage would inject lag that the operator can't predict, which is
+///    more dangerous than letting the follower's lower-level controller
+///    decide how to track the new target.
 ///
-/// Sync is automatically disabled when the configured kind is not joint /
-/// parallel position, or when no follower state subscription is available.
-struct SyncState {
+/// Sync is automatically disabled (the router defaults to pure
+/// pass-through) when the follower-state subscription is missing or when
+/// the configured state/command kinds don't match either ramp.
+///
+/// While syncing, if no follower-state sample has been received yet, the
+/// router holds (skips publishing) and waits for follower feedback. This
+/// is intentionally stricter than letting the leader value through
+/// unclamped: the whole point of the ramp is to ensure the very first
+/// command we publish is close to where the follower already is.
+///
+/// The ramp parameters (`SYNC_MAX_STEP_*` and `SYNC_COMPLETE_THRESHOLD_*`)
+/// are intentionally compile-time constants and are NOT exposed via
+/// `TeleopRuntimeConfigV2`. They are safety-critical defaults that bound
+/// the worst-case startup motion; any deployed config can therefore be
+/// audited for correctness without inspecting per-channel overrides. The
+/// `sync_max_step_rad` / `sync_complete_threshold_rad` fields on
+/// `TeleopRuntimeConfigV2` remain for backwards-compatible deserialisation
+/// only and are deliberately ignored by this module.
+enum SyncState {
+    Disabled,
+    Joint(JointSyncState),
+    Cartesian(CartesianSyncState),
+}
+
+struct JointSyncState {
     synced: bool,
-    enabled: bool,
     max_step: f64,
     complete_threshold: f64,
 }
 
+struct CartesianSyncState {
+    synced: bool,
+    max_step_m: f64,
+    max_step_rot_rad: f64,
+    complete_threshold_m: f64,
+    complete_threshold_rot_rad: f64,
+    /// Internal monotonic ramp anchor. Initialized once from the
+    /// follower's first reported EE pose, then advanced toward the
+    /// leader by at most (`max_step_m`, `max_step_rot_rad`) per tick.
+    /// The published target is this state, NOT a function of the live
+    /// follower pose, so FK/IK noise on the follower side cannot leak
+    /// back into the published command and create a closed-loop
+    /// oscillation. (Joint mapping uses live follower as anchor without
+    /// problems because joint->joint mapping has no FK/IK in the loop
+    /// to amplify noise; cartesian does, hence the asymmetry.)
+    ramp_pose: Option<Pose7>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncOutcome {
+    /// The forwarded command (mutated in-place by `apply`) is safe to
+    /// publish to the follower this cycle.
+    Publish,
+    /// The router does not yet have enough information (typically: no
+    /// follower-state sample seen) to safely publish a clamped command.
+    /// The caller MUST drop this leader sample without publishing and
+    /// without advancing the last-forwarded timestamp, so the next loop
+    /// iteration re-evaluates as soon as follower feedback arrives.
+    Hold,
+}
+
 impl SyncState {
     fn new(config: &TeleopRuntimeConfigV2) -> Self {
-        let kind = config.follower_state_kind;
-        let supports_kind = matches!(
-            kind,
-            Some(RobotStateKind::JointPosition) | Some(RobotStateKind::ParallelPosition),
-        );
-        let has_topic = config.follower_state_topic.is_some();
-        let supports_command = matches!(
-            config.follower_command_kind,
-            RobotCommandKind::JointPosition
+        let has_follower_topic = config.follower_state_topic.is_some();
+        if !has_follower_topic {
+            return SyncState::Disabled;
+        }
+        match (config.mapping, config.follower_state_kind, config.follower_command_kind) {
+            (
+                MappingStrategy::Cartesian,
+                Some(RobotStateKind::EndEffectorPose),
+                RobotCommandKind::EndPose,
+            ) => SyncState::Cartesian(CartesianSyncState {
+                synced: false,
+                max_step_m: SYNC_MAX_STEP_M,
+                max_step_rot_rad: SYNC_MAX_STEP_ROT_RAD,
+                complete_threshold_m: SYNC_COMPLETE_THRESHOLD_M,
+                complete_threshold_rot_rad: SYNC_COMPLETE_THRESHOLD_ROT_RAD,
+                ramp_pose: None,
+            }),
+            (
+                MappingStrategy::DirectJoint,
+                Some(RobotStateKind::JointPosition) | Some(RobotStateKind::ParallelPosition),
+                RobotCommandKind::JointPosition
                 | RobotCommandKind::JointMit
                 | RobotCommandKind::ParallelPosition
                 | RobotCommandKind::ParallelMit,
-        );
-        let enabled = has_topic && supports_kind && supports_command;
-        Self {
-            synced: false,
-            enabled,
-            max_step: config
-                .sync_max_step_rad
-                .unwrap_or(DEFAULT_TELEOP_SYNC_MAX_STEP_RAD)
-                .abs()
-                .max(f64::EPSILON),
-            complete_threshold: config
-                .sync_complete_threshold_rad
-                .unwrap_or(DEFAULT_TELEOP_SYNC_COMPLETE_THRESHOLD_RAD)
-                .abs()
-                .max(0.0),
+            ) => SyncState::Joint(JointSyncState {
+                synced: false,
+                max_step: SYNC_MAX_STEP_RAD,
+                complete_threshold: SYNC_COMPLETE_THRESHOLD_RAD,
+            }),
+            _ => SyncState::Disabled,
         }
     }
 
     fn enabled(&self) -> bool {
-        self.enabled && !self.synced
+        match self {
+            SyncState::Disabled => false,
+            SyncState::Joint(s) => !s.synced,
+            SyncState::Cartesian(s) => !s.synced,
+        }
     }
 
-    /// Mutate `command` in place so every joint is at most `max_step` away
-    /// from the corresponding follower joint, then mark the router as synced
-    /// once every joint difference is below `complete_threshold`.
+    /// Returns a short label describing the ramp, used in the startup log
+    /// so operators can see at a glance which mode the router booted in.
+    fn mode_label(&self) -> &'static str {
+        match self {
+            SyncState::Disabled => "pass-through",
+            SyncState::Joint(_) => "initial-ramp (joint)",
+            SyncState::Cartesian(_) => "initial-ramp (cartesian)",
+        }
+    }
+
+    /// Clamp `command` toward the follower's current state and tell the
+    /// caller whether to publish this cycle. Must only be invoked while
+    /// `self.enabled()` is true.
     fn apply(
         &mut self,
         command: &mut ForwardedCommand,
         follower: Option<&LeaderState>,
-        _config: &TeleopRuntimeConfigV2,
-    ) {
+    ) -> SyncOutcome {
+        match self {
+            SyncState::Disabled => SyncOutcome::Publish,
+            SyncState::Joint(state) => state.apply(command, follower),
+            SyncState::Cartesian(state) => state.apply(command, follower),
+        }
+    }
+}
+
+impl JointSyncState {
+    fn apply(
+        &mut self,
+        command: &mut ForwardedCommand,
+        follower: Option<&LeaderState>,
+    ) -> SyncOutcome {
         let Some(follower_values) = follower_position_slice(follower) else {
-            // No follower feedback yet — fall back to pass-through this cycle
-            // and try again next time. We don't switch to "synced" because
-            // we still haven't proven the follower is close enough.
-            return;
+            // We refuse to publish until the follower has reported its
+            // current pose at least once. Holding here matches the
+            // safety stance of the cartesian ramp and prevents an
+            // unbounded first command from being forwarded if the
+            // follower-state subscriber never fires.
+            return SyncOutcome::Hold;
         };
-        let target = command_target_slice_mut(command);
+        let Some(target) = command_joint_target_mut(command) else {
+            // Should be unreachable thanks to the kind check in
+            // `SyncState::new`, but bail safely if a future code path
+            // builds a non-joint command on the joint ramp.
+            return SyncOutcome::Publish;
+        };
         let len = target.len().min(follower_values.len());
         let mut max_diff = 0.0f64;
         for i in 0..len {
@@ -165,10 +311,82 @@ impl SyncState {
         if max_diff <= self.complete_threshold {
             self.synced = true;
             eprintln!(
-                "rollio-teleop-router: initial sync complete (max diff {:.4} rad <= threshold {:.4} rad)",
+                "rollio-teleop-router: initial sync complete (joint max diff {:.4} rad <= threshold {:.4} rad)",
                 max_diff, self.complete_threshold
             );
         }
+        SyncOutcome::Publish
+    }
+}
+
+impl CartesianSyncState {
+    fn apply(
+        &mut self,
+        command: &mut ForwardedCommand,
+        follower: Option<&LeaderState>,
+    ) -> SyncOutcome {
+        let Some(target) = command_pose_mut(command) else {
+            return SyncOutcome::Publish;
+        };
+        let leader_p = pose_position(target);
+        let leader_q_raw = pose_quat(target);
+
+        // Initialize the internal ramp anchor exactly once, from the
+        // first follower-state sample we see. After that we never read
+        // the live follower pose again — the ramp advances purely from
+        // its previous internal state, decoupling the published
+        // command from FK noise on the follower side. (Without this,
+        // follower jitter -> published target jitter -> IK jitter ->
+        // joint command jitter -> more follower jitter, a closed-loop
+        // oscillation that joint-mapping doesn't suffer because it
+        // bypasses FK/IK.)
+        if self.ramp_pose.is_none() {
+            let Some(follower_pose) = follower_pose(follower) else {
+                // Hold publishing until we've seen a follower sample,
+                // so the ramp anchor starts at a sane place near the
+                // arm's current EE pose.
+                return SyncOutcome::Hold;
+            };
+            self.ramp_pose = Some(follower_pose);
+        }
+        let ramp = self.ramp_pose.as_mut().expect("ramp_pose set above");
+        let mut anchor_p = pose_position(ramp);
+        let mut anchor_q = pose_quat(ramp);
+
+        // Hemisphere-align the leader's quat against the ramp anchor
+        // (NOT against the live follower) so subsequent slerp/error
+        // computations are consistent with the ramp's progression.
+        let leader_q = quat_align_shortest(&leader_q_raw, &anchor_q);
+
+        // Step the ramp anchor toward the leader by at most max_step.
+        // `clamp_*` mutates `next_*` in place so it lands at most
+        // max_step away from anchor; the return value is the original
+        // gap (used for completion).
+        let mut next_p = leader_p;
+        let translational_error = clamp_translation(&mut next_p, &anchor_p, self.max_step_m);
+        let mut next_q = leader_q;
+        let rotational_error =
+            clamp_rotation(&mut next_q, &anchor_q, self.max_step_rot_rad);
+
+        anchor_p = next_p;
+        anchor_q = next_q;
+        write_pose(ramp, &anchor_p, &anchor_q);
+        write_pose(target, &anchor_p, &anchor_q);
+
+        if translational_error <= self.complete_threshold_m
+            && rotational_error <= self.complete_threshold_rot_rad
+        {
+            self.synced = true;
+            eprintln!(
+                "rollio-teleop-router: initial sync complete (cartesian \
+                 translation {:.4} m <= {:.4} m, rotation {:.4} rad <= {:.4} rad)",
+                translational_error,
+                self.complete_threshold_m,
+                rotational_error,
+                self.complete_threshold_rot_rad,
+            );
+        }
+        SyncOutcome::Publish
     }
 }
 
@@ -179,29 +397,180 @@ fn follower_position_slice(state: Option<&LeaderState>) -> Option<&[f64]> {
     }
 }
 
-/// Mutable view into the joint-target portion of a forwarded command. Pose
-/// commands are not rate-limited because the syncing phase only applies to
-/// joint-space mappings (see `SyncState::new`).
-fn command_target_slice_mut(command: &mut ForwardedCommand) -> &mut [f64] {
+fn follower_pose(state: Option<&LeaderState>) -> Option<Pose7> {
+    match state? {
+        LeaderState::Pose(pose) => Some(*pose),
+        LeaderState::Vector { .. } => None,
+    }
+}
+
+/// Mutable view into the joint-target portion of a forwarded command.
+/// Returns `None` for pose commands; the cartesian ramp uses
+/// `command_pose_mut` instead.
+fn command_joint_target_mut(command: &mut ForwardedCommand) -> Option<&mut [f64]> {
     match command {
         ForwardedCommand::JointPosition(payload) => {
             let len = payload.len as usize;
-            &mut payload.values[..len]
+            Some(&mut payload.values[..len])
         }
         ForwardedCommand::JointMit(payload) => {
             let len = payload.len as usize;
-            &mut payload.position[..len]
+            Some(&mut payload.position[..len])
         }
         ForwardedCommand::ParallelPosition(payload) => {
             let len = payload.len as usize;
-            &mut payload.values[..len]
+            Some(&mut payload.values[..len])
         }
         ForwardedCommand::ParallelMit(payload) => {
             let len = payload.len as usize;
-            &mut payload.position[..len]
+            Some(&mut payload.position[..len])
         }
-        ForwardedCommand::EndPose(_) => &mut [],
+        ForwardedCommand::EndPose(_) => None,
     }
+}
+
+/// Mutable view into the pose payload of a forwarded command. Returns
+/// `None` for joint-space commands; the joint ramp uses
+/// `command_joint_target_mut` instead.
+fn command_pose_mut(command: &mut ForwardedCommand) -> Option<&mut Pose7> {
+    match command {
+        ForwardedCommand::EndPose(pose) => Some(pose),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cartesian helpers
+//
+// `Pose7.values` layout is `[x, y, z, qx, qy, qz, qw]` (w-last quaternion
+// convention, see `robots/airbot_play_rust/src/bin/device.rs`). Helpers
+// below operate on plain `[f64; N]` arrays so they can be unit-tested
+// without dragging in a quaternion library; if we ever pull in `nalgebra`
+// or similar, the implementations can be swapped without changing call
+// sites.
+// ---------------------------------------------------------------------------
+
+fn pose_position(p: &Pose7) -> [f64; 3] {
+    [p.values[0], p.values[1], p.values[2]]
+}
+
+fn pose_quat(p: &Pose7) -> [f64; 4] {
+    [p.values[3], p.values[4], p.values[5], p.values[6]]
+}
+
+fn write_pose(p: &mut Pose7, position: &[f64; 3], quat: &[f64; 4]) {
+    p.values[0] = position[0];
+    p.values[1] = position[1];
+    p.values[2] = position[2];
+    p.values[3] = quat[0];
+    p.values[4] = quat[1];
+    p.values[5] = quat[2];
+    p.values[6] = quat[3];
+}
+
+fn quat_dot(a: &[f64; 4], b: &[f64; 4]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+}
+
+/// Flip the sign of `target` if it lies on the opposite hemisphere from
+/// `reference`, so subsequent slerp/error computations follow the short
+/// path. Quaternions `q` and `-q` represent the same rotation.
+fn quat_align_shortest(target: &[f64; 4], reference: &[f64; 4]) -> [f64; 4] {
+    if quat_dot(target, reference) < 0.0 {
+        [-target[0], -target[1], -target[2], -target[3]]
+    } else {
+        *target
+    }
+}
+
+/// Angle (rad) between two unit quaternions, assuming they are already
+/// aligned to the same hemisphere via `quat_align_shortest`.
+fn quat_angle_between(a: &[f64; 4], b: &[f64; 4]) -> f64 {
+    // `dot` is `cos(theta/2)` for unit quaternions on the same
+    // hemisphere; clamp to guard against floating-point drift outside
+    // the legal `[-1, 1]` domain of `acos`.
+    let cos_half = quat_dot(a, b).clamp(-1.0, 1.0);
+    2.0 * cos_half.abs().min(1.0).acos()
+}
+
+/// Standard spherical linear interpolation. `t` is clamped to `[0, 1]`.
+/// `from` and `to` are expected to be unit quaternions on the same
+/// hemisphere (see `quat_align_shortest`).
+fn quat_slerp(from: &[f64; 4], to: &[f64; 4], t: f64) -> [f64; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let dot = quat_dot(from, to).clamp(-1.0, 1.0);
+    // For nearly-parallel quaternions, fall back to normalised lerp to
+    // avoid dividing by a near-zero `sin(theta)`.
+    if dot.abs() > 0.9995 {
+        let mut out = [
+            from[0] + t * (to[0] - from[0]),
+            from[1] + t * (to[1] - from[1]),
+            from[2] + t * (to[2] - from[2]),
+            from[3] + t * (to[3] - from[3]),
+        ];
+        normalise_quat(&mut out);
+        return out;
+    }
+    let theta = dot.acos();
+    let sin_theta = theta.sin();
+    let s_from = ((1.0 - t) * theta).sin() / sin_theta;
+    let s_to = (t * theta).sin() / sin_theta;
+    let mut out = [
+        s_from * from[0] + s_to * to[0],
+        s_from * from[1] + s_to * to[1],
+        s_from * from[2] + s_to * to[2],
+        s_from * from[3] + s_to * to[3],
+    ];
+    normalise_quat(&mut out);
+    out
+}
+
+fn normalise_quat(q: &mut [f64; 4]) {
+    let norm_sq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if norm_sq > 0.0 {
+        let inv = 1.0 / norm_sq.sqrt();
+        q[0] *= inv;
+        q[1] *= inv;
+        q[2] *= inv;
+        q[3] *= inv;
+    }
+}
+
+/// Move `target` so it is at most `max_step` away (Euclidean norm in
+/// metres) from `anchor`. Returns the original distance between the two
+/// before clamping, so the caller can decide whether the ramp is
+/// complete.
+fn clamp_translation(target: &mut [f64; 3], anchor: &[f64; 3], max_step: f64) -> f64 {
+    let dx = target[0] - anchor[0];
+    let dy = target[1] - anchor[1];
+    let dz = target[2] - anchor[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+    if dist > max_step {
+        let scale = max_step / dist;
+        target[0] = anchor[0] + dx * scale;
+        target[1] = anchor[1] + dy * scale;
+        target[2] = anchor[2] + dz * scale;
+    }
+    dist
+}
+
+/// Slerp `target_q` toward `anchor_q`'s neighbourhood by at most
+/// `max_step` radians. Returns the original angular distance between the
+/// two (before clamping). Both quaternions must already be aligned to
+/// the same hemisphere via `quat_align_shortest`.
+fn clamp_rotation(target_q: &mut [f64; 4], anchor_q: &[f64; 4], max_step: f64) -> f64 {
+    let angle = quat_angle_between(anchor_q, target_q);
+    if angle > max_step && angle > f64::EPSILON {
+        let t = max_step / angle;
+        // Slerp from the anchor toward the leader's target by the
+        // fraction that corresponds to `max_step` radians.
+        let stepped = quat_slerp(anchor_q, target_q, t);
+        target_q[0] = stepped[0];
+        target_q[1] = stepped[1];
+        target_q[2] = stepped[2];
+        target_q[3] = stepped[3];
+    }
+    angle
 }
 
 pub fn run_cli() -> Result<(), Box<dyn Error>> {
@@ -253,11 +622,7 @@ pub fn run_router(config: TeleopRuntimeConfigV2) -> Result<(), Box<dyn Error>> {
         config.leader_channel_id,
         config.follower_channel_id,
         config.mapping,
-        if sync_state.enabled() {
-            "initial-ramp"
-        } else {
-            "pass-through"
-        }
+        sync_state.mode_label(),
     );
 
     loop {
@@ -279,11 +644,25 @@ pub fn run_router(config: TeleopRuntimeConfigV2) -> Result<(), Box<dyn Error>> {
             }
             let mapped = map_leader_state(&config, &state)?;
             if let Some(mut forwarded) = mapped {
-                if sync_state.enabled() {
-                    sync_state.apply(&mut forwarded, follower_state.as_ref(), &config);
+                let outcome = if sync_state.enabled() {
+                    sync_state.apply(&mut forwarded, follower_state.as_ref())
+                } else {
+                    SyncOutcome::Publish
+                };
+                match outcome {
+                    SyncOutcome::Publish => {
+                        publish_command(&follower_command_publisher, forwarded)?;
+                        last_forwarded_timestamp_ms = Some(timestamp_ms);
+                    }
+                    SyncOutcome::Hold => {
+                        // Deliberately do NOT advance
+                        // `last_forwarded_timestamp_ms`: we want the
+                        // next loop iteration to re-evaluate the same
+                        // leader sample once follower feedback lands,
+                        // so the very first published command is
+                        // close to the follower's current pose.
+                    }
                 }
-                publish_command(&follower_command_publisher, forwarded)?;
-                last_forwarded_timestamp_ms = Some(timestamp_ms);
                 continue;
             }
         }
@@ -706,8 +1085,18 @@ mod tests {
         let mut config = direct_config();
         config.follower_state_kind = Some(RobotStateKind::JointPosition);
         config.follower_state_topic = Some("follower/arm/states/joint_position".into());
-        config.sync_max_step_rad = Some(0.005);
-        config.sync_complete_threshold_rad = Some(0.01);
+        config
+    }
+
+    fn cartesian_sync_config() -> TeleopRuntimeConfigV2 {
+        let mut config = direct_config();
+        config.mapping = MappingStrategy::Cartesian;
+        config.leader_state_kind = RobotStateKind::EndEffectorPose;
+        config.leader_state_topic = "leader/arm/states/end_effector_pose".into();
+        config.follower_command_kind = RobotCommandKind::EndPose;
+        config.follower_command_topic = "follower/arm/commands/end_pose".into();
+        config.follower_state_kind = Some(RobotStateKind::EndEffectorPose);
+        config.follower_state_topic = Some("follower/arm/states/end_effector_pose".into());
         config
     }
 
@@ -716,6 +1105,7 @@ mod tests {
         let config = direct_config();
         let sync_state = SyncState::new(&config);
         assert!(!sync_state.enabled());
+        assert!(matches!(sync_state, SyncState::Disabled));
     }
 
     #[test]
@@ -723,6 +1113,7 @@ mod tests {
         let config = sync_config();
         let sync_state = SyncState::new(&config);
         assert!(sync_state.enabled());
+        assert!(matches!(sync_state, SyncState::Joint(_)));
     }
 
     #[test]
@@ -737,23 +1128,26 @@ mod tests {
             timestamp_ms: 100,
             values: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         };
-        sync_state.apply(&mut command, Some(&follower), &config);
+        let outcome = sync_state.apply(&mut command, Some(&follower));
+        assert_eq!(outcome, SyncOutcome::Publish);
         let ForwardedCommand::JointPosition(command) = command else {
             panic!("expected joint-position command");
         };
-        // Each joint should be at most 0.005 away from the corresponding
-        // follower position (i.e. clamped from the leader's larger delta).
+        // Each joint should be at most SYNC_MAX_STEP_RAD away from the
+        // corresponding follower position (i.e. clamped from the
+        // leader's larger delta).
         let positions = &command.values[..6];
         for (i, value) in positions.iter().enumerate() {
             assert!(
-                value.abs() <= 0.005 + f64::EPSILON,
-                "joint {} clamped to {}, expected within 0.005 of follower (0.0)",
+                value.abs() <= SYNC_MAX_STEP_RAD + f64::EPSILON,
+                "joint {} clamped to {}, expected within {} of follower (0.0)",
                 i,
                 value,
+                SYNC_MAX_STEP_RAD,
             );
         }
         // Sync remains active because the leader is still well above the
-        // 0.01 rad completion threshold.
+        // completion threshold.
         assert!(sync_state.enabled());
     }
 
@@ -761,34 +1155,41 @@ mod tests {
     fn sync_completes_once_within_threshold() {
         let config = sync_config();
         let mut sync_state = SyncState::new(&config);
+        // Use values strictly inside SYNC_COMPLETE_THRESHOLD_RAD (0.05
+        // rad) so a single apply finishes the ramp.
         let mut command = ForwardedCommand::JointPosition(JointVector15::from_slice(
             123,
-            &[0.005, 0.005, 0.005, 0.005, 0.005, 0.005],
+            &[0.04, 0.04, 0.04, 0.04, 0.04, 0.04],
         ));
         let follower = LeaderState::Vector {
             timestamp_ms: 100,
             values: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         };
-        sync_state.apply(&mut command, Some(&follower), &config);
-        // Once the difference is <= the configured threshold the router
-        // exits the syncing phase.
+        let outcome = sync_state.apply(&mut command, Some(&follower));
+        assert_eq!(outcome, SyncOutcome::Publish);
+        // Once the difference is <= the threshold the router exits the
+        // syncing phase.
         assert!(!sync_state.enabled());
     }
 
     #[test]
-    fn sync_passes_through_when_no_follower_feedback() {
-        // Even with sync configured, if the follower never reports a state
-        // we do *not* clamp (and we stay in syncing mode for next cycle).
+    fn sync_holds_when_no_follower_feedback() {
+        // If the follower never reports a state we deliberately refuse
+        // to publish (Hold) instead of forwarding the leader's value
+        // unclamped. Stays in syncing mode so the next cycle can retry.
         let config = sync_config();
         let mut sync_state = SyncState::new(&config);
         let mut command = ForwardedCommand::JointPosition(JointVector15::from_slice(
             123,
             &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
         ));
-        sync_state.apply(&mut command, None, &config);
+        let outcome = sync_state.apply(&mut command, None);
+        assert_eq!(outcome, SyncOutcome::Hold);
         let ForwardedCommand::JointPosition(command) = command else {
             panic!("expected joint-position command");
         };
+        // Command was left untouched so the caller can re-evaluate it
+        // next iteration once follower feedback lands.
         assert_eq!(&command.values[..6], &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5]);
         assert!(sync_state.enabled());
     }
@@ -796,29 +1197,237 @@ mod tests {
     #[test]
     fn sync_passes_through_after_completion_even_for_big_jumps() {
         // Reflects the user spec: once sync completes, large diffs are
-        // forwarded as-is because rate-limiting at this stage would inject
-        // dangerous lag.
+        // forwarded as-is because rate-limiting at this stage would
+        // inject dangerous lag. The actual pass-through is driven by
+        // the loop's `enabled()` gate, so this test documents the
+        // invariant.
         let config = sync_config();
         let mut sync_state = SyncState::new(&config);
-        sync_state.synced = true;
-        let mut command = ForwardedCommand::JointPosition(JointVector15::from_slice(
-            123,
-            &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
-        ));
-        let follower = LeaderState::Vector {
-            timestamp_ms: 100,
-            values: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        let SyncState::Joint(ref mut joint) = sync_state else {
+            panic!("expected joint sync state");
         };
-        // Even though `apply` is reachable when synced is true, the higher
-        // level loop only calls it while `enabled()` is true, so this test
-        // documents the invariant rather than executing the rate limiter.
+        joint.synced = true;
         assert!(!sync_state.enabled());
-        sync_state.apply(&mut command, Some(&follower), &config);
-        // Calling apply manually still clamps the values; the actual
-        // pass-through behaviour comes from `enabled()` gating.
-        let ForwardedCommand::JointPosition(command) = command else {
-            panic!("expected joint-position command");
+    }
+
+    // -------------------------------------------------------------------
+    // Cartesian sync tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cartesian_sync_disabled_when_no_follower_state_configured() {
+        let mut config = cartesian_sync_config();
+        config.follower_state_topic = None;
+        config.follower_state_kind = None;
+        let sync_state = SyncState::new(&config);
+        assert!(!sync_state.enabled());
+        assert!(matches!(sync_state, SyncState::Disabled));
+    }
+
+    #[test]
+    fn cartesian_sync_enabled_when_follower_pose_configured() {
+        let config = cartesian_sync_config();
+        let sync_state = SyncState::new(&config);
+        assert!(sync_state.enabled());
+        assert!(matches!(sync_state, SyncState::Cartesian(_)));
+    }
+
+    #[test]
+    fn cartesian_sync_clamps_translation_when_far() {
+        let config = cartesian_sync_config();
+        let mut sync_state = SyncState::new(&config);
+        // Leader is 1 m away from the follower along +X. The follower
+        // reports the origin with identity orientation.
+        let mut command = ForwardedCommand::EndPose(Pose7 {
+            timestamp_ms: 123,
+            values: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        });
+        let follower = LeaderState::Pose(Pose7 {
+            timestamp_ms: 100,
+            values: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        });
+        let outcome = sync_state.apply(&mut command, Some(&follower));
+        assert_eq!(outcome, SyncOutcome::Publish);
+        let ForwardedCommand::EndPose(command) = command else {
+            panic!("expected pose command");
         };
-        assert!(command.values[0] <= 0.005 + f64::EPSILON);
+        let dx = command.values[0];
+        let dy = command.values[1];
+        let dz = command.values[2];
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        assert!(
+            dist <= SYNC_MAX_STEP_M + 1e-9,
+            "translational step {} exceeded SYNC_MAX_STEP_M ({})",
+            dist,
+            SYNC_MAX_STEP_M,
+        );
+        // Step direction should still point toward the leader (+X).
+        assert!(dx > 0.0);
+        // Sync remains active: 1 m >> SYNC_COMPLETE_THRESHOLD_M.
+        assert!(sync_state.enabled());
+    }
+
+    #[test]
+    fn cartesian_sync_clamps_rotation_when_far() {
+        let config = cartesian_sync_config();
+        let mut sync_state = SyncState::new(&config);
+        // Leader is +90 deg around Z relative to follower (identity).
+        // qz = sin(45 deg), qw = cos(45 deg).
+        let half_angle = std::f64::consts::FRAC_PI_4;
+        let mut command = ForwardedCommand::EndPose(Pose7 {
+            timestamp_ms: 123,
+            values: [0.0, 0.0, 0.0, 0.0, 0.0, half_angle.sin(), half_angle.cos()],
+        });
+        let follower = LeaderState::Pose(Pose7 {
+            timestamp_ms: 100,
+            values: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        });
+        let outcome = sync_state.apply(&mut command, Some(&follower));
+        assert_eq!(outcome, SyncOutcome::Publish);
+        let ForwardedCommand::EndPose(command) = command else {
+            panic!("expected pose command");
+        };
+        let target_q = pose_quat(&command);
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let angle = quat_angle_between(&identity, &target_q);
+        assert!(
+            angle <= SYNC_MAX_STEP_ROT_RAD + 1e-9,
+            "rotational step {} exceeded SYNC_MAX_STEP_ROT_RAD ({})",
+            angle,
+            SYNC_MAX_STEP_ROT_RAD,
+        );
+        // The step should still rotate around +Z (toward the leader).
+        assert!(target_q[2] > 0.0);
+        assert!(sync_state.enabled());
+    }
+
+    #[test]
+    fn cartesian_sync_completes_once_within_thresholds() {
+        let config = cartesian_sync_config();
+        let mut sync_state = SyncState::new(&config);
+        // Pick errors strictly under both completion thresholds so a
+        // single apply marks the ramp complete.
+        let small_translation = SYNC_COMPLETE_THRESHOLD_M * 0.5;
+        let small_half_angle = SYNC_COMPLETE_THRESHOLD_ROT_RAD * 0.25;
+        let mut command = ForwardedCommand::EndPose(Pose7 {
+            timestamp_ms: 123,
+            values: [
+                small_translation,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                small_half_angle.sin(),
+                small_half_angle.cos(),
+            ],
+        });
+        let follower = LeaderState::Pose(Pose7 {
+            timestamp_ms: 100,
+            values: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        });
+        let outcome = sync_state.apply(&mut command, Some(&follower));
+        assert_eq!(outcome, SyncOutcome::Publish);
+        assert!(!sync_state.enabled());
+    }
+
+    #[test]
+    fn cartesian_sync_holds_when_no_follower_feedback() {
+        // Cartesian ramp must also refuse to publish without a follower
+        // pose to anchor against.
+        let config = cartesian_sync_config();
+        let mut sync_state = SyncState::new(&config);
+        let original = Pose7 {
+            timestamp_ms: 123,
+            values: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        };
+        let mut command = ForwardedCommand::EndPose(original);
+        let outcome = sync_state.apply(&mut command, None);
+        assert_eq!(outcome, SyncOutcome::Hold);
+        let ForwardedCommand::EndPose(command) = command else {
+            panic!("expected pose command");
+        };
+        assert_eq!(command.values, original.values);
+        assert!(sync_state.enabled());
+    }
+
+    #[test]
+    fn cartesian_sync_passes_through_after_completion_for_big_jumps() {
+        // Mirrors the joint case: once cartesian sync completes the
+        // loop stops calling apply (because `enabled()` is false), so
+        // big leader jumps are forwarded verbatim by the caller.
+        let config = cartesian_sync_config();
+        let mut sync_state = SyncState::new(&config);
+        let SyncState::Cartesian(ref mut cart) = sync_state else {
+            panic!("expected cartesian sync state");
+        };
+        cart.synced = true;
+        assert!(!sync_state.enabled());
+    }
+
+    // -------------------------------------------------------------------
+    // Quaternion helper tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn quat_slerp_takes_shortest_path() {
+        // A 270 deg rotation around +Z is the same orientation as
+        // -90 deg around +Z; slerp from identity should walk toward
+        // the negative-Z direction (the short way) once we align
+        // hemispheres.
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        // For an angle theta rotation around +Z, q = [0, 0, sin(theta/2),
+        // cos(theta/2)]. theta = 270 deg => half = 135 deg => cos < 0,
+        // so the raw quaternion lies on the opposite hemisphere from
+        // identity (dot = cos(135 deg) < 0).
+        let half_angle = std::f64::consts::PI * 0.75; // 135 deg
+        let raw_target = [0.0, 0.0, half_angle.sin(), half_angle.cos()];
+        let aligned = quat_align_shortest(&raw_target, &identity);
+        // After alignment the target represents the equivalent -90 deg
+        // rotation, so qz should be negative.
+        assert!(aligned[2] < 0.0, "expected aligned qz < 0, got {:?}", aligned);
+        // Slerping halfway should land on -45 deg around +Z, i.e.
+        // qz = sin(-22.5 deg).
+        let halfway = quat_slerp(&identity, &aligned, 0.5);
+        assert!(halfway[2] < 0.0);
+        let expected_z = (-std::f64::consts::FRAC_PI_8).sin();
+        assert!(
+            (halfway[2] - expected_z).abs() < 1e-6,
+            "slerp halfway qz {} != expected {}",
+            halfway[2],
+            expected_z,
+        );
+    }
+
+    #[test]
+    fn clamp_translation_returns_original_distance() {
+        let mut target = [1.0, 0.0, 0.0];
+        let anchor = [0.0, 0.0, 0.0];
+        let dist = clamp_translation(&mut target, &anchor, 0.1);
+        assert!((dist - 1.0).abs() < 1e-9);
+        assert!((target[0] - 0.1).abs() < 1e-9);
+        assert_eq!(target[1], 0.0);
+        assert_eq!(target[2], 0.0);
+    }
+
+    #[test]
+    fn clamp_translation_passes_short_deltas_through() {
+        let mut target = [0.05, 0.0, 0.0];
+        let anchor = [0.0, 0.0, 0.0];
+        let dist = clamp_translation(&mut target, &anchor, 0.1);
+        assert!((dist - 0.05).abs() < 1e-9);
+        // Within max_step, target untouched.
+        assert_eq!(target, [0.05, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn clamp_rotation_returns_original_angle() {
+        let half = std::f64::consts::FRAC_PI_4;
+        let mut target_q = [0.0, 0.0, half.sin(), half.cos()]; // 90 deg around +Z
+        let anchor_q = [0.0, 0.0, 0.0, 1.0];
+        let max_step = 0.1;
+        let angle = clamp_rotation(&mut target_q, &anchor_q, max_step);
+        assert!((angle - std::f64::consts::FRAC_PI_2).abs() < 1e-6);
+        let new_angle = quat_angle_between(&anchor_q, &target_q);
+        assert!(new_angle <= max_step + 1e-9);
     }
 }

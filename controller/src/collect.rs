@@ -26,13 +26,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub fn run(args: CollectArgs) -> Result<(), Box<dyn Error>> {
-    let config = args.load_project_config()?;
-    run_with_config(config)
-}
-
-fn run_with_config(config: ProjectConfig) -> Result<(), Box<dyn Error>> {
+    let mut config = args.load_project_config()?;
     let workspace_root = workspace_root()?;
     let current_exe_dir = current_executable_dir()?;
+    // Persisted configs no longer carry value_limits; refresh them from a
+    // fresh `query --json` per device before runtime children are spawned.
+    // The visualizer treats absent limits as a hard error, so any failure
+    // here aborts the run with a clear driver/path message.
+    crate::device_query::refresh_value_limits_from_devices(
+        &mut config,
+        &workspace_root,
+        &current_exe_dir,
+    )?;
+    run_with_config(config, workspace_root, current_exe_dir)
+}
+
+fn run_with_config(
+    config: ProjectConfig,
+    workspace_root: std::path::PathBuf,
+    current_exe_dir: std::path::PathBuf,
+) -> Result<(), Box<dyn Error>> {
+    let workspace_root = workspace_root.as_path();
+    let current_exe_dir = current_exe_dir.as_path();
     let poll_interval = Duration::from_millis(config.controller.child_poll_interval_ms);
     let shutdown_timeout =
         Duration::from_millis(config.controller.shutdown_timeout_ms).max(Duration::from_secs(30));

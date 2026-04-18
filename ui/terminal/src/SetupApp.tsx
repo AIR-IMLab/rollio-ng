@@ -42,11 +42,26 @@ type SettingsField = {
   editableFieldId?: EditableFieldId;
 };
 
-type PreviewJumpStep = "devices" | "storage" | "pairing";
+type PreviewJumpStep = "devices" | "states" | "storage" | "pairing";
 
 type PreviewAction =
   | { kind: "jump"; label: string; targetStep: PreviewJumpStep }
   | { kind: "save"; label: string };
+
+/** One toggleable row in the "States" sub-step: a single (channel, state)
+ *  pair across every selected robot channel. */
+type StateRow = {
+  /** Per-channel `available_devices` key (e.g. "robot|airbot-play|<id>|arm|-").
+   *  Used as the `name` parameter for the toggle commands. */
+  deviceName: string;
+  /** Operator-facing label: "{device}/{channel}". */
+  channelLabel: string;
+  /** Driver-advertised state kind (serialized as the wire format the
+   *  backend expects, e.g. "joint_position"). */
+  stateKind: string;
+  isPublished: boolean;
+  isRecorded: boolean;
+};
 
 type DetailSpan = {
   text: string;
@@ -161,10 +176,13 @@ export function SetupApp({
     () => buildPreviewActions(setupState),
     [setupState],
   );
+  const stateRows = useMemo(() => buildStateRows(setupState), [setupState]);
   const focusableCount = useMemo(() => {
     switch (setupState?.step) {
       case "devices":
         return setupState.available_devices.length;
+      case "states":
+        return stateRows.length;
       case "pairing":
         return setupState.config.pairings.length;
       case "storage":
@@ -174,7 +192,7 @@ export function SetupApp({
       default:
         return 0;
     }
-  }, [previewActions.length, settingsFields.length, setupState]);
+  }, [previewActions.length, settingsFields.length, setupState, stateRows.length]);
 
   useEffect(() => {
     if (focusableCount <= 0) {
@@ -206,6 +224,7 @@ export function SetupApp({
         previewActions,
         editingField,
         draftValue,
+        stateRows,
       ),
     [
       draftValue,
@@ -215,6 +234,7 @@ export function SetupApp({
       previewActions,
       settingsFields,
       setupState,
+      stateRows,
     ],
   );
   const showLivePanels = useMemo(
@@ -407,6 +427,28 @@ export function SetupApp({
           sendControl(encodeSetupCommand("setup_toggle_device", { name: device.name }));
         }
         return;
+      }
+
+      if (setupState.step === "states") {
+        const row = stateRows[focusedIndex];
+        if (row && normalizedInput === "p") {
+          sendControl(
+            encodeSetupCommand("setup_toggle_publish_state", {
+              name: row.deviceName,
+              value: row.stateKind,
+            }),
+          );
+          return;
+        }
+        if (row && normalizedInput === "e") {
+          sendControl(
+            encodeSetupCommand("setup_toggle_recorded_state", {
+              name: row.deviceName,
+              value: row.stateKind,
+            }),
+          );
+          return;
+        }
       }
 
       const delta =
@@ -627,6 +669,60 @@ function formatCodecBackend(
   return `${codec} (${backend})`;
 }
 
+/** Flatten every selected robot channel's supported_states into a single
+ *  list of toggleable rows. Camera channels and disabled robot channels
+ *  are skipped because they have no toggleable states. */
+function buildStateRows(setupState: SetupStateMessage | null): StateRow[] {
+  if (!setupState) {
+    return [];
+  }
+  const selectedKeys = new Set(
+    setupState.config.devices.flatMap((device) =>
+      device.channels
+        .filter((channel) => channel.enabled !== false && channel.kind === "robot")
+        .map((channel) => `${device.name}|${channel.channel_type}`),
+    ),
+  );
+  const rows: StateRow[] = [];
+  for (const available of setupState.available_devices) {
+    if (available.device_type !== "robot") continue;
+    const channel = primaryChannel(available.current);
+    if (!channel) continue;
+    const channelKey = `${available.current.name}|${channel.channel_type}`;
+    if (!selectedKeys.has(channelKey)) continue;
+    const channelLabel = `${available.current.name}/${channel.channel_type}`;
+    const publishedSet = new Set(channel.publish_states ?? []);
+    const recordedSet = new Set(channel.recorded_states ?? []);
+    // Prefer the driver-reported supported_states so newly added kinds
+    // surface even if the operator never configured them. Fall back to the
+    // currently configured publish ∪ recorded set so the wizard still
+    // lets the operator edit existing state lists when an older driver
+    // (or a transient query) didn't expose supported_states.
+    const advertised = available.supported_states ?? [];
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    const pushUnique = (kind: string) => {
+      if (seen.has(kind)) return;
+      seen.add(kind);
+      candidates.push(kind);
+    };
+    advertised.forEach(pushUnique);
+    publishedSet.forEach(pushUnique);
+    recordedSet.forEach(pushUnique);
+    if (candidates.length === 0) continue;
+    for (const stateKind of candidates) {
+      rows.push({
+        deviceName: available.name,
+        channelLabel,
+        stateKind,
+        isPublished: publishedSet.has(stateKind),
+        isRecorded: recordedSet.has(stateKind),
+      });
+    }
+  }
+  return rows;
+}
+
 function buildPreviewActions(setupState: SetupStateMessage | null): PreviewAction[] {
   if (!setupState) {
     return [];
@@ -634,6 +730,7 @@ function buildPreviewActions(setupState: SetupStateMessage | null): PreviewActio
 
   const actions: PreviewAction[] = [
     { kind: "jump", label: "Edit devices", targetStep: "devices" },
+    { kind: "jump", label: "Edit states", targetStep: "states" },
     { kind: "jump", label: "Edit settings", targetStep: "storage" },
   ];
 
@@ -739,6 +836,7 @@ function buildDetailLines(
   previewActions: PreviewAction[],
   editingField: EditableFieldId | null,
   draftValue: string,
+  stateRows: StateRow[],
 ): DetailLine[] {
   if (!setupState) {
     return [
@@ -798,6 +896,43 @@ function buildDetailLines(
         ...warningLines,
         ...messageLines,
       ];
+    }
+    case "states": {
+      if (stateRows.length === 0) {
+        return [
+          textLine(
+            "states-empty",
+            "No robot channels are selected. Go back and enable a robot channel first.",
+            { color: "yellow", bold: true },
+          ),
+          ...warningLines,
+          ...messageLines,
+        ];
+      }
+      let lastChannel: string | null = null;
+      const lines: DetailLine[] = [
+        textLine(
+          "states-title",
+          "Pick which states each robot channel publishes (P) and records (R).",
+          { color: "cyan", bold: true },
+        ),
+      ];
+      for (let index = 0; index < stateRows.length; index += 1) {
+        const row = stateRows[index]!;
+        if (row.channelLabel !== lastChannel) {
+          lines.push(
+            textLine(
+              `states-channel:${row.channelLabel}`,
+              row.channelLabel,
+              { color: "magenta", bold: true },
+            ),
+          );
+          lastChannel = row.channelLabel;
+        }
+        lines.push(stateRowLine(row, index === focusedIndex));
+      }
+      lines.push(...warningLines, ...messageLines);
+      return lines;
     }
     case "pairing":
       return setupState.config.pairings.length > 0
@@ -886,6 +1021,23 @@ function buildDetailLines(
         ...warningLines,
       ];
   }
+}
+
+function stateRowLine(row: StateRow, focused: boolean): DetailLine {
+  const publishGlyph = row.isPublished ? "P" : ".";
+  const recordedGlyph = row.isRecorded ? "R" : ".";
+  return buildDetailLine(`state:${row.deviceName}:${row.stateKind}`, [
+    focusPrefix(focused),
+    textSegment(`[${publishGlyph} ${recordedGlyph}] `, {
+      color: row.isPublished ? "green" : "gray",
+      bold: focused,
+    }),
+    textSegment(row.stateKind, {
+      bold: focused,
+      color: row.isPublished ? undefined : "gray",
+    }),
+    textSegment(" [p:Publish e:Record]", { color: "cyan" }),
+  ]);
 }
 
 function settingsFieldLine(
@@ -1269,6 +1421,8 @@ function stepHintForState(
   switch (setupState?.step) {
     case "devices":
       return "j/k:Focus space:Toggle Enter:Rename h/l or [/] Cycle i:Identify b/n:Step q:Cancel";
+    case "states":
+      return "j/k:Focus p:Publish e:Record b/n:Step q:Cancel";
     case "pairing":
       return "j/k:Focus h/l Cycle mapping b/n:Step q:Cancel";
     case "storage":

@@ -429,13 +429,15 @@ fn gray8_infrared_uses_depth_codec_when_depth_codec_supports_it() {
     );
 }
 
-/// `value_limits` round-trips through TOML so the controller can persist
-/// driver-reported envelopes once and reuse them on subsequent sessions
-/// without re-querying. The visualizer pulls these into
-/// `VisualizerRobotSourceConfig.value_min` / `value_max` so the UI bars
-/// match the real hardware envelope.
+/// `value_limits` are no longer persisted in TOML: the controller refreshes
+/// them from a fresh `query` invocation on every startup and feeds them into
+/// the in-memory channel config before downstream consumers (visualizer)
+/// build their runtime configs. This test confirms that
+/// 1) the field is silently ignored if it appears in older configs (no parse
+///    error), and 2) once populated programmatically, the visualizer runtime
+///    config still surfaces the per-source value envelopes.
 #[test]
-fn value_limits_round_trip_through_project_config() {
+fn value_limits_are_runtime_only() {
     let toml_text = r#"
 project_name = "limits"
 mode = "intervention"
@@ -458,16 +460,6 @@ mode = "free-drive"
 dof = 6
 publish_states = ["joint_position", "joint_velocity"]
 
-[[devices.channels.value_limits]]
-state_kind = "joint_position"
-min = [-3.14, -2.96, -0.087, -3.01, -1.76, -3.01]
-max = [2.094, 0.174, 3.14, 3.01, 1.76, 3.01]
-
-[[devices.channels.value_limits]]
-state_kind = "joint_velocity"
-min = [-3.14, -3.14, -3.14, -3.14, -3.14, -3.14]
-max = [3.14, 3.14, 3.14, 3.14, 3.14, 3.14]
-
 [encoder]
 video_codec = "h264"
 depth_codec = "rvl"
@@ -479,14 +471,23 @@ output_path = "./out"
 [visualizer]
 port = 19090
 "#;
-    let config = ProjectConfig::from_str(toml_text).expect("config should parse");
-    let channel = &config.devices[0].channels[0];
-    assert_eq!(channel.value_limits.len(), 2);
-    assert_eq!(
-        channel.value_limits[0].state_kind,
-        RobotStateKind::JointPosition
+    let mut config = ProjectConfig::from_str(toml_text).expect("config should parse");
+    let channel = &mut config.devices[0].channels[0];
+    assert!(
+        channel.value_limits.is_empty(),
+        "fresh load should carry no value_limits until the controller refreshes them",
     );
-    assert_eq!(channel.value_limits[0].max[0], 2.094);
+
+    // Simulate the controller injecting the latest driver-reported limits
+    // into the in-memory config (this happens after the device `query`).
+    channel.value_limits = vec![
+        StateValueLimitsEntry::new(
+            RobotStateKind::JointPosition,
+            vec![-3.14, -2.96, -0.087, -3.01, -1.76, -3.01],
+            vec![2.094, 0.174, 3.14, 3.01, 1.76, 3.01],
+        ),
+        StateValueLimitsEntry::symmetric(RobotStateKind::JointVelocity, 3.14, 6),
+    ];
 
     // The visualizer runtime config exposes per-source value envelopes so
     // the WebSocket payload can carry them to the UI bars.
@@ -498,6 +499,14 @@ port = 19090
         .expect("joint_position source should be present");
     assert_eq!(position_source.value_min[0], -3.14);
     assert_eq!(position_source.value_max[0], 2.094);
+
+    // Re-serializing must NOT include value_limits, even if we just populated
+    // the in-memory copy.
+    let serialized = toml::to_string(&config).expect("config should re-serialize");
+    assert!(
+        !serialized.contains("value_limits"),
+        "serialized TOML must omit value_limits; got:\n{serialized}",
+    );
 }
 
 #[test]

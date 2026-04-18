@@ -1,5 +1,6 @@
 mod cli;
 mod collect;
+mod device_query;
 mod discovery;
 mod episode;
 mod process;

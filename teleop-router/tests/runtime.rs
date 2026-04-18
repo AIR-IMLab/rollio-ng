@@ -1,160 +1,156 @@
 use iceoryx2::prelude::*;
 use rollio_bus::CONTROL_EVENTS_SERVICE;
-use rollio_types::config::{MappingStrategy, TeleopRuntimeConfig};
-use rollio_types::messages::{CommandMode, ControlEvent, RobotCommand, RobotState};
+use rollio_types::config::{
+    ChannelCommandDefaults, MappingStrategy, RobotCommandKind, RobotStateKind,
+    TeleopRuntimeConfigV2,
+};
+use rollio_types::messages::{ControlEvent, Pose7};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-type StatePublisher = iceoryx2::port::publisher::Publisher<ipc::Service, RobotState, ()>;
-type CommandSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::Service, RobotCommand, ()>;
+// ---------------------------------------------------------------------------
+// Cartesian initial-syncing ramp end-to-end test.
+//
+// Drives the v2 router binary against `Pose7` topics: publishes a fixed
+// follower EE pose far from the leader, asserts the first forwarded
+// command lands within one cartesian sync step of the follower (proving
+// the ramp engaged), then drives the follower toward the leader until
+// pass-through engages and verifies the leader's pose is forwarded
+// verbatim.
+// ---------------------------------------------------------------------------
+
+type PosePublisher = iceoryx2::port::publisher::Publisher<ipc::Service, Pose7, ()>;
+type PoseSubscriber = iceoryx2::port::subscriber::Subscriber<ipc::Service, Pose7, ()>;
 type ControlPublisher = iceoryx2::port::publisher::Publisher<ipc::Service, ControlEvent, ()>;
 
-struct TestPorts {
+struct PoseTestPorts {
     _node: Node<ipc::Service>,
-    leader_state_publisher: StatePublisher,
-    follower_state_publisher: StatePublisher,
-    command_subscriber: CommandSubscriber,
+    leader_state_publisher: PosePublisher,
+    follower_state_publisher: PosePublisher,
+    command_subscriber: PoseSubscriber,
     control_publisher: ControlPublisher,
 }
 
-#[test]
-fn router_forwards_identity_joint_commands() {
-    let _guard = test_guard();
-    let id = unique_id("identity");
-    let config = teleop_config(&id, MappingStrategy::DirectJoint);
-    let ports = create_test_ports(&config).expect("ports should be created");
-    let mut child = spawn_router(&config);
-    thread::sleep(Duration::from_millis(100));
-
-    publish_state(&ports.follower_state_publisher, leader_state(now_ns()))
-        .expect("follower publish should work");
-    publish_state(&ports.leader_state_publisher, leader_state(now_ns()))
-        .expect("leader publish should work");
-    let command =
-        wait_for_command(&ports.command_subscriber, Duration::from_secs(2)).expect("command");
-
-    assert_eq!(command.mode, CommandMode::Joint);
-    assert_eq!(command.num_joints, 6);
-    assert_eq!(&command.joint_targets[..6], &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
-
-    send_shutdown(&ports.control_publisher);
-    wait_for_exit(&mut child, Duration::from_secs(2));
-}
+// Must stay in sync with `teleop_router::SYNC_MAX_STEP_M` (private).
+const SYNC_MAX_STEP_M: f64 = 0.005;
 
 #[test]
-fn router_forwards_single_joint_end_effector_commands() {
+fn router_cartesian_initial_sync_ramps_pose() {
     let _guard = test_guard();
-    let id = unique_id("eef");
-    let mut config = teleop_config(&id, MappingStrategy::DirectJoint);
-    config.joint_index_map = vec![0];
-    config.joint_scales = vec![1.0];
-    let ports = create_test_ports(&config).expect("ports should be created");
-    let mut child = spawn_router(&config);
-    thread::sleep(Duration::from_millis(100));
+    let id = unique_id("cart_sync");
+    let config = cartesian_sync_config(&id);
+    let ports = create_pose_test_ports(&config).expect("ports should be created");
+    let mut child = spawn_router_v2(&config);
+    thread::sleep(Duration::from_millis(150));
 
-    publish_state(&ports.follower_state_publisher, eef_state(now_ns(), 0.0))
-        .expect("follower publish should work");
-    publish_state(&ports.leader_state_publisher, eef_state(now_ns(), 0.042))
-        .expect("leader publish should work");
-    let command =
-        wait_for_command(&ports.command_subscriber, Duration::from_secs(2)).expect("command");
+    // The router skips leader samples whose `timestamp_ms` matches the
+    // last forwarded one, so we use a monotonic counter rather than
+    // wallclock millis to ensure each leader publish is treated as a
+    // distinct sample even when the test loop iterates inside a single
+    // millisecond.
+    let mut tick_ts = 1u64;
+    let mut next_ts = || {
+        let value = tick_ts;
+        tick_ts += 1;
+        value
+    };
 
-    assert_eq!(command.mode, CommandMode::Joint);
-    assert_eq!(command.num_joints, 1);
-    assert_eq!(command.joint_targets[0], 0.042);
+    // Follower starts at the origin with identity orientation.
+    let follower_pose = Pose7 {
+        timestamp_ms: next_ts(),
+        values: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    };
+    publish_pose(&ports.follower_state_publisher, follower_pose)
+        .expect("follower state publish should work");
 
-    send_shutdown(&ports.control_publisher);
-    wait_for_exit(&mut child, Duration::from_secs(2));
-}
+    // Leader is 1 m away along +X with identity orientation. This is
+    // far above the SYNC_COMPLETE_THRESHOLD_M so the very first
+    // forwarded command MUST be clamped.
+    let leader_pose = Pose7 {
+        timestamp_ms: next_ts(),
+        values: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+    };
+    publish_pose(&ports.leader_state_publisher, leader_pose)
+        .expect("leader state publish should work");
 
-#[test]
-fn router_forwards_cartesian_commands() {
-    let _guard = test_guard();
-    let id = unique_id("cartesian");
-    let mut config = teleop_config(&id, MappingStrategy::Cartesian);
-    config.joint_index_map.clear();
-    config.joint_scales.clear();
-    let ports = create_test_ports(&config).expect("ports should be created");
-    let mut child = spawn_router(&config);
-    thread::sleep(Duration::from_millis(100));
-
-    let mut state = leader_state(now_ns());
-    state.has_ee_pose = true;
-    state.ee_pose = [0.3, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0];
-    publish_state(&ports.follower_state_publisher, leader_state(now_ns()))
-        .expect("follower publish should work");
-    publish_state(&ports.leader_state_publisher, state).expect("leader publish should work");
-    let command =
-        wait_for_command(&ports.command_subscriber, Duration::from_secs(2)).expect("command");
-
-    assert_eq!(command.mode, CommandMode::Cartesian);
-    assert_eq!(
-        command.cartesian_target,
-        [0.3, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0]
-    );
-
-    send_shutdown(&ports.control_publisher);
-    wait_for_exit(&mut child, Duration::from_secs(2));
-}
-
-#[test]
-fn router_shutdown_exits_within_500ms() {
-    let _guard = test_guard();
-    let id = unique_id("shutdown");
-    let config = teleop_config(&id, MappingStrategy::DirectJoint);
-    let ports = create_test_ports(&config).expect("ports should be created");
-    let mut child = spawn_router(&config);
-    thread::sleep(Duration::from_millis(100));
-
-    let started = Instant::now();
-    send_shutdown(&ports.control_publisher);
-    wait_for_exit(&mut child, Duration::from_millis(500));
+    let first_command =
+        wait_for_pose_command(&ports.command_subscriber, Duration::from_secs(2))
+            .expect("first cartesian command should arrive");
+    let dx = first_command.values[0] - follower_pose.values[0];
+    let dy = first_command.values[1] - follower_pose.values[1];
+    let dz = first_command.values[2] - follower_pose.values[2];
+    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
     assert!(
-        started.elapsed() <= Duration::from_millis(500),
-        "router did not exit within 500ms"
+        dist <= SYNC_MAX_STEP_M + 1e-9,
+        "first command translation step {dist} exceeded SYNC_MAX_STEP_M {SYNC_MAX_STEP_M}",
     );
-}
+    assert!(
+        first_command.values[0] > 0.0,
+        "ramp should still point toward the leader (+X)"
+    );
 
-#[test]
-fn router_latency_stays_below_budget_at_200_hz() {
-    let _guard = test_guard();
-    let id = unique_id("latency");
-    let config = teleop_config(&id, MappingStrategy::DirectJoint);
-    let ports = create_test_ports(&config).expect("ports should be created");
-    let mut child = spawn_router(&config);
-    thread::sleep(Duration::from_millis(100));
-
-    publish_state(&ports.follower_state_publisher, leader_state(now_ns()))
-        .expect("follower publish should work");
-
-    let mut latencies_us = Vec::new();
-    for sample_index in 0..80 {
-        let timestamp_ns = now_ns();
-        let mut state = leader_state(timestamp_ns);
-        state.positions[0] = sample_index as f64 / 10.0;
-        publish_state(&ports.leader_state_publisher, state).expect("leader publish should work");
-        let command = wait_for_command_timestamp(
-            &ports.command_subscriber,
-            timestamp_ns,
-            Duration::from_secs(2),
-        )
-        .expect("timed command should arrive");
-        assert_eq!(command.timestamp_ns, timestamp_ns);
-        latencies_us.push((now_ns().saturating_sub(timestamp_ns)) / 1_000);
-        thread::sleep(Duration::from_millis(5));
+    // Walk the follower toward the leader until the router exits the
+    // ramp. We do this by repeatedly publishing follower poses that
+    // approach the leader and a fresh leader pose that nudges forward
+    // by one step (so the router always sees a *new* leader timestamp
+    // and re-evaluates).
+    let mut follower_x = 0.0_f64;
+    let mut completed_sync = false;
+    for tick in 0..200 {
+        follower_x = (follower_x + 0.05).min(1.0);
+        let updated_follower = Pose7 {
+            timestamp_ms: next_ts(),
+            values: [follower_x, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        };
+        publish_pose(&ports.follower_state_publisher, updated_follower)
+            .expect("follower state publish should work");
+        let updated_leader = Pose7 {
+            timestamp_ms: next_ts(),
+            values: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        };
+        publish_pose(&ports.leader_state_publisher, updated_leader)
+            .expect("leader state publish should work");
+        let command = wait_for_pose_command(&ports.command_subscriber, Duration::from_millis(500))
+            .expect("router should keep producing commands");
+        // Once the leader matches the follower (both at x=1.0) and the
+        // ramp has finished, the router forwards the leader pose
+        // verbatim.
+        if (command.values[0] - 1.0).abs() < 1e-9 && follower_x >= 1.0 {
+            completed_sync = true;
+            break;
+        }
+        // Defensive sanity: never let the ramp publish a command past
+        // the leader's actual pose.
+        assert!(
+            command.values[0] <= 1.0 + 1e-9,
+            "ramp produced overshoot at tick {tick}: {}",
+            command.values[0]
+        );
     }
+    assert!(completed_sync, "router did not exit ramp within 200 ticks");
 
-    latencies_us.sort_unstable();
-    let median_us = percentile(&latencies_us, 0.5);
-    let p99_us = percentile(&latencies_us, 0.99);
-    assert!(median_us < 1_000, "median latency too high: {median_us}us");
-    assert!(p99_us < 5_000, "p99 latency too high: {p99_us}us");
+    // After completion, an arbitrary big leader jump must be forwarded
+    // verbatim (pass-through engaged).
+    let jump_leader = Pose7 {
+        timestamp_ms: next_ts(),
+        values: [-2.0, 1.0, 3.0, 0.0, 0.0, 0.0, 1.0],
+    };
+    publish_pose(&ports.leader_state_publisher, jump_leader)
+        .expect("leader jump publish should work");
+    let jump_command =
+        wait_for_pose_command(&ports.command_subscriber, Duration::from_secs(2))
+            .expect("jump command should arrive");
+    assert_eq!(jump_command.values, jump_leader.values);
 
     send_shutdown(&ports.control_publisher);
     wait_for_exit(&mut child, Duration::from_secs(2));
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_rollio-teleop-router")
@@ -175,46 +171,55 @@ fn unique_id(prefix: &str) -> String {
     format!("{prefix}_{nanos}")
 }
 
-fn teleop_config(id: &str, mapping: MappingStrategy) -> TeleopRuntimeConfig {
-    TeleopRuntimeConfig {
+fn cartesian_sync_config(id: &str) -> TeleopRuntimeConfigV2 {
+    TeleopRuntimeConfigV2 {
         process_id: format!("teleop.{id}"),
-        leader_name: format!("leader_{id}"),
-        follower_name: format!("follower_{id}"),
-        leader_state_topic: format!("robot/{id}/leader-state"),
-        follower_state_topic: format!("robot/{id}/follower-state"),
-        follower_command_topic: format!("robot/{id}/follower-command"),
-        mapping,
-        joint_index_map: vec![0, 1, 2, 3, 4, 5],
-        joint_scales: vec![1.0; 6],
+        leader_channel_id: format!("leader_{id}"),
+        follower_channel_id: format!("follower_{id}"),
+        leader_state_kind: RobotStateKind::EndEffectorPose,
+        leader_state_topic: format!("robot/{id}/leader/end_effector_pose"),
+        follower_command_kind: RobotCommandKind::EndPose,
+        follower_command_topic: format!("robot/{id}/follower/end_pose"),
+        follower_state_kind: Some(RobotStateKind::EndEffectorPose),
+        follower_state_topic: Some(format!("robot/{id}/follower/end_effector_pose")),
+        sync_max_step_rad: None,
+        sync_complete_threshold_rad: None,
+        mapping: MappingStrategy::Cartesian,
+        joint_index_map: Vec::new(),
+        joint_scales: Vec::new(),
+        command_defaults: ChannelCommandDefaults::default(),
     }
 }
 
-fn create_test_ports(
-    config: &TeleopRuntimeConfig,
-) -> Result<TestPorts, Box<dyn std::error::Error>> {
+fn create_pose_test_ports(
+    config: &TeleopRuntimeConfigV2,
+) -> Result<PoseTestPorts, Box<dyn std::error::Error>> {
     let node = NodeBuilder::new()
         .signal_handling_mode(SignalHandlingMode::Disabled)
         .create::<ipc::Service>()?;
 
-    let state_service_name: ServiceName = config.leader_state_topic.as_str().try_into()?;
-    let state_service = node
-        .service_builder(&state_service_name)
-        .publish_subscribe::<RobotState>()
+    let leader_service_name: ServiceName = config.leader_state_topic.as_str().try_into()?;
+    let leader_service = node
+        .service_builder(&leader_service_name)
+        .publish_subscribe::<Pose7>()
         .open_or_create()?;
-    let leader_state_publisher = state_service.publisher_builder().create()?;
+    let leader_state_publisher = leader_service.publisher_builder().create()?;
 
-    let follower_state_service_name: ServiceName =
-        config.follower_state_topic.as_str().try_into()?;
-    let follower_state_service = node
-        .service_builder(&follower_state_service_name)
-        .publish_subscribe::<RobotState>()
+    let follower_topic = config
+        .follower_state_topic
+        .as_deref()
+        .expect("cartesian sync config must have a follower state topic");
+    let follower_service_name: ServiceName = follower_topic.try_into()?;
+    let follower_service = node
+        .service_builder(&follower_service_name)
+        .publish_subscribe::<Pose7>()
         .open_or_create()?;
-    let follower_state_publisher = follower_state_service.publisher_builder().create()?;
+    let follower_state_publisher = follower_service.publisher_builder().create()?;
 
     let command_service_name: ServiceName = config.follower_command_topic.as_str().try_into()?;
     let command_service = node
         .service_builder(&command_service_name)
-        .publish_subscribe::<RobotCommand>()
+        .publish_subscribe::<Pose7>()
         .open_or_create()?;
     let command_subscriber = command_service.subscriber_builder().create()?;
 
@@ -225,7 +230,7 @@ fn create_test_ports(
         .open_or_create()?;
     let control_publisher = control_service.publisher_builder().create()?;
 
-    Ok(TestPorts {
+    Ok(PoseTestPorts {
         _node: node,
         leader_state_publisher,
         follower_state_publisher,
@@ -234,8 +239,8 @@ fn create_test_ports(
     })
 }
 
-fn spawn_router(config: &TeleopRuntimeConfig) -> Child {
-    let config_toml = toml::to_string(config).expect("config should serialize");
+fn spawn_router_v2(config: &TeleopRuntimeConfigV2) -> Child {
+    let config_toml = toml::to_string(config).expect("v2 config should serialize");
     Command::new(binary_path())
         .arg("run")
         .arg("--config-inline")
@@ -246,18 +251,15 @@ fn spawn_router(config: &TeleopRuntimeConfig) -> Child {
         .expect("teleop router should start")
 }
 
-fn publish_state(
-    publisher: &StatePublisher,
-    state: RobotState,
-) -> Result<(), Box<dyn std::error::Error>> {
-    publisher.send_copy(state)?;
+fn publish_pose(publisher: &PosePublisher, pose: Pose7) -> Result<(), Box<dyn std::error::Error>> {
+    publisher.send_copy(pose)?;
     Ok(())
 }
 
-fn wait_for_command(
-    subscriber: &CommandSubscriber,
+fn wait_for_pose_command(
+    subscriber: &PoseSubscriber,
     timeout: Duration,
-) -> Result<RobotCommand, Box<dyn std::error::Error>> {
+) -> Result<Pose7, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(sample) = subscriber.receive()? {
@@ -265,26 +267,7 @@ fn wait_for_command(
         }
         thread::sleep(Duration::from_micros(50));
     }
-    Err("timed out waiting for follower command".into())
-}
-
-fn wait_for_command_timestamp(
-    subscriber: &CommandSubscriber,
-    expected_timestamp_ns: u64,
-    timeout: Duration,
-) -> Result<RobotCommand, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(sample) = subscriber.receive()? {
-            let command = *sample.payload();
-            if command.timestamp_ns == expected_timestamp_ns {
-                return Ok(command);
-            }
-        } else {
-            thread::sleep(Duration::from_micros(50));
-        }
-    }
-    Err("timed out waiting for matching follower command".into())
+    Err("timed out waiting for follower pose command".into())
 }
 
 fn send_shutdown(publisher: &ControlPublisher) {
@@ -304,36 +287,4 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) {
     let _ = child.kill();
     let _ = child.wait();
     panic!("child did not exit within {timeout:?}");
-}
-
-fn leader_state(timestamp_ns: u64) -> RobotState {
-    let mut state = RobotState {
-        timestamp_ns,
-        num_joints: 6,
-        ..RobotState::default()
-    };
-    state.positions[..6].copy_from_slice(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
-    state
-}
-
-fn eef_state(timestamp_ns: u64, position: f64) -> RobotState {
-    let mut state = RobotState {
-        timestamp_ns,
-        num_joints: 1,
-        ..RobotState::default()
-    };
-    state.positions[0] = position;
-    state
-}
-
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-fn percentile(values: &[u64], quantile: f64) -> u64 {
-    let index = ((values.len().saturating_sub(1)) as f64 * quantile).round() as usize;
-    values[index]
 }

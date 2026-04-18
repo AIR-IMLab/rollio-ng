@@ -139,6 +139,12 @@ struct DiscoveredChannelMeta {
     /// guessing the value envelope.
     #[serde(default)]
     value_limits: Vec<rollio_types::config::StateValueLimitsEntry>,
+    /// All `RobotStateKind` values this driver reports it can publish on
+    /// this channel. The setup wizard's "States" sub-step uses this list
+    /// to render the toggleable publish/recorded options. Falls back to
+    /// `value_limits` keys when the driver doesn't populate it explicitly.
+    #[serde(default)]
+    supported_states: Vec<RobotStateKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -161,6 +167,12 @@ struct AvailableDevice {
     id: String,
     camera_profiles: Vec<CameraProfile>,
     supported_modes: Vec<RobotMode>,
+    /// All `RobotStateKind` values the driver advertises it can publish on
+    /// this channel. The setup wizard's "States" sub-step uses this list to
+    /// render the toggleable publish/recorded options. Empty for camera
+    /// channels.
+    #[serde(default)]
+    supported_states: Vec<RobotStateKind>,
     /// Single-binary snapshot for this discovery row (one channel).
     current: BinaryDeviceConfig,
 }
@@ -178,6 +190,7 @@ struct DeviceIdentity {
 #[serde(rename_all = "kebab-case")]
 enum SetupStep {
     Devices,
+    States,
     Pairing,
     Storage,
     Preview,
@@ -187,6 +200,7 @@ impl SetupStep {
     fn label(self) -> &'static str {
         match self {
             Self::Devices => "Devices",
+            Self::States => "States",
             Self::Pairing => "Pairing",
             Self::Storage => "Settings",
             Self::Preview => "Preview",
@@ -387,17 +401,24 @@ impl SetupSession {
     }
 
     fn visible_steps(&self) -> &'static [SetupStep] {
+        // Pairing must precede States: choosing a teleop mapping decides
+        // which `leader_state` is required, and the States step refuses to
+        // toggle off a kind that an active pairing depends on. Putting
+        // States after Pairing surfaces those locked rows immediately
+        // instead of forcing the operator to backtrack.
         if self.config.mode == CollectionMode::Teleop {
             &[
                 SetupStep::Devices,
                 SetupStep::Storage,
                 SetupStep::Pairing,
+                SetupStep::States,
                 SetupStep::Preview,
             ]
         } else {
             &[
                 SetupStep::Devices,
                 SetupStep::Storage,
+                SetupStep::States,
                 SetupStep::Preview,
             ]
         }
@@ -712,6 +733,135 @@ impl SetupSession {
         Ok(true)
     }
 
+    /// Flip whether `state_kind` appears in the addressed channel's
+    /// `publish_states`. When turning a kind off, also drop it from
+    /// `recorded_states` to preserve the subset invariant. Reject the
+    /// toggle if any active pairing currently relies on the kind as
+    /// `leader_state` (we can't quietly break a configured teleop pair).
+    fn toggle_publish_state(
+        &mut self,
+        name: &str,
+        state_kind: RobotStateKind,
+    ) -> Result<bool, Box<dyn Error>> {
+        let Some((device_index, channel_index)) = self.selected_device_index(name) else {
+            return Ok(false);
+        };
+        if self.config.devices[device_index].channels[channel_index].kind != DeviceType::Robot {
+            return Ok(false);
+        }
+        let device_name = self.config.devices[device_index].name.clone();
+        let channel_type = self.config.devices[device_index].channels[channel_index]
+            .channel_type
+            .clone();
+        let supported_states: Vec<RobotStateKind> = self
+            .available_devices
+            .iter()
+            .find(|available| available.name == name)
+            .map(|available| available.supported_states.clone())
+            .unwrap_or_default();
+
+        let channel = &mut self.config.devices[device_index].channels[channel_index];
+        let currently_enabled = channel.publish_states.contains(&state_kind);
+        if currently_enabled {
+            // Block removal if a pairing depends on this state as its
+            // leader_state.
+            if let Some(pairing) = self.config.pairings.iter().find(|pair| {
+                pair.leader_device == device_name
+                    && pair.leader_channel_type == channel_type
+                    && pair.leader_state == state_kind
+            }) {
+                self.message = Some(format!(
+                    "{:?} is required by pairing {}:{} (leader_state); change the pairing first.",
+                    state_kind, pairing.leader_device, pairing.leader_channel_type
+                ));
+                return Ok(false);
+            }
+            channel.publish_states.retain(|kind| *kind != state_kind);
+            channel.recorded_states.retain(|kind| *kind != state_kind);
+        } else {
+            // Refuse to toggle on a kind the driver doesn't advertise so the
+            // wizard cannot publish unsupported topics.
+            if !supported_states.is_empty() && !supported_states.contains(&state_kind) {
+                self.message = Some(format!(
+                    "{:?} is not advertised as supported by this device.",
+                    state_kind
+                ));
+                return Ok(false);
+            }
+            channel.publish_states.push(state_kind);
+        }
+        self.config.validate()?;
+        // Mirror the latest publish/recorded sets into the AvailableDevice
+        // snapshot the wizard UI renders from. The wizard otherwise keeps
+        // showing the stale glyphs because every other toggle in the
+        // session writes through both `config.devices` and
+        // `available_devices` (see `cycle_robot_mode`).
+        self.sync_available_channel_state_lists(name, device_index, channel_index);
+        // Pairing defaults can change once the publish set changes (e.g.
+        // `parallel_position` becoming available enables parallel teleop).
+        self.teleop_pairing_cache = self.config.pairings.clone();
+        Ok(true)
+    }
+
+    /// Flip whether `state_kind` appears in the addressed channel's
+    /// `recorded_states`. The validator already enforces
+    /// `recorded_states ⊆ publish_states`; we surface a clearer message
+    /// here when the operator tries to record a kind that isn't being
+    /// published.
+    fn toggle_recorded_state(
+        &mut self,
+        name: &str,
+        state_kind: RobotStateKind,
+    ) -> Result<bool, Box<dyn Error>> {
+        let Some((device_index, channel_index)) = self.selected_device_index(name) else {
+            return Ok(false);
+        };
+        if self.config.devices[device_index].channels[channel_index].kind != DeviceType::Robot {
+            return Ok(false);
+        }
+        let channel = &mut self.config.devices[device_index].channels[channel_index];
+        let currently_enabled = channel.recorded_states.contains(&state_kind);
+        if currently_enabled {
+            channel.recorded_states.retain(|kind| *kind != state_kind);
+        } else {
+            if !channel.publish_states.contains(&state_kind) {
+                self.message = Some(format!(
+                    "{:?} must be published before it can be recorded.",
+                    state_kind
+                ));
+                return Ok(false);
+            }
+            channel.recorded_states.push(state_kind);
+        }
+        self.config.validate()?;
+        self.sync_available_channel_state_lists(name, device_index, channel_index);
+        Ok(true)
+    }
+
+    /// Copy `publish_states` / `recorded_states` from
+    /// `self.config.devices[device_index].channels[channel_index]` onto the
+    /// matching `AvailableDevice.current` snapshot so the wizard UI sees
+    /// the freshest values on the next state publish.
+    fn sync_available_channel_state_lists(
+        &mut self,
+        name: &str,
+        device_index: usize,
+        channel_index: usize,
+    ) {
+        let publish_states =
+            self.config.devices[device_index].channels[channel_index].publish_states.clone();
+        let recorded_states =
+            self.config.devices[device_index].channels[channel_index].recorded_states.clone();
+        let Some(available) = self.available_device_mut(name) else {
+            return;
+        };
+        let Some(channel) = available.current.channels.first_mut() else {
+            return;
+        };
+        channel.publish_states = publish_states;
+        channel.recorded_states = recorded_states;
+    }
+
     fn build_selected_device_from_available(&self, name: &str) -> Option<BinaryDeviceConfig> {
         let target = self.available_device(name)?;
         let mut device = target.current.clone();
@@ -799,6 +949,18 @@ impl SetupSession {
                 pair.joint_scales.clear();
             }
         }
+        let leader_state = pair.leader_state;
+        // Cartesian (FK/IK) mapping requires the leader to publish
+        // EndEffectorPose; the channel may have been discovered without it,
+        // so opt the leader's publish_states in here. (DirectJoint maps to
+        // JointPosition / ParallelPosition which the discovery defaults
+        // already include.)
+        ensure_channel_publishes_state(
+            &mut self.config.devices,
+            &leader_device,
+            &leader_channel_type,
+            leader_state,
+        );
         self.teleop_pairing_cache = self.config.pairings.clone();
         self.config.validate()?;
         Ok(true)
@@ -991,6 +1153,7 @@ impl SetupSession {
     fn jump_to_step(&mut self, value: &str) -> bool {
         let target = match value {
             "devices" | "discovery" | "selection" | "parameters" => SetupStep::Devices,
+            "states" => SetupStep::States,
             "storage" => SetupStep::Storage,
             "pairing" => SetupStep::Pairing,
             "preview" => SetupStep::Preview,
@@ -1081,6 +1244,32 @@ impl SetupSession {
                     self.cycle_pair_mapping(index, delta)?,
                 ))
             }
+            "setup_toggle_publish_state" => {
+                let (Some(name), Some(value)) =
+                    (command.name.as_deref(), command.value.as_deref())
+                else {
+                    return Ok(SessionMutation::default());
+                };
+                let Some(state_kind) = parse_robot_state_kind(value) else {
+                    return Ok(SessionMutation::default());
+                };
+                Ok(SessionMutation::config_changed(
+                    self.toggle_publish_state(name, state_kind)?,
+                ))
+            }
+            "setup_toggle_recorded_state" => {
+                let (Some(name), Some(value)) =
+                    (command.name.as_deref(), command.value.as_deref())
+                else {
+                    return Ok(SessionMutation::default());
+                };
+                let Some(state_kind) = parse_robot_state_kind(value) else {
+                    return Ok(SessionMutation::default());
+                };
+                Ok(SessionMutation::config_changed(
+                    self.toggle_recorded_state(name, state_kind)?,
+                ))
+            }
             "setup_cycle_episode_format" => Ok(SessionMutation::config_changed(
                 self.cycle_episode_format(delta)?,
             )),
@@ -1140,6 +1329,10 @@ impl SetupSession {
             _ => Ok(SessionMutation::default()),
         }
     }
+}
+
+fn parse_robot_state_kind(value: &str) -> Option<RobotStateKind> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
 }
 
 fn rotate_index(current_index: usize, len: usize, delta: i32) -> usize {
@@ -1243,10 +1436,21 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
     };
 
     let (config, available_devices, mut warnings, resume_mode) =
-        if let Some(existing_config) = args.load_project_config()? {
+        if let Some(mut existing_config) = args.load_project_config()? {
             existing_config.validate().map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
             validate_existing_project(&existing_config, &workspace_root, &current_exe_dir)?;
-            let available_devices = available_devices_from_project(&existing_config);
+            // Persisted configs no longer carry value_limits: re-query each
+            // device executable to refresh them in-memory before the wizard
+            // (or the visualizer, on accept-defaults) consumes the config.
+            // The returned meta map also carries `supported_states`, which
+            // the wizard's "States" sub-step needs to render toggle lists.
+            let runtime_meta = crate::device_query::refresh_value_limits_from_devices(
+                &mut existing_config,
+                &workspace_root,
+                &current_exe_dir,
+            )?;
+            let available_devices =
+                available_devices_from_project(&existing_config, &runtime_meta);
             (existing_config, available_devices, Vec::new(), true)
         } else {
             eprintln!("rollio: discovering devices...");
@@ -1859,21 +2063,44 @@ fn binary_device_from_camera_discovery(
     }
 }
 
-/// Group a camera discovery's profiles by `channel_type`, picking the first
-/// profile encountered as the default for each group. Order is the order of
-/// first appearance in `camera_profiles`, so the highest-resolution profile
-/// per stream is preferred when the discovery sorts profiles.
+/// Group a camera discovery's profiles by `channel_type` and pick the
+/// "best" profile per channel as the wizard's default. "Best" is
+/// `(width * height) desc, fps desc, original-order asc` — i.e. highest
+/// resolution wins, ties are broken by highest fps, and remaining ties
+/// fall back to whichever profile the device discovery listed first
+/// (which preserves driver-supplied preferences such as a preferred
+/// pixel format). The output preserves the cross-channel order of first
+/// appearance so e.g. RealSense color/depth/infrared keep their natural
+/// listing.
 fn group_camera_profiles_by_channel(
     profiles: &[CameraProfile],
 ) -> Vec<(String, CameraProfile)> {
     let mut groups: Vec<(String, CameraProfile)> = Vec::new();
     for profile in profiles {
         let channel_type = camera_channel_type_for_profile(profile);
-        if !groups.iter().any(|(existing, _)| existing == &channel_type) {
-            groups.push((channel_type, profile.clone()));
+        match groups
+            .iter_mut()
+            .find(|(existing, _)| existing == &channel_type)
+        {
+            None => groups.push((channel_type, profile.clone())),
+            Some((_, current_best)) => {
+                if camera_profile_quality_key(profile)
+                    > camera_profile_quality_key(current_best)
+                {
+                    *current_best = profile.clone();
+                }
+            }
         }
     }
     groups
+}
+
+/// Quality ordering key for `CameraProfile` defaults: higher pixel count
+/// first, ties broken by higher fps. Returned as a tuple so the caller
+/// can compare with `>` directly.
+fn camera_profile_quality_key(profile: &CameraProfile) -> (u64, u32) {
+    let pixels = (profile.width as u64) * (profile.height as u64);
+    (pixels, profile.fps)
 }
 
 /// Per-device base name when a discovery exposes more than one channel
@@ -1893,21 +2120,12 @@ fn binary_device_from_robot_discovery(
     discovery: &DiscoveredDevice,
     name: String,
     preferred_mode: RobotMode,
+    name_counts: &mut BTreeMap<String, usize>,
 ) -> BinaryDeviceConfig {
     let mode = Some(select_supported_mode(
         &discovery.supported_modes,
         preferred_mode,
     ));
-    let publish_states = vec![
-        RobotStateKind::JointPosition,
-        RobotStateKind::JointVelocity,
-        RobotStateKind::JointEffort,
-    ];
-    let recorded_states = vec![
-        RobotStateKind::JointPosition,
-        RobotStateKind::JointVelocity,
-        RobotStateKind::JointEffort,
-    ];
     let command_defaults = ChannelCommandDefaults::default();
     let mut extra = toml::Table::new();
     if let Some(transport) = &discovery.transport {
@@ -1934,16 +2152,27 @@ fn binary_device_from_robot_discovery(
         .get(&arm_channel_type)
         .cloned()
         .unwrap_or_default();
+    let arm_publish_states = default_publish_states_for_meta(
+        &arm_meta,
+        &[
+            RobotStateKind::JointPosition,
+            RobotStateKind::JointVelocity,
+            RobotStateKind::JointEffort,
+        ],
+    );
+    let arm_recorded_states = arm_publish_states.clone();
+    let arm_channel_name =
+        dedup_channel_default_name(arm_meta.default_name.as_deref(), name_counts);
     let mut channels = vec![DeviceChannelConfigV2 {
         channel_type: arm_channel_type,
         kind: DeviceType::Robot,
         enabled: true,
-        name: arm_meta.default_name,
+        name: arm_channel_name,
         channel_label: arm_meta.channel_label,
         mode,
         dof: discovery.dof.or(Some(6)),
-        publish_states,
-        recorded_states,
+        publish_states: arm_publish_states,
+        recorded_states: arm_recorded_states,
         control_frequency_hz: discovery.default_frequency_hz,
         profile: None,
         command_defaults,
@@ -1959,20 +2188,27 @@ fn binary_device_from_robot_discovery(
                 .get(&channel_type)
                 .cloned()
                 .unwrap_or_default();
-            channels.push(DeviceChannelConfigV2 {
-                channel_type,
-                kind: DeviceType::Robot,
-                enabled: true,
-                name: eef_meta.default_name,
-                channel_label: eef_meta.channel_label,
-                mode: Some(preferred_mode),
-                dof: Some(1),
-                publish_states: vec![
+            let eef_publish_states = default_publish_states_for_meta(
+                &eef_meta,
+                &[
                     RobotStateKind::ParallelPosition,
                     RobotStateKind::ParallelVelocity,
                     RobotStateKind::ParallelEffort,
                 ],
-                recorded_states: vec![RobotStateKind::ParallelPosition],
+            );
+            let eef_recorded_states = eef_publish_states.clone();
+            let eef_channel_name =
+                dedup_channel_default_name(eef_meta.default_name.as_deref(), name_counts);
+            channels.push(DeviceChannelConfigV2 {
+                channel_type,
+                kind: DeviceType::Robot,
+                enabled: true,
+                name: eef_channel_name,
+                channel_label: eef_meta.channel_label,
+                mode: Some(preferred_mode),
+                dof: Some(1),
+                publish_states: eef_publish_states,
+                recorded_states: eef_recorded_states,
                 control_frequency_hz: discovery.default_frequency_hz.or(Some(250.0)),
                 profile: None,
                 command_defaults: eef_defaults,
@@ -2021,6 +2257,66 @@ fn mounted_airbot_end_effector_channel(
 fn channel_uses_parallel_teleop(ch: &DeviceChannelConfigV2) -> bool {
     ch.publish_states
         .contains(&RobotStateKind::ParallelPosition)
+}
+
+/// Pick the default `publish_states` for a freshly discovered robot
+/// channel. Prefer whatever the driver advertises (`supported_states`,
+/// falling back to the kinds enumerated by `value_limits`) so newly added
+/// state kinds (e.g. `EndEffectorPose` on the airbot arm) are turned on
+/// without requiring a config edit. Falls back to a static template when
+/// the driver query returned nothing usable, so older drivers and tests
+/// keep working unchanged.
+fn default_publish_states_for_meta(
+    meta: &DiscoveredChannelMeta,
+    fallback: &[RobotStateKind],
+) -> Vec<RobotStateKind> {
+    if !meta.supported_states.is_empty() {
+        return dedup_in_order(&meta.supported_states);
+    }
+    let from_limits: Vec<RobotStateKind> =
+        meta.value_limits.iter().map(|entry| entry.state_kind).collect();
+    if !from_limits.is_empty() {
+        return dedup_in_order(&from_limits);
+    }
+    fallback.to_vec()
+}
+
+fn dedup_in_order(values: &[RobotStateKind]) -> Vec<RobotStateKind> {
+    let mut out: Vec<RobotStateKind> = Vec::with_capacity(values.len());
+    for value in values {
+        if !out.contains(value) {
+            out.push(*value);
+        }
+    }
+    out
+}
+
+/// Ensure a robot channel publishes the given state kind. Used as a
+/// safety net when switching pairings to FK/IK so we don't blow up on
+/// validation if a legacy config (or an operator who toggled the kind off
+/// in the new "States" sub-step) doesn't have it. Newly discovered
+/// channels already opt every supported kind into `publish_states` via
+/// `default_publish_states_for_meta`, so this rarely runs in fresh
+/// projects.
+fn ensure_channel_publishes_state(
+    devices: &mut [BinaryDeviceConfig],
+    device_name: &str,
+    channel_type: &str,
+    state: RobotStateKind,
+) {
+    let Some(device) = devices.iter_mut().find(|d| d.name == device_name) else {
+        return;
+    };
+    let Some(channel) = device
+        .channels
+        .iter_mut()
+        .find(|c| c.channel_type == channel_type)
+    else {
+        return;
+    };
+    if !channel.publish_states.contains(&state) {
+        channel.publish_states.push(state);
+    }
 }
 
 fn build_default_channel_pairings(devices: &[BinaryDeviceConfig]) -> Vec<ChannelPairingConfig> {
@@ -2248,7 +2544,10 @@ impl SetupIpc {
     }
 }
 
-fn available_devices_from_project(project: &ProjectConfig) -> Vec<AvailableDevice> {
+fn available_devices_from_project(
+    project: &ProjectConfig,
+    runtime_meta: &crate::device_query::DeviceRuntimeMetaMap,
+) -> Vec<AvailableDevice> {
     project
         .devices
         .iter()
@@ -2277,6 +2576,23 @@ fn available_devices_from_project(project: &ProjectConfig) -> Vec<AvailableDevic
                     Vec::new()
                 };
                 let supported_modes = supported_modes_from_project_channel(device, channel);
+                let supported_states = if device_type == DeviceType::Robot {
+                    runtime_meta
+                        .get(&(device.name.clone(), channel.channel_type.clone()))
+                        .map(|meta| meta.supported_states.clone())
+                        .unwrap_or_else(|| {
+                            // Older drivers may not advertise supported_states;
+                            // fall back to whatever value_limits the latest
+                            // refresh populated.
+                            channel
+                                .value_limits
+                                .iter()
+                                .map(|entry| entry.state_kind)
+                                .collect()
+                        })
+                } else {
+                    Vec::new()
+                };
                 Some(AvailableDevice {
                     name: available_device_key_from_binary(&current),
                     display_name: display_name_for_binary_channel(device, channel),
@@ -2285,6 +2601,7 @@ fn available_devices_from_project(project: &ProjectConfig) -> Vec<AvailableDevic
                     id: device.id.clone(),
                     camera_profiles,
                     supported_modes,
+                    supported_states,
                     current,
                 })
             })
@@ -2374,6 +2691,15 @@ fn available_rows_from_discovery(
             } else {
                 Vec::new()
             };
+            let supported_states = if device_type == DeviceType::Robot {
+                discovery
+                    .channel_meta_by_channel
+                    .get(&channel.channel_type)
+                    .map(|meta| meta.supported_states.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             Some(AvailableDevice {
                 name: available_device_key_from_binary(&row_current),
                 display_name: display_name_for_binary_channel(current, channel),
@@ -2382,6 +2708,7 @@ fn available_rows_from_discovery(
                 id: current.id.clone(),
                 camera_profiles,
                 supported_modes: supported_modes_from_discovery(discovery, channel),
+                supported_states,
                 current: row_current,
             })
         })
@@ -2785,6 +3112,7 @@ fn build_discovery_config(discoveries: &[DiscoveredDevice]) -> Result<ProjectCon
                     discovery,
                     name,
                     preferred_mode,
+                    &mut default_name_counts,
                 ));
             }
         }
@@ -2949,47 +3277,30 @@ fn parse_query_channel_meta(device: &Value) -> BTreeMap<String, DiscoveredChanne
             let channel_type = value_as_string(channel.get("channel_type"))?;
             let channel_label = value_as_string(channel.get("channel_label"));
             let default_name = value_as_string(channel.get("default_name"));
-            let value_limits = parse_query_value_limits(channel.get("value_limits"));
+            let value_limits =
+                crate::device_query::parse_query_value_limits(channel.get("value_limits"));
+            let mut supported_states =
+                crate::device_query::parse_query_supported_states(channel.get("supported_states"));
+            // Fall back to the kinds enumerated by value_limits so older
+            // drivers that only populate value_limits still expose a
+            // supported-state list to the wizard.
+            if supported_states.is_empty() {
+                supported_states = value_limits
+                    .iter()
+                    .map(|entry| entry.state_kind)
+                    .collect();
+            }
             Some((
                 channel_type,
                 DiscoveredChannelMeta {
                     channel_label,
                     default_name,
                     value_limits,
+                    supported_states,
                 },
             ))
         })
         .collect()
-}
-
-fn parse_query_value_limits(
-    value: Option<&Value>,
-) -> Vec<rollio_types::config::StateValueLimitsEntry> {
-    let Some(entries) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let state_kind_str = value_as_string(entry.get("state_kind"))?;
-            let state_kind: rollio_types::config::RobotStateKind =
-                serde_json::from_value(serde_json::Value::String(state_kind_str)).ok()?;
-            let min = value_as_f64_array(entry.get("min"));
-            let max = value_as_f64_array(entry.get("max"));
-            Some(rollio_types::config::StateValueLimitsEntry {
-                state_kind,
-                min,
-                max,
-            })
-        })
-        .collect()
-}
-
-fn value_as_f64_array(value: Option<&Value>) -> Vec<f64> {
-    value
-        .and_then(Value::as_array)
-        .map(|values| values.iter().filter_map(Value::as_f64).collect())
-        .unwrap_or_default()
 }
 
 fn parse_query_robot_modes_by_channel(device: &Value) -> BTreeMap<String, Vec<RobotMode>> {
@@ -3335,6 +3646,23 @@ fn next_default_device_name(base: String, counts: &mut BTreeMap<String, usize>) 
     resolved
 }
 
+/// Dedupe the per-channel `default_name` reported by a driver query (e.g.
+/// "airbot_play_arm", "airbot_e2") against the same `counts` map the
+/// device-name path uses, so two physical AIRBOT Play arms become
+/// "airbot_play_arm" and "airbot_play_arm_2" instead of two rows with the
+/// same name. Returns `None` when the driver did not advertise a default
+/// channel name (callers fall back to the channel_type).
+fn dedup_channel_default_name(
+    default_name: Option<&str>,
+    counts: &mut BTreeMap<String, usize>,
+) -> Option<String> {
+    let base = default_name?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(next_default_device_name(base.to_owned(), counts))
+}
+
 fn group_default_mode(index: usize) -> RobotMode {
     match index {
         0 => RobotMode::FreeDrive,
@@ -3644,6 +3972,54 @@ mod tests {
     }
 
     #[test]
+    fn build_discovery_config_dedupes_robot_channel_names_across_two_airbot_devices() {
+        // Two physical AIRBOT Play arms each report
+        // `default_name = "airbot_play_arm"` from the driver query. The
+        // discovery path must dedupe the channel-level name the same way it
+        // dedupes the device-level name, otherwise the wizard's devices step
+        // shows two rows with identical names and the operator can't tell
+        // them apart.
+        let mut leader = airbot_play_discovery(Some("e2"));
+        leader.id = "PZ_LEADER".into();
+        let mut follower = airbot_play_discovery(Some("e2"));
+        follower.id = "PZ_FOLLOWER".into();
+
+        let config = build_discovery_config(&[leader, follower]).expect("config should build");
+
+        let arm_names: Vec<&str> = config
+            .devices
+            .iter()
+            .filter(|device| device.driver == "airbot-play")
+            .filter_map(|device| {
+                device
+                    .channel_named("arm")
+                    .and_then(|channel| channel.name.as_deref())
+            })
+            .collect();
+        assert_eq!(
+            arm_names,
+            vec!["airbot_play_arm", "airbot_play_arm_2"],
+            "two airbot arms must get distinct channel names",
+        );
+
+        let eef_names: Vec<&str> = config
+            .devices
+            .iter()
+            .filter(|device| device.driver == "airbot-play")
+            .filter_map(|device| {
+                device
+                    .channel_named("e2")
+                    .and_then(|channel| channel.name.as_deref())
+            })
+            .collect();
+        assert_eq!(
+            eef_names,
+            vec!["airbot_e2", "airbot_e2_2"],
+            "two airbot end-effector channels must get distinct names",
+        );
+    }
+
+    #[test]
     fn available_devices_from_discoveries_splits_airbot_channels_into_rows() {
         let discovery = airbot_play_discovery(Some("e2"));
         let config = build_discovery_config(std::slice::from_ref(&discovery))
@@ -3698,6 +4074,226 @@ mod tests {
         assert!(device.channel_named("e2").is_some_and(|channel| !channel.enabled));
     }
 
+    /// `airbot_play_discovery` plus an explicit `EndEffectorPose` in
+    /// supported_states. Used to exercise the new toggle commands so the
+    /// fixture has enough surface area to flip kinds on and off.
+    fn airbot_arm_discovery_with_supported_states(
+        supported: Vec<RobotStateKind>,
+    ) -> DiscoveredDevice {
+        let mut discovery = airbot_play_discovery(None);
+        discovery.channel_meta_by_channel.insert(
+            "arm".into(),
+            DiscoveredChannelMeta {
+                channel_label: Some("AIRBOT Play".into()),
+                default_name: Some("airbot_play_arm".into()),
+                value_limits: Vec::new(),
+                supported_states: supported,
+            },
+        );
+        discovery
+    }
+
+    #[test]
+    fn binary_device_from_robot_discovery_defaults_publish_states_to_all_supported() {
+        // The driver advertises EndEffectorPose alongside the standard
+        // joint kinds; the wizard should opt all of them into both
+        // publish_states and recorded_states by default so operators don't
+        // hit the FK/IK pairing failure when switching mappings.
+        let discovery = airbot_arm_discovery_with_supported_states(vec![
+            RobotStateKind::JointPosition,
+            RobotStateKind::JointVelocity,
+            RobotStateKind::JointEffort,
+            RobotStateKind::EndEffectorPose,
+        ]);
+        let device = binary_device_from_robot_discovery(
+            &discovery,
+            "airbot_play".into(),
+            RobotMode::FreeDrive,
+            &mut BTreeMap::new(),
+        );
+        let arm = device
+            .channel_named("arm")
+            .expect("arm channel should exist");
+        assert!(arm.publish_states.contains(&RobotStateKind::EndEffectorPose));
+        assert_eq!(arm.publish_states, arm.recorded_states);
+    }
+
+    #[test]
+    fn toggle_publish_state_drops_recorded_kind_with_it() {
+        let discovery = airbot_arm_discovery_with_supported_states(vec![
+            RobotStateKind::JointPosition,
+            RobotStateKind::JointVelocity,
+            RobotStateKind::JointEffort,
+        ]);
+        let mut session = setup_session(&[discovery]);
+        let arm_name = session
+            .available_devices
+            .iter()
+            .find(|device| device.current.channels[0].channel_type == "arm")
+            .expect("arm row should exist")
+            .name
+            .clone();
+
+        assert!(session
+            .toggle_publish_state(&arm_name, RobotStateKind::JointEffort)
+            .expect("toggle should succeed"));
+
+        let arm = session
+            .config
+            .device_named("airbot_play")
+            .and_then(|device| device.channel_named("arm"))
+            .expect("arm channel still configured");
+        assert!(!arm.publish_states.contains(&RobotStateKind::JointEffort));
+        assert!(
+            !arm.recorded_states.contains(&RobotStateKind::JointEffort),
+            "recorded_states must stay a subset of publish_states",
+        );
+    }
+
+    #[test]
+    fn toggle_publish_state_blocks_removal_when_pairing_uses_kind() {
+        let discovery = airbot_arm_discovery_with_supported_states(vec![
+            RobotStateKind::JointPosition,
+            RobotStateKind::JointVelocity,
+            RobotStateKind::JointEffort,
+        ]);
+        // Two arms so a default pairing exists with leader_state = JointPosition.
+        let mut session = setup_session(&[discovery.clone(), discovery]);
+        let leader_name = session
+            .config
+            .pairings
+            .first()
+            .expect("default pairing should exist")
+            .leader_device
+            .clone();
+        let leader_row = session
+            .available_devices
+            .iter()
+            .find(|device| {
+                device.current.name == leader_name
+                    && device.current.channels[0].channel_type == "arm"
+            })
+            .expect("leader arm row should exist")
+            .name
+            .clone();
+
+        let outcome = session
+            .toggle_publish_state(&leader_row, RobotStateKind::JointPosition)
+            .expect("call should not error");
+        assert!(
+            !outcome,
+            "toggling off a leader_state must be rejected without applying the change",
+        );
+        let arm = session
+            .config
+            .device_named(&leader_name)
+            .and_then(|device| device.channel_named("arm"))
+            .expect("leader arm still configured");
+        assert!(arm.publish_states.contains(&RobotStateKind::JointPosition));
+        assert!(session.message.is_some(), "user should see a clear refusal");
+    }
+
+    #[test]
+    fn toggle_publish_state_mirrors_into_available_devices_snapshot() {
+        // Regression for a UI bug: the wizard reads publish_states /
+        // recorded_states from `AvailableDevice.current.channels[0]`, so a
+        // toggle that only updates `config.devices` leaves the rendered
+        // [P R] glyph stale. Toggle methods must mirror the freshly
+        // mutated kind into the AvailableDevice snapshot, the way
+        // `cycle_robot_mode` does for the channel mode.
+        let discovery = airbot_arm_discovery_with_supported_states(vec![
+            RobotStateKind::JointPosition,
+            RobotStateKind::JointVelocity,
+            RobotStateKind::JointEffort,
+        ]);
+        let mut session = setup_session(&[discovery]);
+        let arm_name = session
+            .available_devices
+            .iter()
+            .find(|device| device.current.channels[0].channel_type == "arm")
+            .expect("arm row should exist")
+            .name
+            .clone();
+
+        assert!(session
+            .toggle_publish_state(&arm_name, RobotStateKind::JointEffort)
+            .expect("publish toggle should succeed"));
+
+        let available_channel = session
+            .available_devices
+            .iter()
+            .find(|device| device.name == arm_name)
+            .and_then(|device| device.current.channels.first())
+            .expect("available arm row should still exist");
+        assert!(
+            !available_channel
+                .publish_states
+                .contains(&RobotStateKind::JointEffort),
+            "AvailableDevice snapshot must mirror the updated publish_states; \
+             got {:?}",
+            available_channel.publish_states,
+        );
+        assert!(
+            !available_channel
+                .recorded_states
+                .contains(&RobotStateKind::JointEffort),
+            "AvailableDevice snapshot must mirror the updated recorded_states",
+        );
+
+        assert!(session
+            .toggle_recorded_state(&arm_name, RobotStateKind::JointVelocity)
+            .expect("recorded toggle should succeed"));
+        let available_channel = session
+            .available_devices
+            .iter()
+            .find(|device| device.name == arm_name)
+            .and_then(|device| device.current.channels.first())
+            .expect("available arm row should still exist");
+        assert!(
+            !available_channel
+                .recorded_states
+                .contains(&RobotStateKind::JointVelocity),
+            "recorded_state toggle should also propagate; got {:?}",
+            available_channel.recorded_states,
+        );
+    }
+
+    #[test]
+    fn toggle_recorded_state_requires_published_kind() {
+        let discovery = airbot_arm_discovery_with_supported_states(vec![
+            RobotStateKind::JointPosition,
+            RobotStateKind::JointVelocity,
+            RobotStateKind::JointEffort,
+        ]);
+        let mut session = setup_session(&[discovery]);
+        let arm_name = session
+            .available_devices
+            .iter()
+            .find(|device| device.current.channels[0].channel_type == "arm")
+            .expect("arm row should exist")
+            .name
+            .clone();
+
+        // Drop joint_effort from publish_states (and implicitly from recorded_states)
+        // and then attempt to record it: the wizard should reject the toggle.
+        assert!(session
+            .toggle_publish_state(&arm_name, RobotStateKind::JointEffort)
+            .expect("publish toggle should succeed"));
+        let outcome = session
+            .toggle_recorded_state(&arm_name, RobotStateKind::JointEffort)
+            .expect("call should not error");
+        assert!(
+            !outcome,
+            "recording a non-published kind must be rejected",
+        );
+        let arm = session
+            .config
+            .device_named("airbot_play")
+            .and_then(|device| device.channel_named("arm"))
+            .expect("arm channel still configured");
+        assert!(!arm.recorded_states.contains(&RobotStateKind::JointEffort));
+    }
+
     #[test]
     fn preview_runtime_project_overrides_visualizer_port() {
         let config = build_discovery_config(&[
@@ -3731,6 +4327,7 @@ mod tests {
             &[
                 SetupStep::Devices,
                 SetupStep::Storage,
+                SetupStep::States,
                 SetupStep::Preview,
             ]
         );
@@ -3742,6 +4339,7 @@ mod tests {
                 SetupStep::Devices,
                 SetupStep::Storage,
                 SetupStep::Pairing,
+                SetupStep::States,
                 SetupStep::Preview,
             ]
         );
@@ -4023,6 +4621,117 @@ mod tests {
         assert_eq!(config.devices[1].name, "realsense_2");
         assert_eq!(camera_channel_types(&config.devices[0]).len(), 3);
         assert_eq!(camera_channel_types(&config.devices[1]).len(), 3);
+    }
+
+    /// `group_camera_profiles_by_channel` must pick the highest-resolution
+    /// + highest-fps profile per channel as the wizard's default, even when
+    /// the discovery happens to list lower-quality profiles first. We
+    /// construct a discovery where the first listed profile per channel is
+    /// the worst one and assert that each channel ends up defaulting to
+    /// the best one (largest pixel count, then highest fps).
+    #[test]
+    fn build_discovery_config_picks_highest_resolution_and_fps_default_profile() {
+        let discovery = DiscoveredDevice {
+            device_type: DeviceType::Camera,
+            driver: "realsense".into(),
+            id: "best-default".into(),
+            display_name: "Intel RealSense".into(),
+            camera_profiles: vec![
+                // Color: lowest profile listed first to ensure the
+                // selector does not just take the head.
+                CameraProfile {
+                    width: 640,
+                    height: 480,
+                    fps: 30,
+                    pixel_format: PixelFormat::Rgb24,
+                    native_pixel_format: None,
+                    stream: Some("color".into()),
+                    channel: None,
+                },
+                CameraProfile {
+                    width: 1280,
+                    height: 720,
+                    fps: 60,
+                    pixel_format: PixelFormat::Rgb24,
+                    native_pixel_format: None,
+                    stream: Some("color".into()),
+                    channel: None,
+                },
+                CameraProfile {
+                    width: 1920,
+                    height: 1080,
+                    fps: 30,
+                    pixel_format: PixelFormat::Rgb24,
+                    native_pixel_format: None,
+                    stream: Some("color".into()),
+                    channel: None,
+                },
+                CameraProfile {
+                    width: 1920,
+                    height: 1080,
+                    fps: 60,
+                    pixel_format: PixelFormat::Rgb24,
+                    native_pixel_format: None,
+                    stream: Some("color".into()),
+                    channel: None,
+                },
+                // Depth: same pixel count at two fps values.
+                CameraProfile {
+                    width: 640,
+                    height: 480,
+                    fps: 30,
+                    pixel_format: PixelFormat::Depth16,
+                    native_pixel_format: None,
+                    stream: Some("depth".into()),
+                    channel: None,
+                },
+                CameraProfile {
+                    width: 640,
+                    height: 480,
+                    fps: 90,
+                    pixel_format: PixelFormat::Depth16,
+                    native_pixel_format: None,
+                    stream: Some("depth".into()),
+                    channel: None,
+                },
+            ],
+            supported_modes_by_channel: BTreeMap::new(),
+            channel_meta_by_channel: BTreeMap::new(),
+            dof: None,
+            supported_modes: Vec::new(),
+            default_frequency_hz: None,
+            transport: None,
+            interface: None,
+            product_variant: None,
+            end_effector: None,
+        };
+        let config = build_discovery_config(std::slice::from_ref(&discovery))
+            .expect("config should build");
+
+        assert_eq!(config.devices.len(), 1);
+        let device = &config.devices[0];
+        assert_eq!(
+            camera_channel_types(device),
+            vec!["color".to_string(), "depth".to_string()]
+        );
+        let color = device.channels[0]
+            .profile
+            .as_ref()
+            .expect("color channel must have a default profile");
+        assert_eq!(
+            (color.width, color.height, color.fps),
+            (1920, 1080, 60),
+            "color default must be highest-resolution + highest-fps"
+        );
+        let depth = device.channels[1]
+            .profile
+            .as_ref()
+            .expect("depth channel must have a default profile");
+        assert_eq!(
+            (depth.width, depth.height, depth.fps),
+            (640, 480, 90),
+            "depth default must keep its highest-fps profile"
+        );
     }
 
     #[test]
