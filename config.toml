@@ -20,6 +20,7 @@ enabled = true
 name = "realsense_rgb"
 publish_states = []
 recorded_states = []
+value_limits = []
 
 [devices.channels.profile]
 width = 1920
@@ -36,15 +37,16 @@ parallel_mit_kd = []
 [[devices.channels]]
 channel_type = "depth"
 kind = "camera"
-enabled = true
+enabled = false
 name = "realsense_depth"
 publish_states = []
 recorded_states = []
+value_limits = []
 
 [devices.channels.profile]
-width = 640
-height = 480
-fps = 90
+width = 1280
+height = 720
+fps = 30
 pixel_format = "depth16"
 
 [devices.channels.command_defaults]
@@ -60,6 +62,7 @@ enabled = false
 name = "realsense_ir"
 publish_states = []
 recorded_states = []
+value_limits = []
 
 [devices.channels.profile]
 width = 1280
@@ -88,6 +91,7 @@ name = "camera"
 channel_label = "V4L2 Camera"
 publish_states = []
 recorded_states = []
+value_limits = []
 
 [devices.channels.profile]
 width = 1280
@@ -117,10 +121,11 @@ name = "camera_2"
 channel_label = "V4L2 Camera"
 publish_states = []
 recorded_states = []
+value_limits = []
 
 [devices.channels.profile]
-width = 1920
-height = 1080
+width = 1280
+height = 960
 fps = 30
 pixel_format = "rgb24"
 native_pixel_format = "MJPG"
@@ -167,6 +172,84 @@ joint_mit_kd = []
 parallel_mit_kp = []
 parallel_mit_kd = []
 
+[[devices.channels.value_limits]]
+state_kind = "joint_position"
+min = [
+    -3.141592653589793,
+    -2.9671,
+    -0.087266,
+    -3.0107,
+    -1.7628,
+    -3.0107,
+]
+max = [
+    2.0944,
+    0.17453,
+    3.141592653589793,
+    3.0107,
+    1.7628,
+    3.0107,
+]
+
+[[devices.channels.value_limits]]
+state_kind = "joint_velocity"
+min = [
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+]
+max = [
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+]
+
+[[devices.channels.value_limits]]
+state_kind = "joint_effort"
+min = [
+    -50.0,
+    -50.0,
+    -50.0,
+    -50.0,
+    -50.0,
+    -50.0,
+]
+max = [
+    50.0,
+    50.0,
+    50.0,
+    50.0,
+    50.0,
+    50.0,
+]
+
+[[devices.channels.value_limits]]
+state_kind = "end_effector_pose"
+min = [
+    -0.6,
+    -0.6,
+    -0.1,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+]
+max = [
+    0.6,
+    0.6,
+    0.7,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+]
+
 [[devices.channels]]
 channel_type = "e2"
 kind = "robot"
@@ -188,6 +271,21 @@ joint_mit_kp = []
 joint_mit_kd = []
 parallel_mit_kp = [0.0]
 parallel_mit_kd = [0.0]
+
+[[devices.channels.value_limits]]
+state_kind = "parallel_position"
+min = [0.0]
+max = [0.07]
+
+[[devices.channels.value_limits]]
+state_kind = "parallel_velocity"
+min = [-0.5]
+max = [0.5]
+
+[[devices.channels.value_limits]]
+state_kind = "parallel_effort"
+min = [-10.0]
+max = [10.0]
 
 [[devices]]
 name = "airbot_play_2"
@@ -225,6 +323,84 @@ joint_mit_kd = []
 parallel_mit_kp = []
 parallel_mit_kd = []
 
+[[devices.channels.value_limits]]
+state_kind = "joint_position"
+min = [
+    -3.141592653589793,
+    -2.9671,
+    -0.087266,
+    -3.0107,
+    -1.7628,
+    -3.0107,
+]
+max = [
+    2.0944,
+    0.17453,
+    3.141592653589793,
+    3.0107,
+    1.7628,
+    3.0107,
+]
+
+[[devices.channels.value_limits]]
+state_kind = "joint_velocity"
+min = [
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+    -3.141592653589793,
+]
+max = [
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+    3.141592653589793,
+]
+
+[[devices.channels.value_limits]]
+state_kind = "joint_effort"
+min = [
+    -50.0,
+    -50.0,
+    -50.0,
+    -50.0,
+    -50.0,
+    -50.0,
+]
+max = [
+    50.0,
+    50.0,
+    50.0,
+    50.0,
+    50.0,
+    50.0,
+]
+
+[[devices.channels.value_limits]]
+state_kind = "end_effector_pose"
+min = [
+    -0.6,
+    -0.6,
+    -0.1,
+    -1.0,
+    -1.0,
+    -1.0,
+    -1.0,
+]
+max = [
+    0.6,
+    0.6,
+    0.7,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+]
+
 [[devices.channels]]
 channel_type = "g2"
 kind = "robot"
@@ -246,6 +422,21 @@ joint_mit_kp = []
 joint_mit_kd = []
 parallel_mit_kp = [10.0]
 parallel_mit_kd = [0.5]
+
+[[devices.channels.value_limits]]
+state_kind = "parallel_position"
+min = [0.0]
+max = [0.07]
+
+[[devices.channels.value_limits]]
+state_kind = "parallel_velocity"
+min = [-0.5]
+max = [0.5]
+
+[[devices.channels.value_limits]]
+state_kind = "parallel_effort"
+min = [-10.0]
+max = [10.0]
 
 [[pairings]]
 leader_device = "airbot_play"
@@ -287,6 +478,8 @@ joint_scales = [1.0]
 video_codec = "h264"
 depth_codec = "rvl"
 backend = "auto"
+video_backend = "nvidia"
+depth_backend = "cpu"
 artifact_format = "auto"
 queue_size = 32
 
@@ -297,7 +490,7 @@ encoded_handoff = "file"
 
 [storage]
 backend = "local"
-output_path = "./output_123"
+output_path = "./output"
 queue_size = 32
 
 [monitor]
@@ -317,7 +510,7 @@ jpeg_quality = 30
 preview_fps = 60
 
 [ui]
-http_host = "127.0.0.1"
+http_host = "0.0.0.0"
 http_port = 3000
 start_key = "s"
 stop_key = "e"

@@ -111,7 +111,7 @@ export default function App({
   } = useControlSocket(runtimeConfig.controlWebsocketUrl, controlSocketOptions);
   const {
     frames,
-    robotStates,
+    robotChannels,
     streamInfo,
     connected: previewConnected,
     send: sendPreview,
@@ -128,7 +128,7 @@ export default function App({
   );
 
   const cameraNames = Array.from(frames.keys());
-  const configuredCameraNames = streamInfo?.cameras.map((camera) => camera.name) ?? [];
+  const configuredCameraNames = streamInfo?.cameras?.map((camera) => camera.name) ?? [];
   const resolvedCameraNames = useMemo(
     () => resolveCameraNames(configuredCameraNames, cameraNames),
     [cameraNames, configuredCameraNames],
@@ -137,7 +137,9 @@ export default function App({
     () => resolvedCameraNames.map((name) => ({ name, frame: frames.get(name) })),
     [frames, resolvedCameraNames],
   );
-  const robotEntries = Array.from(robotStates.entries());
+  const robotEntries = Array.from(robotChannels.values()).sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
   const effectiveEpisodeStatus = episodeStatus ?? {
     type: "episode_status" as const,
     state: "idle" as const,
@@ -223,7 +225,7 @@ export default function App({
       "ui.layout",
       `${viewport.width}x${viewport.height} ${wideLayout ? "wide" : "narrow"}`,
     );
-    setGauge("ui.robot_count", robotStates.size);
+    setGauge("ui.robot_count", robotChannels.size);
     setGauge("ui.debug_enabled", showDebug ? "On" : "Off");
     setGauge("ui.episode_state", effectiveEpisodeStatus.state);
     setGauge("ui.episode_count", effectiveEpisodeStatus.episode_count);
@@ -239,7 +241,7 @@ export default function App({
     effectiveEpisodeStatus.elapsed_ms,
     effectiveEpisodeStatus.episode_count,
     effectiveEpisodeStatus.state,
-    robotStates.size,
+    robotChannels.size,
     showDebug,
     streamInfo,
     viewport.height,
@@ -282,7 +284,7 @@ export default function App({
                 connected={connected}
                 frames={frames}
                 orientation="vertical"
-                robotStates={robotStates}
+                robotChannels={robotChannels}
                 streamInfo={streamInfo}
               />
             </div>
@@ -291,18 +293,17 @@ export default function App({
 
         <section className="robot-panels">
           {robotEntries.length > 0 ? (
-            robotEntries.map(([name, state]) => (
-              <RobotStatePanel
-                key={name}
-                endEffectorFeedbackValid={state.end_effector_feedback_valid}
-                endEffectorStatus={state.end_effector_status}
-                name={name}
-                numJoints={state.num_joints}
-                positions={state.positions}
-              />
+            robotEntries.map((channel) => (
+              <RobotStatePanel key={channel.name} channel={channel} />
             ))
           ) : (
-            <RobotStatePanel name="robot_0" numJoints={0} positions={[]} />
+            <RobotStatePanel
+              channel={{
+                name: "robot_0",
+                states: {},
+                lastTimestampMs: 0,
+              }}
+            />
           )}
         </section>
 
@@ -311,7 +312,7 @@ export default function App({
             connected={connected}
             frames={frames}
             orientation="horizontal"
-            robotStates={robotStates}
+            robotChannels={robotChannels}
             streamInfo={streamInfo}
           />
         ) : null}

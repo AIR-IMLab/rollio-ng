@@ -1,9 +1,9 @@
-import type { CameraFrame } from "../lib/websocket";
-import type { RobotStateMessage, StreamInfoMessage } from "../lib/protocol";
+import type { CameraFrame, AggregatedRobotChannel } from "../lib/websocket";
+import type { StreamInfoMessage } from "../lib/protocol";
 
 interface InfoPanelProps {
   frames: Map<string, CameraFrame>;
-  robotStates: Map<string, RobotStateMessage>;
+  robotChannels: Map<string, AggregatedRobotChannel>;
   streamInfo?: StreamInfoMessage | null;
   connected: boolean;
   orientation: "vertical" | "horizontal";
@@ -11,18 +11,19 @@ interface InfoPanelProps {
 
 export function InfoPanel({
   frames,
-  robotStates,
+  robotChannels,
   streamInfo = null,
   connected,
   orientation,
 }: InfoPanelProps) {
-  const cameraNames = streamInfo?.cameras.map((camera) => camera.name) ?? Array.from(frames.keys());
-  const robotNames = streamInfo?.robots ?? Array.from(robotStates.keys());
+  const cameraNames =
+    streamInfo?.cameras?.map((camera) => camera.name) ?? Array.from(frames.keys());
+  const robotNames = streamInfo?.robots ?? Array.from(robotChannels.keys());
   const hasData =
     cameraNames.length > 0 ||
     robotNames.length > 0 ||
     frames.size > 0 ||
-    robotStates.size > 0;
+    robotChannels.size > 0;
 
   if (!hasData) {
     return (
@@ -38,7 +39,7 @@ export function InfoPanel({
       .map((name) => `${name}: ${cameraResolution(name, frames.get(name), streamInfo)}`)
       .join(" | ");
     const robotLine = robotNames
-      .map((name) => `${name}: ${robotStates.get(name)?.num_joints ?? 0} DoF`)
+      .map((name) => `${name}: ${robotDof(robotChannels.get(name))} DoF`)
       .join(" | ");
 
     return (
@@ -69,7 +70,7 @@ export function InfoPanel({
           {robotNames.map((name) => (
             <div className="info-panel__row" key={name}>
               <span>{name}</span>
-              <span>{robotStates.get(name)?.num_joints ?? 0} DoF</span>
+              <span>{robotDof(robotChannels.get(name))} DoF</span>
             </div>
           ))}
         </div>
@@ -97,7 +98,7 @@ function cameraResolution(
   frame: CameraFrame | undefined,
   streamInfo: StreamInfoMessage | null,
 ): string {
-  const camera = streamInfo?.cameras.find((entry) => entry.name === name);
+  const camera = streamInfo?.cameras?.find((entry) => entry.name === name);
   if (camera?.source_width != null && camera.source_height != null) {
     return `${camera.source_width}x${camera.source_height}`;
   }
@@ -105,4 +106,21 @@ function cameraResolution(
     return `${frame.previewWidth}x${frame.previewHeight}`;
   }
   return "n/a";
+}
+
+function robotDof(channel: AggregatedRobotChannel | undefined): number {
+  if (!channel) return 0;
+  const sample =
+    channel.states.joint_position ??
+    channel.states.parallel_position ??
+    channel.states.end_effector_pose;
+  if (sample) {
+    return sample.numJoints || sample.values.length;
+  }
+  for (const value of Object.values(channel.states)) {
+    if (value) {
+      return value.numJoints || value.values.length;
+    }
+  }
+  return 0;
 }

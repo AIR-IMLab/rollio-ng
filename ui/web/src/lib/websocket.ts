@@ -4,6 +4,7 @@ import {
   parseBinaryMessage,
   parseJsonMessage,
   type EpisodeStatusMessage,
+  type RobotStateKind,
   type RobotStateMessage,
   type StreamInfoMessage,
 } from "./protocol";
@@ -25,6 +26,30 @@ export interface CameraFrame {
   jpegBytes: number;
 }
 
+/** A single state-kind sample retained for an aggregated robot channel. */
+export interface RobotChannelSample {
+  values: number[];
+  valueMin: number[];
+  valueMax: number[];
+  timestampMs: number;
+  numJoints: number;
+}
+
+/**
+ * Per-channel snapshot built from the per-state-kind `robot_state` messages.
+ * The UI renders one panel per `AggregatedRobotChannel` instead of one panel
+ * per (channel, state_kind) pair so joint position / velocity / effort rows
+ * for the same arm collapse into a single visual block.
+ */
+export interface AggregatedRobotChannel {
+  name: string;
+  states: Partial<Record<RobotStateKind, RobotChannelSample>>;
+  /** Latest non-zero timestamp across all kinds; useful for sorting. */
+  lastTimestampMs: number;
+  endEffectorStatus?: RobotStateMessage["end_effector_status"];
+  endEffectorFeedbackValid?: boolean;
+}
+
 export interface ControlSocketState {
   episodeStatus: EpisodeStatusMessage | null;
   connected: boolean;
@@ -33,7 +58,7 @@ export interface ControlSocketState {
 
 export interface PreviewSocketState {
   frames: Map<string, CameraFrame>;
-  robotStates: Map<string, RobotStateMessage>;
+  robotChannels: Map<string, AggregatedRobotChannel>;
   streamInfo: StreamInfoMessage | null;
   connected: boolean;
   send: (msg: string) => void;
@@ -285,13 +310,13 @@ export function usePreviewSocket(
 
   const [connected, setConnected] = useState(false);
   const [frames, setFrames] = useState<Map<string, CameraFrame>>(() => new Map());
-  const [robotStates, setRobotStates] = useState<Map<string, RobotStateMessage>>(
-    () => new Map(),
-  );
+  const [robotChannels, setRobotChannels] = useState<
+    Map<string, AggregatedRobotChannel>
+  >(() => new Map());
   const [streamInfo, setStreamInfo] = useState<StreamInfoMessage | null>(null);
 
   const framesRef = useRef<Map<string, CameraFrame>>(new Map());
-  const robotStatesRef = useRef<Map<string, RobotStateMessage>>(new Map());
+  const robotChannelsRef = useRef<Map<string, AggregatedRobotChannel>>(new Map());
   const streamInfoRef = useRef<StreamInfoMessage | null>(null);
   const dirtyRef = useRef(false);
   const frameSequenceRef = useRef(0);
@@ -312,7 +337,7 @@ export function usePreviewSocket(
         // UI doesn't show stale frames or robot positions.
         revokeFrameUrls(framesRef.current, revokeObjectUrl);
         framesRef.current.clear();
-        robotStatesRef.current.clear();
+        robotChannelsRef.current.clear();
         streamInfoRef.current = null;
         frameSequenceRef.current = 0;
         dirtyRef.current = true;
@@ -325,10 +350,10 @@ export function usePreviewSocket(
       const msg = parseJsonMessage(text);
       recordTiming("ws.parse.json", nowMs() - parseStartMs);
       if (msg?.type === "robot_state") {
-        robotStatesRef.current.set(msg.name, msg);
+        applyRobotStateSample(robotChannelsRef.current, msg);
         dirtyRef.current = true;
         incrementGauge("ws.robot_messages_total");
-        setGauge("ws.robot_state_count", robotStatesRef.current.size);
+        setGauge("ws.robot_state_count", robotChannelsRef.current.size);
       } else if (msg?.type === "stream_info") {
         streamInfoRef.current = msg;
         dirtyRef.current = true;
@@ -399,11 +424,11 @@ export function usePreviewSocket(
       const flushStartMs = nowMs();
       dirtyRef.current = false;
       setFrames(new Map(framesRef.current));
-      setRobotStates(new Map(robotStatesRef.current));
+      setRobotChannels(new Map(robotChannelsRef.current));
       setStreamInfo(streamInfoRef.current);
       recordTiming("ws.flush", nowMs() - flushStartMs);
       setGauge("ws.frame_count", framesRef.current.size);
-      setGauge("ws.robot_state_count", robotStatesRef.current.size);
+      setGauge("ws.robot_state_count", robotChannelsRef.current.size);
     }, BATCH_INTERVAL_MS);
 
     const streamInfoInterval = window.setInterval(() => {
@@ -418,10 +443,45 @@ export function usePreviewSocket(
       window.clearInterval(streamInfoInterval);
       revokeFrameUrls(framesRef.current, revokeObjectUrl);
       framesRef.current.clear();
-      robotStatesRef.current.clear();
+      robotChannelsRef.current.clear();
       streamInfoRef.current = null;
     };
   }, [revokeObjectUrl]);
 
-  return { frames, robotStates, streamInfo, connected, send };
+  return { frames, robotChannels, streamInfo, connected, send };
+}
+
+/**
+ * Mutate `channels` in-place to merge a new per-state-kind sample.
+ *
+ * The visualizer emits one message per (channel, state_kind) pair, so we
+ * accumulate all kinds belonging to the same channel id under a single
+ * `AggregatedRobotChannel` entry. Old kinds for that channel are preserved
+ * across updates (joint_position arriving doesn't drop the last
+ * joint_velocity sample).
+ */
+export function applyRobotStateSample(
+  channels: Map<string, AggregatedRobotChannel>,
+  msg: RobotStateMessage,
+): void {
+  const existing = channels.get(msg.name);
+  const sample: RobotChannelSample = {
+    values: Array.isArray(msg.values) ? msg.values : [],
+    valueMin: Array.isArray(msg.value_min) ? msg.value_min : [],
+    valueMax: Array.isArray(msg.value_max) ? msg.value_max : [],
+    timestampMs: typeof msg.timestamp_ms === "number" ? msg.timestamp_ms : 0,
+    numJoints: typeof msg.num_joints === "number" ? msg.num_joints : 0,
+  };
+  const states: AggregatedRobotChannel["states"] = existing
+    ? { ...existing.states }
+    : {};
+  states[msg.state_kind] = sample;
+  channels.set(msg.name, {
+    name: msg.name,
+    states,
+    lastTimestampMs: Math.max(existing?.lastTimestampMs ?? 0, sample.timestampMs),
+    endEffectorStatus: msg.end_effector_status ?? existing?.endEffectorStatus,
+    endEffectorFeedbackValid:
+      msg.end_effector_feedback_valid ?? existing?.endEffectorFeedbackValid,
+  });
 }

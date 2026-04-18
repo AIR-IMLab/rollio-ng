@@ -3,6 +3,25 @@ const textDecoder = new TextDecoder("utf-8");
 
 export type EndEffectorStatus = "unknown" | "disabled" | "enabled";
 
+/**
+ * State-kind tag emitted by the visualizer on each `robot_state` message.
+ *
+ * The visualizer publishes one message per (channel, state_kind) pair so the
+ * UI can group rows belonging to the same channel into a single panel
+ * (joint position + velocity + effort + optional EE pose / parallel gripper
+ * channels). Lists every kind the rollio backend currently emits.
+ */
+export type RobotStateKind =
+  | "joint_position"
+  | "joint_velocity"
+  | "joint_effort"
+  | "end_effector_pose"
+  | "end_effector_twist"
+  | "end_effector_wrench"
+  | "parallel_position"
+  | "parallel_velocity"
+  | "parallel_effort";
+
 export interface CameraFrameMessage {
   type: "camera_frame";
   name: string;
@@ -13,14 +32,27 @@ export interface CameraFrameMessage {
   jpegData: Uint8Array;
 }
 
+/**
+ * Single-state-kind sample emitted by the visualizer. The UI aggregates
+ * messages with the same `name` into one channel block keyed on
+ * `state_kind` so joint position / velocity / effort rows for the same arm
+ * collapse into a single visual panel.
+ */
 export interface RobotStateMessage {
   type: "robot_state";
   name: string;
-  timestamp_ns: number;
+  /** Backend timestamp in milliseconds (visualizer wire format). */
+  timestamp_ms: number;
   num_joints: number;
-  positions: number[];
-  velocities: number[];
-  efforts: number[];
+  /** Element values for `state_kind`. Unit depends on the kind: rad / rad·s⁻¹
+   *  / Nm for joint kinds, m / m·s⁻¹ / N for parallel kinds, mixed for poses.
+   */
+  values: number[];
+  state_kind: RobotStateKind;
+  /** Optional per-element envelope reported by the device driver.
+   *  Empty / missing means "no driver-reported limits". */
+  value_min?: number[];
+  value_max?: number[];
   end_effector_status?: EndEffectorStatus;
   end_effector_feedback_valid?: boolean;
 }
@@ -29,16 +61,16 @@ export interface StreamInfoCamera {
   name: string;
   source_width: number | null;
   source_height: number | null;
-  latest_timestamp_ns: number | null;
+  latest_timestamp_ms: number | null;
   latest_frame_index: number | null;
   source_fps_estimate: number | null;
   published_fps_estimate: number | null;
-  last_published_timestamp_ns: number | null;
+  last_published_timestamp_ms: number | null;
 }
 
 export interface StreamInfoMessage {
   type: "stream_info";
-  server_timestamp_ns: number;
+  server_timestamp_ms: number;
   configured_preview_fps: number;
   max_preview_width: number;
   max_preview_height: number;

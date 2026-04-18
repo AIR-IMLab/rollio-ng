@@ -58,6 +58,28 @@ describe("protocol", () => {
     });
   });
 
+  it("parses robot_state JSON in the visualizer wire format", () => {
+    expect(
+      parseJsonMessage(
+        JSON.stringify({
+          type: "robot_state",
+          name: "airbot_play_arm",
+          timestamp_ms: 999,
+          num_joints: 6,
+          values: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+          state_kind: "joint_position",
+        }),
+      ),
+    ).toMatchObject({
+      type: "robot_state",
+      name: "airbot_play_arm",
+      timestamp_ms: 999,
+      num_joints: 6,
+      values: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+      state_kind: "joint_position",
+    });
+  });
+
   it("parses episode status JSON", () => {
     expect(
       parseJsonMessage(

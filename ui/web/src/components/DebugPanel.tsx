@@ -16,7 +16,7 @@ export function DebugPanel({ snapshot, streamInfo }: DebugPanelProps) {
     `Receive latency: ${formatTiming(snapshot, "ws.frame_latency.receive")} | Parse: bin=${formatTiming(snapshot, "ws.parse.binary")} json=${formatTiming(snapshot, "ws.parse.json")}`,
     `App render: ${formatTiming(snapshot, "app.render")} | Camera commit: ${formatTiming(snapshot, "ui.camera_commit")}`,
     formatPerCameraLine("Source fps", cameraNames, (cameraName) =>
-      streamInfo?.cameras.find((camera) => camera.name === cameraName)?.source_fps_estimate,
+      streamInfo?.cameras?.find((camera) => camera.name === cameraName)?.source_fps_estimate,
     ),
     formatPerCameraLine("Bytes", cameraNames, (cameraName) =>
       numericGaugeValue(snapshot, `ws.jpeg_bytes.${cameraName}`, Number.NaN),
@@ -106,7 +106,7 @@ function getCameraNames(
   snapshot: DebugSnapshot,
   streamInfo: StreamInfoMessage | null,
 ): string[] {
-  if (streamInfo && streamInfo.cameras.length > 0) {
+  if (streamInfo?.cameras && streamInfo.cameras.length > 0) {
     return streamInfo.cameras.map((camera) => camera.name);
   }
 
