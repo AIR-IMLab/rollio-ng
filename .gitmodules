@@ -13,3 +13,6 @@
 [submodule "third_party/rvl-rust"]
 	path = third_party/rvl-rust
 	url = git@github.com:tb5z035i/rvl-rust.git
+[submodule "third_party/pyAgxArm"]
+	path = third_party/pyAgxArm
+	url = https://github.com/agilexrobotics/pyAgxArm.git

@@ -26,3 +26,4 @@ external/reference
 *.STL
 logs/
 output/
+**/*.egg-info/

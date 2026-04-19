@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rollio-device-nero"
+version = "0.1.0"
+description = "AGX Nero (7-DOF arm + AGX gripper) device driver for the Rollio framework"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pin>=3.0",
+    "iceoryx2",
+    "pyAgxArm",
+    "tomli>=2.0.1; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+rollio-device-nero = "rollio_device_nero.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rollio_device_nero = [
+    "assets/*.urdf",
+]
+
+# Submodule versions must stay aligned with the rollio-ng workspace
+# (see third_party/iceoryx2 and third_party/pyAgxArm).
+[tool.uv.sources]
+iceoryx2 = { path = "../../third_party/iceoryx2/iceoryx2-ffi/python", editable = true }
+pyAgxArm = { path = "../../third_party/pyAgxArm", editable = true }
