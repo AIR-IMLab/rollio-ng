@@ -1,0 +1,25 @@
+#!/bin/sh
+# Maintainer script for the rollio .deb. Mirrors
+# third_party/airbot-play-rust/root/DEBIAN/postrm so removing the rollio
+# package cleans up any per-device udev rules written by bind_airbot_device
+# under /etc/udev/rules.d/ on `purge`.
+set -e
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+if [ "$1" = "purge" ]; then
+    rm -f /etc/udev/rules.d/*airbot*.rules
+fi
+
+if command -v udevadm >/dev/null 2>&1; then
+    udevadm control --reload-rules || true
+    udevadm trigger || true
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    systemctl restart systemd-udevd.service || systemctl restart udev || true
+fi
+
+exit 0

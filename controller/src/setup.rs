@@ -76,6 +76,44 @@ struct TeleopPairCreate {
     ratio: Option<f64>,
 }
 
+/// Verifies that a usable `node` is on `PATH`. The setup wizard's terminal UI
+/// is an Ink/React app spawned as `node /usr/share/rollio/ui/terminal/dist/index.js`,
+/// and Ink requires a recent Node.js. Ubuntu's apt `nodejs` package lags
+/// what Ink supports, so the rollio .deb intentionally does not pin
+/// `nodejs` as a Depends. Instead we detect Node here at runtime and
+/// point the operator at the upstream installer if it is missing or
+/// broken. Returns `Ok(())` if `node --version` ran cleanly; otherwise
+/// returns a single error message that mentions
+/// <https://nodejs.org/en/download>.
+fn ensure_node_available() -> Result<(), Box<dyn Error>> {
+    const NODE_INSTALL_HINT: &str =
+        "Install a current Node.js build from https://nodejs.org/en/download \
+         (the Ubuntu apt `nodejs` package is typically too old for the \
+         rollio terminal UI).";
+
+    match Command::new("node")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "rollio setup needs Node.js to run the terminal UI, but `node --version` \
+             exited with {} (stderr: {}). {NODE_INSTALL_HINT}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )
+        .into()),
+        Err(err) => Err(format!(
+            "rollio setup needs Node.js to run the terminal UI, but `node` \
+             could not be launched from PATH ({err}). {NODE_INSTALL_HINT}"
+        )
+        .into()),
+    }
+}
+
 fn dev_build_profile(workspace_root: &Path, current_exe_dir: &Path) -> Option<&'static str> {
     let target_root = workspace_root.join("target");
     if current_exe_dir == target_root.join("release") {
@@ -2125,6 +2163,18 @@ fn normalized_delta(delta: Option<i32>) -> i32 {
 }
 
 pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
+    // The interactive wizard spawns the Ink terminal UI via `node`. Fail
+    // fast with a pointer to https://nodejs.org/en/download so the operator
+    // doesn't sit through device discovery + IPC bring-up only to die at
+    // child-spawn time. The rollio .deb deliberately does not pin `nodejs`
+    // as a Debian Depends because Ubuntu's package is too old for Ink, so
+    // this is the first place we surface a missing/broken Node install.
+    // `--accept-defaults` skips the UI entirely, so the check is only
+    // mandatory in the interactive path.
+    if !args.accept_defaults {
+        ensure_node_available()?;
+    }
+
     let workspace_root = workspace_root()?;
     let share_root = resolve_share_root()?;
     let state_dir = resolve_state_dir()?;

@@ -1,0 +1,22 @@
+Package: rollio
+Version: @DEB_VERSION@
+Architecture: @DEB_ARCH@
+Maintainer: Rollio Maintainers <rollio@localhost>
+Section: video
+Priority: optional
+Depends: can-utils, iproute2, kmod, udev, usbutils, @SHLIBS@
+Description: Rollio robotics data collection framework
+ Ships controller binaries under /usr/bin and the terminal/web UI
+ bundles under /usr/share/rollio. Also installs the AIRBOT Play CAN
+ host setup (helper scripts under /bin, udev rules under
+ /lib/udev/rules.d, and the slcan@ systemd unit under
+ /lib/systemd/system) so the rollio-device-airbot-play binary works
+ without a separate airbot-play-rust install. Shared-library
+ Depends are derived from
+ all shipped binaries except rollio-encoder (install FFmpeg/Ubuntu
+ libav* packages separately if you use the encoder). Node.js is not
+ listed as an apt dependency because Ubuntu's `nodejs` package lags
+ the version Ink/the terminal UI need; `rollio setup` detects Node
+ at runtime and points operators at https://nodejs.org/en/download
+ if it is missing. The Nero hardware driver is shipped separately
+ as the rollio_device_nero Python wheel.
