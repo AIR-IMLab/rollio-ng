@@ -96,7 +96,7 @@ def probe_devices(timeout_ms: int = DEFAULT_PROBE_TIMEOUT_MS) -> list[ProbedDevi
     for iface in interfaces:
         cfg = create_agx_arm_config(
             robot=ArmModel.NERO,
-            firmeware_version=NeroFW.DEFAULT,
+            firmeware_version=NeroFW.V111,
             channel=iface,
         )
         feedback = False
@@ -159,7 +159,7 @@ def validate_device(
 
     cfg = create_agx_arm_config(
         robot=ArmModel.NERO,
-        firmeware_version=NeroFW.DEFAULT,
+        firmeware_version=NeroFW.V111,
         channel=device_id,
     )
     robot = AgxArmFactory.create_arm(cfg)

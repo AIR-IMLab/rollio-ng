@@ -34,7 +34,7 @@ def create_robot(interface: str) -> Any:
     pyAgxArm = _load_pyagxarm()
     cfg = pyAgxArm.create_agx_arm_config(
         robot=pyAgxArm.ArmModel.NERO,
-        firmeware_version=pyAgxArm.NeroFW.DEFAULT,
+        firmeware_version=pyAgxArm.NeroFW.V111,
         channel=interface,
     )
     robot = pyAgxArm.AgxArmFactory.create_arm(cfg)
@@ -169,9 +169,22 @@ class AgxGripperBackend:
 
     def get_gripper_position_m(self) -> float | None:
         gs = self._status()
-        if gs is None or gs.msg.mode != "width":
+        if gs is None:
             return None
-        return float(gs.msg.value)
+        # The AGX Nero gripper firmware reports its mode byte (byte 7 of CAN
+        # frame 0x2A8) as 0x01 ("angle") even when it is physically tracking
+        # `move_gripper_m` width-mode commands (status_code=1). The pyAgxArm
+        # decoder then scales the raw int32 by 1e-3 (angle convention,
+        # mdeg -> deg) instead of the 1e-6 used in width mode (µm -> m), so
+        # `gs.msg.value` is left in millimetres rather than metres. The raw
+        # int32 the firmware ships is the same physical width count
+        # regardless of the reported mode flag, so we re-normalise to metres
+        # here. Confirmed empirically: commanded `target_m = 0.04699...`
+        # (47040 µm) round-trips as `gs.msg.value = 47.04` with mode="angle".
+        value = float(gs.msg.value)
+        if gs.msg.mode == "angle":
+            value *= 1e-3
+        return value
 
     def get_gripper_velocity_m_per_s(self) -> float | None:
         # The AGX gripper firmware does not expose a velocity channel; the

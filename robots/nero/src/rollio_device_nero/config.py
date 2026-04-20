@@ -12,7 +12,7 @@ Reference: ../../../../../rollio-types/src/config.rs (`BinaryDeviceConfig` /
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -60,14 +60,15 @@ MIN_ACHIEVED_FREQUENCY_RATIO: float = 0.95
 # The two constants are kept separate so future operator-tunable damping
 # (e.g. add a tiny kd to Identifying for a "shake-test" mode) only touches
 # the corresponding branch.
-DEFAULT_TRACKING_KP: float = 10.0
+DEFAULT_TRACKING_KP: float = 20.0
 DEFAULT_TRACKING_KD: float = 1.0
 DEFAULT_FREE_DRIVE_KD: float = 0.0
 DEFAULT_IDENTIFYING_KD: float = 0.0
 
-# Per-joint torque saturation for the AGX Nero (firmware <= v110, NeroFW.DEFAULT).
-# Source: docs/nero/nero_api.md - move_mit() t_ff range table.
-TAU_MAX: tuple[float, ...] = (24.0, 24.0, 18.0, 18.0, 8.0, 8.0, 8.0)
+# Per-joint torque saturation for the AGX Nero (firmware >= 1.11, NeroFW.V111).
+# Source: third_party/pyAgxArm/docs/nero/nero_api.md — v111 move_mit() t_ff is
+# [-16, 16] N·m on joints 1-7 (uniform; 12-bit encoding vs per-joint caps on ≤1.10).
+TAU_MAX: tuple[float, ...] = (16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0)
 
 
 class ConfigError(RuntimeError):
@@ -89,14 +90,24 @@ class GripperChannelConfig:
     enabled: bool = True
     mode: str = "free-drive"
     publish_states: list[str] = field(default_factory=list)
-    # Default close/open force used when the controller does not provide
-    # one via `command_defaults.parallel_mit_kp[0]`. The AGX gripper
-    # firmware exposes the full [0.0, 3.0] N envelope and the actuator's
+    # Last-resort fallback force (N) when the controller TOML does NOT
+    # provide `[devices.channels.command_defaults] parallel_mit_kp` AND
+    # the per-tick MIT command leaves `kp[0]` at 0.0. In normal teleop
+    # this is unused -- precedence at runtime is:
+    #
+    #   per-tick `mit.kp[0]` (if > 0)
+    #     > controller TOML `command_defaults.parallel_mit_kp[0]`
+    #     > this dataclass default
+    #
+    # To change the actual gripper force in deployed setups, edit the
+    # controller's `config.toml` for the gripper channel (e.g.
+    # `[devices.channels.command_defaults] parallel_mit_kp = [<N>]`) or
+    # the upstream `mit.kp[0]` your teleop pair publishes. Tweaking this
+    # value here will only matter when the TOML omits `parallel_mit_kp`
+    # entirely. AGX gripper firmware exposes [0.0, 3.0] N; the actuator's
     # closing speed scales with this force (it has no separate velocity
-    # knob), so we default at the spec max for snappy teleop. Operators
-    # who need delicate gripping should override via the controller's
-    # `parallel_mit_kp[0]` channel default or per-command MIT `kp` slot.
-    default_force_n: float = 3.0
+    # knob).
+    default_force_n: float = 1.0
 
 
 @dataclass(slots=True)
@@ -195,10 +206,15 @@ def _parse_gripper(raw: dict[str, Any]) -> GripperChannelConfig:
     mode = _normalize_mode(raw.get("mode", "free-drive"))
     publish_states = _string_list(raw.get("publish_states", []))
 
-    # See `GripperChannelConfig.default_force_n` for the rationale -- the
-    # firmware spec max is 3.0 N and the AGX gripper has no independent
-    # speed knob, so the default is set there for snappy teleop.
-    default_force_n = 3.0
+    # Pick up the dataclass-level fallback as the starting point so that
+    # changing `GripperChannelConfig.default_force_n` actually flows
+    # through when the controller TOML omits `parallel_mit_kp`. We go
+    # through `dataclasses.fields(...)` because `slots=True` replaces the
+    # class attribute with a slot descriptor, so the bare `Class.attr`
+    # form would fetch the descriptor instead of the default value.
+    default_force_n = next(
+        f.default for f in fields(GripperChannelConfig) if f.name == "default_force_n"
+    )
     cmd_defaults = raw.get("command_defaults", {})
     if isinstance(cmd_defaults, dict):
         kp_list = cmd_defaults.get("parallel_mit_kp")

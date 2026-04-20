@@ -7,6 +7,7 @@ import pytest
 pin = pytest.importorskip("pinocchio")
 np = pytest.importorskip("numpy")
 
+from rollio_device_nero.config import TAU_MAX  # noqa: E402
 from rollio_device_nero.gravity import GRIPPER_TCP_DEPTH_M, NeroModel  # noqa: E402
 
 # Canonical g(q=0) values produced by `external/reference/nero-demo/gravity_compensation.py --dry-run`
@@ -52,14 +53,14 @@ def test_with_gripper_gravity_at_zero_matches_reference() -> None:
 def test_gravity_torques_clipped_respects_tau_max() -> None:
     nero = NeroModel(with_gripper=True)
     # Push the model into a configuration with a known large gravity torque
-    # (joint 4 hangs out horizontally) and confirm clipping caps at 18 N*m.
+    # (joint 4 hangs out horizontally) and confirm clipping respects TAU_MAX.
     q = np.zeros(7)
     q[1] = -np.pi / 2  # tip joint 2 forward
     g = nero.gravity_torques(q)
     g_clipped = nero.gravity_torques_clipped(q)
-    assert np.all(np.abs(g_clipped) <= np.array([24.0, 24.0, 18.0, 18.0, 8.0, 8.0, 8.0]) + 1e-9)
+    bound = np.asarray(TAU_MAX, dtype=float)
+    assert np.all(np.abs(g_clipped) <= bound + 1e-9)
     # And clipping is a no-op wherever |g| was already within the cap.
-    bound = np.array([24.0, 24.0, 18.0, 18.0, 8.0, 8.0, 8.0])
     safe = np.abs(g) <= bound
     assert np.allclose(g_clipped[safe], g[safe])
 

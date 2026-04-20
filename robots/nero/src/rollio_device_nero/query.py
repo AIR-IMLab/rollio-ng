@@ -152,7 +152,7 @@ def _build_gripper_channel() -> dict[str, Any]:
         "defaults": {
             "joint_mit_kp": [],
             "joint_mit_kd": [],
-            "parallel_mit_kp": [10.0],
+            "parallel_mit_kp": [1.0],
             "parallel_mit_kd": [0.5],
         },
         "value_limits": _gripper_value_limits(),

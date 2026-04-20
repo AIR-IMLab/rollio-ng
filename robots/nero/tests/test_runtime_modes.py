@@ -13,6 +13,7 @@ from rollio_device_nero.config import (  # noqa: E402  # noqa: E402
     DEFAULT_IDENTIFYING_KD,
     DEFAULT_TRACKING_KD,
     DEFAULT_TRACKING_KP,
+    TAU_MAX,
     ArmChannelConfig,
     GripperChannelConfig,
 )
@@ -219,7 +220,8 @@ def test_arm_free_drive_emits_gravity_only_no_damping(nero_model: NeroModel) -> 
         assert kp == 0.0
         assert kd == 0.0
         # gravity feed-forward is bounded by TAU_MAX.
-        assert -24.0 <= t_ff <= 24.0
+        cap = TAU_MAX[joint_index - 1]
+        assert -cap <= t_ff <= cap
     assert ipc.published_modes[-1] == DEVICE_CHANNEL_MODE_FREE_DRIVE
 
 
