@@ -1,3 +1,2 @@
-edition = "2021"
-max_width = 100
-use_small_heuristics = "Default"
+# Vendored trees follow their own formatting; do not block CI on submodule drift.
+ignore = ["third_party", "external"]

@@ -112,4 +112,5 @@ package-deps:
 	  build-essential dpkg-dev \
 	  cmake pkg-config nasm clang libclang-dev llvm-dev \
 	  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+	  liburdfdom-dev \
 	  g++ git
