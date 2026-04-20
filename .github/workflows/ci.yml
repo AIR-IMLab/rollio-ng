@@ -34,7 +34,10 @@ jobs:
             libavformat-dev \
             libavutil-dev \
             libswscale-dev \
-            liburdfdom-dev
+            liburdfdom-dev \
+            libeigen3-dev \
+            libboost-filesystem-dev \
+            libboost-serialization-dev
 
       - name: cargo fmt (check)
         run: cargo +nightly fmt --all -- --check
@@ -161,6 +164,10 @@ jobs:
             libavutil-dev \
             libswscale-dev \
             liburdfdom-dev \
+            libconsole-bridge-dev \
+            libeigen3-dev \
+            libboost-filesystem-dev \
+            libboost-serialization-dev \
             g++ \
             git
 

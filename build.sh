@@ -27,7 +27,13 @@ DEB_DIST="${DEB_DIST:-dist}"
 STAGING="${STAGING:-.deb-staging}"
 TARGET_DIR="${TARGET_DIR:-target/release}"
 
-# All Rust binaries shipped in /usr/bin (encoder folded in).
+# Binaries omitted from dpkg-shlibdeps (still shipped). Encoder links the full
+# FFmpeg stack; Depends are not generated for it until packaging is finalized.
+SHLIBDEPS_EXCLUDE_BINS=(
+    rollio-encoder
+)
+
+# All Rust binaries shipped in /usr/bin (encoder included for shipping).
 CORE_BINS=(
     rollio
     rollio-encoder
@@ -104,8 +110,17 @@ Description: shlibdeps stub for $pkg
  Synthetic control file used only by build.sh to satisfy dpkg-shlibdeps.
 EOF
     rm -f "$subst_abs"
-    local elfs=()
+    local elfs=() exclude name
     while IFS= read -r -d '' f; do
+        name="$(basename "$f")"
+        local skip=0
+        for exclude in "${SHLIBDEPS_EXCLUDE_BINS[@]}"; do
+            if [[ "$name" == "$exclude" ]]; then
+                skip=1
+                break
+            fi
+        done
+        [[ "$skip" -eq 1 ]] && continue
         if file -b "$f" | grep -qE 'ELF.*(executable|shared object)'; then
             elfs+=("$(realpath "$f")")
         fi
@@ -149,9 +164,11 @@ Section: video
 Priority: optional
 Depends: nodejs, $shlibs
 Description: Rollio robotics data collection framework
- Ships all controller binaries (including the FFmpeg-backed encoder) and
- the terminal/web UI bundles under /usr/share/rollio. The Nero hardware
- driver is shipped separately as the rollio_device_nero Python wheel.
+ Ships controller binaries and the terminal/web UI bundles under
+ /usr/share/rollio. Shared-library Depends are derived from all shipped
+ binaries except rollio-encoder (install FFmpeg/Ubuntu libav* packages
+ separately if you use the encoder). The Nero hardware driver is shipped
+ separately as the rollio_device_nero Python wheel.
 EOF
 
     install -d "$DEB_DIST"

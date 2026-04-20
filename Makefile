@@ -113,4 +113,7 @@ package-deps:
 	  cmake pkg-config nasm clang libclang-dev llvm-dev \
 	  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
 	  liburdfdom-dev \
+	  libconsole-bridge-dev \
+	  libeigen3-dev \
+	  libboost-filesystem-dev libboost-serialization-dev \
 	  g++ git
