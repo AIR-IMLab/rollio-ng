@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rollio-device-nero"
-version = "0.1.0"
+version = "1.0.0"
 description = "AGX Nero (7-DOF arm + AGX gripper) device driver for the Rollio framework"
 requires-python = ">=3.10"
 dependencies = [

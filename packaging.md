@@ -28,7 +28,7 @@ Tooling required at pack time:
 - `uv` for the wheel (recommended): `pipx install uv` — or `python3-build` as fallback
 - `make package-deps` installs the apt-side helpers (omits Python — use `uv`)
 
-`./build.sh` accepts subcommands when you only need one artifact: `core`, `nero`, `clean`. Env overrides: `DEB_VERSION` (default `0.1.0-1`), `DEB_ARCH` (default `dpkg --print-architecture`), `DEB_DIST` (default `dist`), `STAGING` (default `.deb-staging`), `TARGET_DIR` (default `target/release`).
+`./build.sh` accepts subcommands when you only need one artifact: `core`, `nero`, `clean`. Env overrides: `DEB_VERSION` (default `1.0.0-1`), `DEB_ARCH` (default `dpkg --print-architecture`), `DEB_DIST` (default `dist`), `STAGING` (default `.deb-staging`), `TARGET_DIR` (default `target/release`).
 
 Example:
 

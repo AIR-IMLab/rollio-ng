@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "airbot_play_rust"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "cmake",
@@ -2129,7 +2129,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rollio"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "airbot_play_rust",
  "clap",
@@ -2147,11 +2147,11 @@ dependencies = [
 
 [[package]]
 name = "rollio-bus"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "rollio-bus-tap"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "iceoryx2",
@@ -2163,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-control-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-device-airbot-play"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "airbot_play_rust",
  "clap",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-device-pseudo"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "iceoryx2",
@@ -2210,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-device-v4l2"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "iceoryx2",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-encoder"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "ffmpeg-next",
@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-episode-assembler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2254,7 +2254,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-monitor"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "iceoryx2",
  "rollio-types",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-storage"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "iceoryx2",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-teleop-router"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "iceoryx2",
@@ -2286,7 +2286,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-test-publisher"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "iceoryx2",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-types"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "iceoryx2",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-ui-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "clap",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "rollio-visualizer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "crossbeam-channel",
@@ -2396,7 +2396,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rvl"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "ryu"

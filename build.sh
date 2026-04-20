@@ -10,7 +10,7 @@
 # This script does NOT compile. Run `make build` first (or `make package-all`).
 #
 # Env overrides:
-#   DEB_VERSION         package version (default: 0.1.0-1)
+#   DEB_VERSION         package version (default: 1.0.0-1)
 #   DEB_ARCH            dpkg architecture (default: dpkg --print-architecture)
 #   DEB_DIST            output directory (default: dist)
 #   STAGING             staging tree   (default: .deb-staging)
@@ -23,7 +23,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
-DEB_VERSION="${DEB_VERSION:-0.1.0-1}"
+DEB_VERSION="${DEB_VERSION:-1.0.0-1}"
 DEB_ARCH="${DEB_ARCH:-$(dpkg --print-architecture 2>/dev/null || echo amd64)}"
 DEB_DIST="${DEB_DIST:-dist}"
 STAGING="${STAGING:-.deb-staging}"

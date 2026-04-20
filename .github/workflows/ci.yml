@@ -188,7 +188,7 @@ jobs:
 
       - name: Build release artifacts and pack
         env:
-          DEB_VERSION: 0.1.0~ci${{ github.run_number }}
+          DEB_VERSION: 1.0.0~ci${{ github.run_number }}
         run: make package-all
 
       - name: Upload deb and wheel
