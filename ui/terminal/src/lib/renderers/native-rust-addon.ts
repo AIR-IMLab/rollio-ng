@@ -44,7 +44,14 @@ export interface NativeAsciiAddonModule {
 }
 
 function resolveNativeAsciiAddonUrl(): URL {
-  return new URL("../../../native/rollio-native-ascii.node", import.meta.url);
+  // tsx (dev) runs this file as src/lib/renderers/native-rust-addon.ts, so the
+  // addon is three levels up. The production bundle inlines this module into
+  // dist/index.js and dist/native-rust.worker.js, where the addon is one level
+  // up at ../native/.
+  if (import.meta.url.endsWith(".ts")) {
+    return new URL("../../../native/rollio-native-ascii.node", import.meta.url);
+  }
+  return new URL("../native/rollio-native-ascii.node", import.meta.url);
 }
 
 export function loadNativeAsciiAddon(): NativeAsciiAddonModule {

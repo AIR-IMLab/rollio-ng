@@ -68,6 +68,14 @@ jobs:
           find cameras cpp/common \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) \
             | xargs clang-format --dry-run --Werror --style=file
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libusb-1.0-0-dev \
+            libudev-dev
+
       - name: cmake configure
         run: cmake -B cameras/build -S cameras -DCMAKE_CXX_COMPILER=g++
 
@@ -173,6 +181,8 @@ jobs:
             libeigen3-dev \
             libboost-filesystem-dev \
             libboost-serialization-dev \
+            libusb-1.0-0-dev \
+            libudev-dev \
             g++ \
             git
 

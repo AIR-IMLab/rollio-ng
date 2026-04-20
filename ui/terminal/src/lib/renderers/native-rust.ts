@@ -96,11 +96,15 @@ function resolveCellAspect(geometry?: AsciiCellGeometry): number {
 }
 
 function resolveWorkerModuleUrl(): URL {
+  // Bundled production: this module is inlined into dist/index.js, and the
+  // worker entry sits next to it as dist/native-rust.worker.js.
   if (!import.meta.url.endsWith(".ts")) {
     return new URL("./native-rust.worker.js", import.meta.url);
   }
 
-  const builtWorkerUrl = new URL("../../../dist/lib/renderers/native-rust.worker.js", import.meta.url);
+  // tsx (dev): prefer the previously-built bundle worker if it exists, else
+  // fall back to running the .ts source through tsx in the worker thread.
+  const builtWorkerUrl = new URL("../../../dist/native-rust.worker.js", import.meta.url);
   if (existsSync(fileURLToPath(builtWorkerUrl))) {
     return builtWorkerUrl;
   }

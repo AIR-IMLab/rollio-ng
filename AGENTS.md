@@ -18,12 +18,13 @@ See `Makefile` and `README.md` for standard commands. Key shortcuts:
 - **Lint:** `cargo clippy --workspace -- -D warnings`
 - **Format check:** `cargo fmt --all -- --check`
 - **C++ build:** `cmake -B cameras/build -S cameras -DCMAKE_CXX_COMPILER=g++ && cmake --build cameras/build`
-- **UI:** `cd ui/terminal && npm install && npm run build`
+- **UI:** `cd ui/terminal && npm install && npm run build` (esbuild bundles `dist/index.js` + `dist/native-rust.worker.js` and vendors sharp's runtime closure into `ui/terminal/.deb-vendor/node_modules/`).
 - **UI run:** `cd ui/terminal && node dist/index.js`
+- **UI typecheck:** `cd ui/terminal && npm run typecheck` (runs `tsc --noEmit`)
 
 ### Non-obvious caveats
 
-- **Git submodules required:** Initialize `third_party/iceoryx2` and `third_party/ascii-video-renderer` before builds that compile the full stack. Run `git submodule update --init --recursive` if directories are empty.
+- **Git submodules required:** Initialize `third_party/iceoryx2`, `third_party/ascii-video-renderer`, and `third_party/librealsense` (statically linked into `rollio-device-realsense`) before builds that compile the full stack. Run `git submodule update --init --recursive` if directories are empty.
 - **C++ compiler:** The default `c++` symlink points to Clang 18, which may fail to find `<iostream>` on this platform. Use `-DCMAKE_CXX_COMPILER=g++` when running CMake to use GCC instead.
 - **Rust 1.85+:** The workspace requires Rust 1.85 or newer. The VM default may be older; use `rustup install 1.85.0 && rustup default 1.85.0` if needed.
 - **libstdc++ symlink:** If Clang linker fails with `cannot find -lstdc++`, create the symlink: `sudo ln -sf /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so /usr/lib/x86_64-linux-gnu/libstdc++.so`.

@@ -2,10 +2,10 @@
 
 `debian/` is the static template for the rollio `.deb`. `build.sh` treats
 this whole tree as the package root: it copies `debian/` into the staging
-directory, layers the freshly-built Rust binaries (`/usr/bin/`) and UI
-bundles (`/usr/share/rollio/`) on top, then runs `dpkg-deb --build`.
-Nothing else outside this directory is needed at pack time, so packaging
-no longer reaches into `third_party/`.
+directory, layers the freshly-built Rust binaries plus the C++ camera
+driver(s) (`/usr/bin/`) and UI bundles (`/usr/share/rollio/`) on top,
+then runs `dpkg-deb --build`. Nothing else outside this directory is
+needed at pack time, so packaging no longer reaches into `third_party/`.
 
 ```
 debian/

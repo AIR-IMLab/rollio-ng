@@ -10,11 +10,13 @@
 # This script does NOT compile. Run `make build` first (or `make package-all`).
 #
 # Env overrides:
-#   DEB_VERSION  package version (default: 0.1.0-1)
-#   DEB_ARCH     dpkg architecture (default: dpkg --print-architecture)
-#   DEB_DIST     output directory (default: dist)
-#   STAGING      staging tree   (default: .deb-staging)
-#   TARGET_DIR   cargo profile target dir (default: target/release)
+#   DEB_VERSION         package version (default: 0.1.0-1)
+#   DEB_ARCH            dpkg architecture (default: dpkg --print-architecture)
+#   DEB_DIST            output directory (default: dist)
+#   STAGING             staging tree   (default: .deb-staging)
+#   TARGET_DIR          cargo profile target dir (default: target/release)
+#   CAMERAS_BUILD_DIR   cmake build dir for C++ camera drivers
+#                       (default: cameras/build)
 
 set -euo pipefail
 
@@ -26,9 +28,14 @@ DEB_ARCH="${DEB_ARCH:-$(dpkg --print-architecture 2>/dev/null || echo amd64)}"
 DEB_DIST="${DEB_DIST:-dist}"
 STAGING="${STAGING:-.deb-staging}"
 TARGET_DIR="${TARGET_DIR:-target/release}"
+CAMERAS_BUILD_DIR="${CAMERAS_BUILD_DIR:-cameras/build}"
 
 # Binaries omitted from dpkg-shlibdeps (still shipped). Encoder links the full
 # FFmpeg stack; Depends are not generated for it until packaging is finalized.
+# rollio-device-realsense is *not* on this list: librealsense2 is built into
+# the binary statically (see cameras/CMakeLists.txt), so the only remaining
+# runtime deps are libusb-1.0 and libudev which are normal Ubuntu apt
+# packages that dpkg-shlibdeps resolves cleanly.
 SHLIBDEPS_EXCLUDE_BINS=(
     rollio-encoder
 )
@@ -51,7 +58,32 @@ CORE_BINS=(
     rollio-test-publisher
 )
 
+# C++ camera-driver binaries shipped in /usr/bin. Each entry is the path of
+# the built executable relative to $CAMERAS_BUILD_DIR; the basename is what
+# lands under /usr/bin/. The controller's runtime path resolution looks for
+# these in `cameras/build/<dir>/` during in-tree development and on $PATH
+# (i.e. /usr/bin/) once the .deb is installed -- see
+# controller/src/runtime_paths.rs::resolve_registered_program. Add another
+# `<subdir>/<binary>` entry here when cameras/<driver>/CMakeLists.txt grows
+# a new add_executable(rollio-device-...).
+#
+# Note: rollio-device-pseudo-camera is intentionally omitted -- it is built
+# only to back the C++ integration tests in cameras/pseudo/tests and is not
+# discoverable by the controller (see cameras/README.md).
+CAMERA_BINS=(
+    "realsense/rollio-device-realsense"
+)
+
 CORE_STAGING="$STAGING/rollio"
+
+# debian/ is the static deb root template. It carries DEBIAN/ metadata and
+# the AIRBOT host-setup payload (bin/, lib/udev/, lib/systemd/) -- same
+# content as third_party/airbot-play-rust/root/ but vendored so packaging
+# is self-contained. build.sh copies this whole tree into the staging
+# directory, then layers the freshly-built Rust binaries + UI bundles
+# on top. control.in carries @DEB_VERSION@ / @DEB_ARCH@ / @SHLIBS@
+# placeholders that get substituted at pack time.
+DEBIAN_TEMPLATE_DIR="debian"
 
 log()  { printf '\033[1;34m[build.sh]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[build.sh]\033[0m %s\n' "$*" >&2; }
@@ -82,8 +114,26 @@ assert_built() {
     for b in "${CORE_BINS[@]}"; do
         [[ -x "$TARGET_DIR/$b" ]] || die "missing $TARGET_DIR/$b -- run \`make build\` (or \`make package-all\`) first"
     done
+    for entry in "${CAMERA_BINS[@]}"; do
+        [[ -x "$CAMERAS_BUILD_DIR/$entry" ]] \
+            || die "missing $CAMERAS_BUILD_DIR/$entry -- run \`make cpp-build\` (or \`make build\`) first"
+    done
     [[ -d ui/web/dist ]]      || die "missing ui/web/dist -- run \`make ui-build\` (or \`make build\`) first"
     [[ -d ui/terminal/dist ]] || die "missing ui/terminal/dist -- run \`make ui-build\` (or \`make build\`) first"
+    [[ -f ui/terminal/dist/index.js ]] \
+        || die "missing ui/terminal/dist/index.js -- run \`make ui-build\` (or \`make build\`) first"
+    [[ -f ui/terminal/dist/native-rust.worker.js ]] \
+        || die "missing ui/terminal/dist/native-rust.worker.js -- run \`make ui-build\` (or \`make build\`) first"
+    [[ -f ui/terminal/dist/package.json ]] \
+        || die "missing ui/terminal/dist/package.json (ESM marker) -- run \`make ui-build\` (or \`make build\`) first"
+    [[ -f ui/terminal/native/rollio-native-ascii.node ]] \
+        || die "missing ui/terminal/native/rollio-native-ascii.node -- run \`make ui-build\` (or \`make build\`) first"
+    # bundle-terminal.mjs vendors sharp + its runtime deps (incl. the per-arch
+    # @img/sharp-* native binding npm picked locally) into .deb-vendor/.
+    [[ -f ui/terminal/.deb-vendor/node_modules/sharp/package.json ]] \
+        || die "missing ui/terminal/.deb-vendor/node_modules/sharp -- run \`make ui-build\` (or \`make build\`) first"
+    compgen -G "ui/terminal/.deb-vendor/node_modules/@img/sharp-*" >/dev/null \
+        || die "missing ui/terminal/.deb-vendor/node_modules/@img/sharp-* -- run \`cd ui/terminal && npm install\` on the target arch and rebuild"
 }
 
 run_shlibdeps() {
@@ -133,20 +183,79 @@ extract_shlibs_depends() {
     grep '^shlibs:Depends=' "$1" 2>/dev/null | head -1 | cut -d= -f2-
 }
 
+stage_debian_template() {
+    # $1 = staging root, $2 = computed shlibs:Depends value
+    # Copies debian/ wholesale into the staging root, then renders
+    # DEBIAN/control.in -> DEBIAN/control with @DEB_VERSION@,
+    # @DEB_ARCH@, @SHLIBS@ filled in. Edit files under debian/ to
+    # change anything packaged here -- this script no longer carries
+    # heredoc-generated payload.
+    local root="$1" shlibs="$2"
+    [[ -d "$DEBIAN_TEMPLATE_DIR" ]] || die "missing $DEBIAN_TEMPLATE_DIR/ template"
+    [[ -d "$DEBIAN_TEMPLATE_DIR/DEBIAN" ]] || die "missing $DEBIAN_TEMPLATE_DIR/DEBIAN/"
+    [[ -f "$DEBIAN_TEMPLATE_DIR/DEBIAN/control.in" ]] \
+        || die "missing $DEBIAN_TEMPLATE_DIR/DEBIAN/control.in"
+
+    log "Copying $DEBIAN_TEMPLATE_DIR/ template into $root"
+    # `cp -aT` copies contents-of-source into dest while preserving modes
+    # (postinst/postrm stay 0755, .rules / .service stay 0644).
+    cp -aT "$DEBIAN_TEMPLATE_DIR" "$root"
+
+    # README in the template is for humans editing debian/, not for the
+    # installed package. Strip it (and the control template) from staging.
+    rm -f "$root/README.md" "$root/DEBIAN/control.in"
+
+    # Substitute placeholders. awk handles values containing `/`, `&`, etc.
+    # without the sed escaping pitfalls.
+    awk \
+        -v ver="$DEB_VERSION" \
+        -v arch="$DEB_ARCH" \
+        -v shlibs="$shlibs" \
+        '{
+            gsub(/@DEB_VERSION@/, ver);
+            gsub(/@DEB_ARCH@/, arch);
+            gsub(/@SHLIBS@/, shlibs);
+            print;
+         }' "$DEBIAN_TEMPLATE_DIR/DEBIAN/control.in" > "$root/DEBIAN/control"
+    chmod 0644 "$root/DEBIAN/control"
+}
+
 build_core() {
     preflight_deb
     assert_built
-    log "Staging rollio -> $CORE_STAGING"
+    log "Staging rollio -> $CORE_STAGING (template: $DEBIAN_TEMPLATE_DIR/)"
     rm -rf "$CORE_STAGING"
-    install -d "$CORE_STAGING/DEBIAN" \
-               "$CORE_STAGING/usr/bin" \
+    install -d "$CORE_STAGING/usr/bin" \
                "$CORE_STAGING/usr/share/rollio/ui/web" \
                "$CORE_STAGING/usr/share/rollio/ui/terminal"
     for b in "${CORE_BINS[@]}"; do
         install -m755 "$TARGET_DIR/$b" "$CORE_STAGING/usr/bin/"
     done
+    # C++ camera binaries land alongside the Rust ones so the controller
+    # finds them on $PATH on installed systems. dpkg-shlibdeps below picks
+    # them up automatically (it scans usr/bin/ for ELFs); if a build host
+    # has librealsense2 installed, the realsense binary will pull in the
+    # corresponding Depends -- without it, the binary is a stub (compile
+    # guarded on ROLLIO_HAVE_REALSENSE) but still ships under the same
+    # name so `rollio setup` discovery doesn't blow up.
+    for entry in "${CAMERA_BINS[@]}"; do
+        install -m755 "$CAMERAS_BUILD_DIR/$entry" "$CORE_STAGING/usr/bin/"
+    done
     cp -a ui/web/dist      "$CORE_STAGING/usr/share/rollio/ui/web/dist"
     cp -a ui/terminal/dist "$CORE_STAGING/usr/share/rollio/ui/terminal/dist"
+
+    # The terminal UI bundle keeps `sharp` external (native addon) and uses a
+    # native ASCII N-API addon. Both must sit next to dist/ in the install
+    # tree so Node resolves them at runtime:
+    #   /usr/share/rollio/ui/terminal/native/rollio-native-ascii.node
+    #   /usr/share/rollio/ui/terminal/node_modules/{sharp,@img/sharp-*,...}/
+    # The vendor tree (sharp + its runtime closure, incl. per-arch @img/sharp-*
+    # native bindings) is staged by ui/terminal/scripts/bundle-terminal.mjs.
+    install -d "$CORE_STAGING/usr/share/rollio/ui/terminal/native"
+    install -m644 ui/terminal/native/rollio-native-ascii.node \
+        "$CORE_STAGING/usr/share/rollio/ui/terminal/native/"
+    cp -a ui/terminal/.deb-vendor/node_modules \
+        "$CORE_STAGING/usr/share/rollio/ui/terminal/node_modules"
 
     local subst="$STAGING/substvars-rollio"
     log "Computing rollio Depends via dpkg-shlibdeps"
@@ -155,21 +264,7 @@ build_core() {
     shlibs="$(extract_shlibs_depends "$subst")"
     [[ -n "$shlibs" ]] || die "dpkg-shlibdeps produced no Depends for rollio"
 
-    cat > "$CORE_STAGING/DEBIAN/control" <<EOF
-Package: rollio
-Version: $DEB_VERSION
-Architecture: $DEB_ARCH
-Maintainer: Rollio Maintainers <rollio@localhost>
-Section: video
-Priority: optional
-Depends: nodejs, $shlibs
-Description: Rollio robotics data collection framework
- Ships controller binaries and the terminal/web UI bundles under
- /usr/share/rollio. Shared-library Depends are derived from all shipped
- binaries except rollio-encoder (install FFmpeg/Ubuntu libav* packages
- separately if you use the encoder). The Nero hardware driver is shipped
- separately as the rollio_device_nero Python wheel.
-EOF
+    stage_debian_template "$CORE_STAGING" "$shlibs"
 
     install -d "$DEB_DIST"
     local out="$DEB_DIST/rollio_${DEB_VERSION}_${DEB_ARCH}.deb"

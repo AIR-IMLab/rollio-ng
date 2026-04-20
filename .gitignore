@@ -11,6 +11,7 @@ ui/terminal/node_modules/
 ui/terminal/dist/
 ui/terminal/wasm/
 ui/terminal/native/
+ui/terminal/.deb-vendor/
 ui/web/node_modules/
 ui/web/dist/
 

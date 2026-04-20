@@ -23,6 +23,7 @@ clean:
 	rm -rf cameras/build
 	rm -rf ui/terminal/dist
 	rm -rf ui/terminal/native
+	rm -rf ui/terminal/.deb-vendor
 	rm -rf ui/web/dist
 	rm -rf .deb-staging dist
 
@@ -131,4 +132,5 @@ package-deps:
 	  libconsole-bridge-dev \
 	  libeigen3-dev \
 	  libboost-filesystem-dev libboost-serialization-dev \
+	  libusb-1.0-0-dev libudev-dev \
 	  g++ git
