@@ -194,6 +194,7 @@ fn is_executable_entry(entry: &std::fs::DirEntry) -> bool {
 
 pub(crate) fn discover_probe_entries(
     workspace_root: &Path,
+    process_working_dir: &Path,
     current_exe_dir: &Path,
     options: DiscoveryOptions,
     discovery_timeout: Duration,
@@ -214,6 +215,7 @@ pub(crate) fn discover_probe_entries(
             executable,
             &extra_args,
             workspace_root,
+            process_working_dir,
             current_exe_dir,
             discovery_timeout,
             &mut entries,
@@ -312,10 +314,12 @@ pub(crate) fn run_driver_json(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn extend_probe_entries(
     executable: String,
     extra_probe_args: &[OsString],
     workspace_root: &Path,
+    process_working_dir: &Path,
     current_exe_dir: &Path,
     discovery_timeout: Duration,
     entries: &mut Vec<ProbeEntry>,
@@ -325,15 +329,19 @@ fn extend_probe_entries(
     let mut probe_args = vec![OsString::from("probe"), OsString::from("--json")];
     probe_args.extend(extra_probe_args.iter().cloned());
 
-    let probe_output =
-        match run_driver_json(&program, &probe_args, workspace_root, discovery_timeout) {
-            Ok(value) => value,
-            Err(DriverCommandError::NotFound { .. }) => return,
-            Err(error) => {
-                probe_errors.push(format!("{}: {error}", executable));
-                return;
-            }
-        };
+    let probe_output = match run_driver_json(
+        &program,
+        &probe_args,
+        process_working_dir,
+        discovery_timeout,
+    ) {
+        Ok(value) => value,
+        Err(DriverCommandError::NotFound { .. }) => return,
+        Err(error) => {
+            probe_errors.push(format!("{}: {error}", executable));
+            return;
+        }
+    };
 
     let Some(probe_entries) = probe_output.as_array() else {
         probe_errors.push(format!(

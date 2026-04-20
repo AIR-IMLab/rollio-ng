@@ -12,8 +12,9 @@ The project is in early development — most binary crates are stubs. The `rolli
 
 See `Makefile` and `README.md` for standard commands. Key shortcuts:
 
-- **Full build:** `make build` (runs Rust + C++ + UI)
-- **Rust only:** `cargo build --workspace` / `cargo test --workspace`
+- **Full build:** `make build` (runs Rust + C++ + UI; Rust uses `CARGO_BUILD_ARGS` which defaults to `--release`)
+- **Packaging (Ubuntu 24.04):** `make build` then `make package` (delegates to `./build.sh all`; produces a single `rollio_*.deb` with all Rust binaries + UI bundles, and a separate `rollio_device_nero-*.whl` for the Nero driver, under `dist/`). Needs `dpkg-dev` and `uv` on PATH; optional `make package-deps` for the apt side — see `packaging/README.md`
+- **Rust only:** `cargo build --workspace` / `cargo test --workspace` (add `--release` to match `make build`, or use `make rust-build`)
 - **Lint:** `cargo clippy --workspace -- -D warnings`
 - **Format check:** `cargo fmt --all -- --check`
 - **C++ build:** `cmake -B cameras/build -S cameras -DCMAKE_CXX_COMPILER=g++ && cmake --build cameras/build`

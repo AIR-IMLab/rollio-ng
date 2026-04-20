@@ -3,7 +3,9 @@ use crate::episode::EpisodeLifecycle;
 use crate::process::{
     poll_children_once, spawn_child, terminate_children, ChildSpec, ManagedChild, ShutdownTrigger,
 };
-use crate::runtime_paths::{current_executable_dir, workspace_root};
+use crate::runtime_paths::{
+    current_executable_dir, resolve_share_root, resolve_state_dir, workspace_root,
+};
 #[cfg(test)]
 pub(crate) use crate::runtime_plan::{build_collect_specs, build_preview_specs, build_teleop_spec};
 use iceoryx2::prelude::*;
@@ -28,6 +30,8 @@ use std::time::{Duration, Instant};
 pub fn run(args: CollectArgs) -> Result<(), Box<dyn Error>> {
     let mut config = args.load_project_config()?;
     let workspace_root = workspace_root()?;
+    let share_root = resolve_share_root()?;
+    let state_dir = resolve_state_dir()?;
     let current_exe_dir = current_executable_dir()?;
     // Persisted configs no longer carry value_limits; refresh them from a
     // fresh `query --json` per device before runtime children are spawned.
@@ -36,22 +40,33 @@ pub fn run(args: CollectArgs) -> Result<(), Box<dyn Error>> {
     crate::device_query::refresh_value_limits_from_devices(
         &mut config,
         &workspace_root,
+        state_dir.as_path(),
         &current_exe_dir,
     )?;
-    run_with_config(config, workspace_root, current_exe_dir)
+    run_with_config(
+        config,
+        workspace_root,
+        share_root,
+        state_dir,
+        current_exe_dir,
+    )
 }
 
 fn run_with_config(
     config: ProjectConfig,
     workspace_root: std::path::PathBuf,
+    share_root: std::path::PathBuf,
+    state_dir: std::path::PathBuf,
     current_exe_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn Error>> {
     let workspace_root = workspace_root.as_path();
+    let share_root = share_root.as_path();
+    let child_working_dir = state_dir.as_path();
     let current_exe_dir = current_exe_dir.as_path();
     let poll_interval = Duration::from_millis(config.controller.child_poll_interval_ms);
     let shutdown_timeout =
         Duration::from_millis(config.controller.shutdown_timeout_ms).max(Duration::from_secs(30));
-    let log_dir = workspace_root.join("target/rollio-logs");
+    let log_dir = state_dir.join("rollio-logs");
     std::fs::create_dir_all(&log_dir)?;
 
     let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -59,7 +74,13 @@ fn run_with_config(
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
 
     let controller_ipc = ControllerIpc::new()?;
-    let specs = crate::runtime_plan::build_collect_specs(&config, workspace_root, current_exe_dir)?;
+    let specs = crate::runtime_plan::build_collect_specs(
+        &config,
+        workspace_root,
+        share_root,
+        child_working_dir,
+        current_exe_dir,
+    )?;
 
     let mut children = spawn_collect_children(
         &specs,
@@ -416,7 +437,7 @@ mod tests {
             command_defaults: ChannelCommandDefaults::default(),
         };
 
-        let spec = build_teleop_spec(&teleop, Path::new("."), Path::new("."))
+        let spec = build_teleop_spec(&teleop, Path::new("."), Path::new("."), Path::new("."))
             .expect("teleop spec should build");
 
         assert_eq!(spec.id, "teleop-leader_arm-to-follower_arm");
@@ -438,8 +459,14 @@ mod tests {
         config.assembler.staging_dir = staging_root.to_string_lossy().into_owned();
         create_fake_web_bundle(&workspace_root);
 
-        let specs = build_collect_specs(&config, &workspace_root, Path::new("."))
-            .expect("specs should build");
+        let specs = build_collect_specs(
+            &config,
+            &workspace_root,
+            &workspace_root,
+            Path::new("."),
+            Path::new("."),
+        )
+        .expect("specs should build");
 
         let ids = specs
             .iter()
@@ -532,7 +559,7 @@ mod tests {
         config.mode = rollio_types::config::CollectionMode::Intervention;
         config.pairings.clear();
 
-        let specs = build_preview_specs(&config, Path::new("."), Path::new("."))
+        let specs = build_preview_specs(&config, Path::new("."), Path::new("."), Path::new("."))
             .expect("specs should build");
 
         assert!(

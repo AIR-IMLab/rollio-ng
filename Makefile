@@ -1,10 +1,11 @@
-.PHONY: all build test clean fmt lint smoke-pseudo
+.PHONY: all build test clean fmt lint smoke-pseudo package package-all package-deps wheel
 .PHONY: rust cpp ui python
 .PHONY: rust-build rust-test rust-fmt rust-lint
 .PHONY: cpp-build cpp-test ui-build ui-install ui-test ui-bench-ascii
 .PHONY: python-test python-lint
 
-CARGO_BUILD_ARGS ?=
+# Default to release binaries; override with `make build CARGO_BUILD_ARGS=` for debug.
+CARGO_BUILD_ARGS ?= --release
 CARGO_RUN_ARGS ?= $(CARGO_BUILD_ARGS)
 
 all: build
@@ -22,6 +23,7 @@ clean:
 	rm -rf ui/terminal/dist
 	rm -rf ui/terminal/native
 	rm -rf ui/web/dist
+	rm -rf .deb-staging dist
 
 fmt: rust-fmt
 
@@ -81,10 +83,33 @@ python-test:
 	PYTHONPATH="$(CURDIR)/robots/airbot_play/src" python3 -m pytest robots/airbot_play/tests
 
 python-lint:
-	ruff check --exclude third_party .
-	ruff format --check --exclude third_party .
+	ruff check .
+	ruff format --check .
 
 # ── Smoke ─────────────────────────────────────────────────────────────
 
 smoke-pseudo: build
 	cargo run $(CARGO_RUN_ARGS) -p rollio -- collect -c config/config.example.toml
+
+# ── Packaging ─────────────────────────────────────────────────────────
+# All packaging logic lives in ./build.sh. These targets are thin wrappers.
+# Run `make build` before `make package` (or use `make package-all`).
+
+package:
+	./build.sh all
+
+package-all: build package
+
+wheel:
+	./build.sh nero
+
+# Optional: install apt helpers (dpkg-deb/shlibdeps + ffmpeg + bindgen toolchain).
+# Rust (`cargo`/`rustc`) and Node (`node`/`npm`) come from rustup/nvm/etc.
+# `uv` (for the Nero wheel) install separately, e.g. `pipx install uv`.
+package-deps:
+	sudo apt-get update
+	sudo apt-get install -y --no-install-recommends \
+	  build-essential dpkg-dev \
+	  cmake pkg-config nasm clang libclang-dev llvm-dev \
+	  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+	  g++ git

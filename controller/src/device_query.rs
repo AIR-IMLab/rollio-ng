@@ -52,6 +52,7 @@ pub(crate) type DeviceRuntimeMetaMap = BTreeMap<(String, String), ChannelRuntime
 pub(crate) fn refresh_value_limits_from_devices(
     config: &mut ProjectConfig,
     workspace_root: &Path,
+    process_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<DeviceRuntimeMetaMap, Box<dyn Error>> {
     let mut runtime_meta = DeviceRuntimeMetaMap::new();
@@ -63,7 +64,12 @@ pub(crate) fn refresh_value_limits_from_devices(
         {
             continue;
         }
-        let meta_by_channel = refresh_device_value_limits(device, workspace_root, current_exe_dir)?;
+        let meta_by_channel = refresh_device_value_limits(
+            device,
+            workspace_root,
+            process_working_dir,
+            current_exe_dir,
+        )?;
         for (channel_type, meta) in meta_by_channel {
             runtime_meta.insert((device.name.clone(), channel_type), meta);
         }
@@ -74,6 +80,7 @@ pub(crate) fn refresh_value_limits_from_devices(
 fn refresh_device_value_limits(
     device: &mut BinaryDeviceConfig,
     workspace_root: &Path,
+    process_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<BTreeMap<String, ChannelRuntimeMeta>, Box<dyn Error>> {
     let executable_name = device
@@ -88,7 +95,7 @@ fn refresh_device_value_limits(
             OsString::from("--json"),
             OsString::from(&device.id),
         ],
-        workspace_root,
+        process_working_dir,
         DEVICE_QUERY_TIMEOUT,
     )
     .map_err(|error| -> Box<dyn Error> {

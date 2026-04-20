@@ -7,7 +7,7 @@ use crate::process::{
 };
 use crate::runtime_paths::{
     current_executable_dir, default_device_executable_name, resolve_registered_program,
-    workspace_root,
+    resolve_share_root, resolve_state_dir, workspace_root,
 };
 use crate::runtime_plan::{build_control_server_spec, build_preview_specs};
 use iceoryx2::prelude::*;
@@ -1496,6 +1496,8 @@ fn normalized_delta(delta: Option<i32>) -> i32 {
 
 pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
     let workspace_root = workspace_root()?;
+    let share_root = resolve_share_root()?;
+    let state_dir = resolve_state_dir()?;
     let current_exe_dir = current_executable_dir()?;
     ensure_setup_dev_runtime_binaries_built(&workspace_root, &current_exe_dir)?;
     let output_path = args.output_path();
@@ -1508,7 +1510,12 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
             existing_config
                 .validate()
                 .map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
-            validate_existing_project(&existing_config, &workspace_root, &current_exe_dir)?;
+            validate_existing_project(
+                &existing_config,
+                &workspace_root,
+                state_dir.as_path(),
+                &current_exe_dir,
+            )?;
             // Persisted configs no longer carry value_limits: re-query each
             // device executable to refresh them in-memory before the wizard
             // (or the visualizer, on accept-defaults) consumes the config.
@@ -1517,14 +1524,19 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
             let runtime_meta = crate::device_query::refresh_value_limits_from_devices(
                 &mut existing_config,
                 &workspace_root,
+                state_dir.as_path(),
                 &current_exe_dir,
             )?;
             let available_devices = available_devices_from_project(&existing_config, &runtime_meta);
             (existing_config, available_devices, Vec::new(), true)
         } else {
             eprintln!("rollio: discovering devices...");
-            let (discoveries, warnings) =
-                discover_devices(&workspace_root, &current_exe_dir, discovery_options)?;
+            let (discoveries, warnings) = discover_devices(
+                &workspace_root,
+                state_dir.as_path(),
+                &current_exe_dir,
+                discovery_options,
+            )?;
             if discoveries.is_empty() {
                 return Err("setup did not discover any devices".into());
             }
@@ -1554,10 +1566,13 @@ pub fn run(args: SetupArgs) -> Result<(), Box<dyn Error>> {
         resume_mode,
         warnings,
         &workspace_root,
+        share_root.as_path(),
+        state_dir.as_path(),
         &current_exe_dir,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_interactive_setup(
     config: ProjectConfig,
     available_devices: Vec<AvailableDevice>,
@@ -1565,6 +1580,8 @@ fn run_interactive_setup(
     resume_mode: bool,
     warnings: Vec<String>,
     workspace_root: &Path,
+    share_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
     // Reserve two distinct loopback ports up front:
@@ -1585,7 +1602,7 @@ fn run_interactive_setup(
         resume_mode,
         warnings,
     );
-    let log_dir = workspace_root.join("target/rollio-setup-logs");
+    let log_dir = child_working_dir.join("rollio-setup-logs");
     fs::create_dir_all(&log_dir)?;
 
     let shutdown_requested = Arc::new(AtomicBool::new(false));
@@ -1601,12 +1618,14 @@ fn run_interactive_setup(
             crate::runtime_plan::ControlServerRole::Setup,
             control_port,
             workspace_root,
+            child_working_dir,
             current_exe_dir,
         )?;
         control_children = spawn_setup_children(std::slice::from_ref(&control_spec), &log_dir)?;
 
         let ui_spec = build_setup_ui_spec(
-            workspace_root,
+            share_root,
+            child_working_dir,
             &control_websocket_url,
             &preview_websocket_url,
         )?;
@@ -1693,6 +1712,7 @@ fn run_interactive_setup(
                     preview_port,
                     &preview_websocket_url,
                     workspace_root,
+                    child_working_dir,
                     current_exe_dir,
                     &log_dir,
                 )?);
@@ -1913,6 +1933,7 @@ fn start_preview_runtime(
     preview_port: u16,
     preview_websocket_url: &str,
     workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
     log_dir: &Path,
 ) -> Result<SetupRuntimeState, Box<dyn Error>> {
@@ -1923,7 +1944,12 @@ fn start_preview_runtime(
         log_dir,
         &format!("setup-preview-{preview_port}.toml"),
     )?;
-    let specs = build_setup_preview_specs(&preview_config, workspace_root, current_exe_dir)?;
+    let specs = build_setup_preview_specs(
+        &preview_config,
+        workspace_root,
+        child_working_dir,
+        current_exe_dir,
+    )?;
     let children = spawn_setup_children(&specs, log_dir)?;
     if session.current_step == SetupStep::Preview {
         session.message = Some(format!(
@@ -2031,9 +2057,10 @@ fn cleanup_preview_temp_config(path: &Path) {
 fn build_setup_preview_specs(
     project: &ProjectConfig,
     workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<Vec<ChildSpec>, Box<dyn Error>> {
-    build_preview_specs(project, workspace_root, current_exe_dir)
+    build_preview_specs(project, workspace_root, child_working_dir, current_exe_dir)
 }
 
 fn camera_channel_type_for_profile(profile: &CameraProfile) -> String {
@@ -2391,14 +2418,16 @@ fn pair_robot_channels_by_order<'a>(
 }
 
 fn build_setup_ui_spec(
-    workspace_root: &Path,
+    share_root: &Path,
+    child_working_dir: &Path,
     control_websocket_url: &str,
     preview_websocket_url: &str,
 ) -> Result<ChildSpec, Box<dyn Error>> {
-    let ui_entry = workspace_root.join("ui/terminal/dist/index.js");
+    let ui_entry = share_root.join("ui/terminal/dist/index.js");
     if !ui_entry.exists() {
         return Err(format!(
-            "Terminal UI bundle not found at {}. Run `cd ui/terminal && npm run build` first.",
+            "Terminal UI bundle not found at {}. Run `cd ui/terminal && npm run build` first, \
+             or set ROLLIO_SHARE_DIR.",
             ui_entry.display()
         )
         .into());
@@ -2418,7 +2447,7 @@ fn build_setup_ui_spec(
                 OsString::from(preview_websocket_url),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: true,
     })
 }
@@ -2786,11 +2815,17 @@ fn missing_value_limit_warnings(config: &ProjectConfig) -> Vec<String> {
 
 fn discover_devices(
     workspace_root: &Path,
+    process_working_dir: &Path,
     current_exe_dir: &Path,
     options: DiscoveryOptions,
 ) -> Result<(Vec<DiscoveredDevice>, Vec<String>), Box<dyn Error>> {
-    let (probe_entries, mut probe_errors) =
-        discover_probe_entries(workspace_root, current_exe_dir, options, DISCOVERY_TIMEOUT)?;
+    let (probe_entries, mut probe_errors) = discover_probe_entries(
+        workspace_root,
+        process_working_dir,
+        current_exe_dir,
+        options,
+        DISCOVERY_TIMEOUT,
+    )?;
     let mut discoveries = Vec::new();
 
     for entry in probe_entries {
@@ -2798,7 +2833,7 @@ fn discover_devices(
             &entry.executable,
             &entry.probe_entry,
             &entry.program,
-            workspace_root,
+            process_working_dir,
             DISCOVERY_TIMEOUT,
         ) {
             Ok(device) => discoveries.push(device),
@@ -2817,7 +2852,7 @@ fn build_discovered_device(
     executable: &str,
     probe_entry: &Value,
     program: &OsString,
-    workspace_root: &Path,
+    process_working_dir: &Path,
     timeout: Duration,
 ) -> Result<DiscoveredDevice, Box<dyn Error>> {
     let id = probe_entry
@@ -2832,7 +2867,7 @@ fn build_discovered_device(
             OsString::from("--json"),
             OsString::from(&id),
         ],
-        workspace_root,
+        process_working_dir,
         timeout,
     )?;
     let query_device = query
@@ -2901,10 +2936,16 @@ fn driver_to_label_fallback(driver: &str) -> String {
 fn validate_existing_project(
     project: &ProjectConfig,
     workspace_root: &Path,
+    process_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
     for device in &project.devices {
-        validate_binary_device_hardware(device, workspace_root, current_exe_dir)?;
+        validate_binary_device_hardware(
+            device,
+            workspace_root,
+            process_working_dir,
+            current_exe_dir,
+        )?;
     }
     Ok(())
 }
@@ -2912,6 +2953,7 @@ fn validate_existing_project(
 fn validate_binary_device_hardware(
     device: &BinaryDeviceConfig,
     workspace_root: &Path,
+    process_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let executable_name = device
@@ -2925,7 +2967,7 @@ fn validate_binary_device_hardware(
         args.push(OsString::from(&channel.channel_type));
     }
     args.push(OsString::from("--json"));
-    let report = run_driver_json(&program, &args, workspace_root, VALIDATION_TIMEOUT)?;
+    let report = run_driver_json(&program, &args, process_working_dir, VALIDATION_TIMEOUT)?;
     if report
         .get("valid")
         .and_then(Value::as_bool)

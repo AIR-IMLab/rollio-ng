@@ -1,9 +1,8 @@
-#include "iox2/iceoryx2.hpp"
-#include "rollio/topic_names.hpp"
-#include "rollio/types.h"
+#include <sys/wait.h>
+#include <unistd.h>
 
-#include <chrono>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,8 +12,9 @@
 #include <thread>
 #include <vector>
 
-#include <sys/wait.h>
-#include <unistd.h>
+#include "iox2/iceoryx2.hpp"
+#include "rollio/topic_names.hpp"
+#include "rollio/types.h"
 
 namespace {
 
@@ -36,8 +36,8 @@ struct FrameObservation {
 };
 
 auto count_substring(const std::string& text, const std::string& needle) -> std::size_t {
-    auto count = std::size_t {0};
-    auto pos = std::string::size_type {0};
+    auto count = std::size_t{0};
+    auto pos = std::string::size_type{0};
     while ((pos = text.find(needle, pos)) != std::string::npos) {
         ++count;
         pos += needle.size();
@@ -46,7 +46,7 @@ auto count_substring(const std::string& text, const std::string& needle) -> std:
 }
 
 auto capture_stdout(const std::string& command) -> std::string {
-    std::array<char, 256> buffer {};
+    std::array<char, 256> buffer{};
     std::string output;
 
     auto* pipe = popen(command.c_str(), "r");
@@ -68,8 +68,7 @@ auto capture_stdout(const std::string& command) -> std::string {
 
 auto unique_name() -> std::string {
     const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                           std::chrono::system_clock::now().time_since_epoch()
-                       )
+                           std::chrono::system_clock::now().time_since_epoch())
                            .count();
     return "pseudo_cam_test_" + std::to_string(nanos);
 }
@@ -79,7 +78,8 @@ auto create_test_ports(const std::string& device_name) -> TestPorts {
 
     auto node = NodeBuilder().create<ServiceType::Ipc>().value();
 
-    const auto frame_service_name = ServiceName::create(rollio::camera_frames_service_name(device_name).c_str()).value();
+    const auto frame_service_name =
+        ServiceName::create(rollio::camera_frames_service_name(device_name).c_str()).value();
     auto frame_service = node.service_builder(frame_service_name)
                              .publish_subscribe<bb::Slice<uint8_t>>()
                              .user_header<rollio::CameraFrameHeader>()
@@ -94,7 +94,7 @@ auto create_test_ports(const std::string& device_name) -> TestPorts {
                                .value();
     auto control_publisher = control_service.publisher_builder().create().value();
 
-    return TestPorts {
+    return TestPorts{
         std::move(node),
         std::move(frame_subscriber),
         std::move(control_publisher),
@@ -121,15 +121,15 @@ auto spawn_camera_process(const std::string& config_inline) -> pid_t {
     return pid;
 }
 
-auto collect_frames(FrameSubscriber& subscriber, std::size_t count, const std::chrono::seconds timeout)
-    -> std::vector<FrameObservation> {
-    auto frames = std::vector<FrameObservation> {};
+auto collect_frames(FrameSubscriber& subscriber, std::size_t count,
+                    const std::chrono::seconds timeout) -> std::vector<FrameObservation> {
+    auto frames = std::vector<FrameObservation>{};
     const auto deadline = SteadyClock::now() + timeout;
 
     while (SteadyClock::now() < deadline && frames.size() < count) {
         auto sample = subscriber.receive().value();
         if (sample.has_value()) {
-            frames.push_back(FrameObservation {
+            frames.push_back(FrameObservation{
                 sample->user_header(),
                 sample->payload().number_of_bytes(),
             });
@@ -146,7 +146,7 @@ auto collect_frames(FrameSubscriber& subscriber, std::size_t count, const std::c
 }
 
 auto send_shutdown(ControlPublisher& publisher) -> void {
-    rollio::ControlEvent event {};
+    rollio::ControlEvent event{};
     event.tag = rollio::ControlEventTag::Shutdown;
     publisher.send_copy(event).value();
 }
@@ -179,9 +179,11 @@ auto run_probe_test() -> void {
 }
 
 auto run_capabilities_test() -> void {
-    const auto command = std::string("\"") + ROLLIO_DEVICE_PSEUDO_CAMERA_BIN + "\" capabilities pseudo_cam_0";
+    const auto command =
+        std::string("\"") + ROLLIO_DEVICE_PSEUDO_CAMERA_BIN + "\" capabilities pseudo_cam_0";
     const auto output = capture_stdout(command);
-    if (output.find("\"rgb24\"") == std::string::npos || output.find("\"width\":640") == std::string::npos) {
+    if (output.find("\"rgb24\"") == std::string::npos ||
+        output.find("\"width\":640") == std::string::npos) {
         throw std::runtime_error("capabilities output is missing expected profile data");
     }
 }
@@ -190,17 +192,19 @@ auto run_runtime_test() -> void {
     const auto device_name = unique_name();
     auto ports = create_test_ports(device_name);
 
-    const auto config_inline =
-        "name = \"" + device_name + "\"\n"
-        "type = \"camera\"\n"
-        "driver = \"pseudo\"\n"
-        "id = \"" + device_name + "_id\"\n"
-        "width = 320\n"
-        "height = 240\n"
-        "fps = 20\n"
-        "pixel_format = \"rgb24\"\n"
-        "stream = \"color\"\n"
-        "transport = \"simulated\"\n";
+    const auto config_inline = "name = \"" + device_name +
+                               "\"\n"
+                               "type = \"camera\"\n"
+                               "driver = \"pseudo\"\n"
+                               "id = \"" +
+                               device_name +
+                               "_id\"\n"
+                               "width = 320\n"
+                               "height = 240\n"
+                               "fps = 20\n"
+                               "pixel_format = \"rgb24\"\n"
+                               "stream = \"color\"\n"
+                               "transport = \"simulated\"\n";
 
     const auto pid = spawn_camera_process(config_inline);
     const auto frames = collect_frames(ports.frame_subscriber, 12U, std::chrono::seconds(3));
@@ -225,7 +229,7 @@ auto run_runtime_test() -> void {
     wait_for_exit(pid, std::chrono::seconds(2));
 }
 
-} // namespace
+}  // namespace
 
 auto main() -> int {
     try {

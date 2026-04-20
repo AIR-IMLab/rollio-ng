@@ -53,7 +53,8 @@ sudo apt-get install -y \
   libavutil-dev \
   libswscale-dev
 
-# Rust
+# Rust (debug). For release binaries, use `cargo build --workspace --release`
+# or `make rust-build` / `make build` — the Makefile defaults `CARGO_BUILD_ARGS=--release`.
 cargo build --workspace
 cargo test --workspace
 # Camera drivers (C++)
@@ -73,7 +74,7 @@ cargo run --manifest-path third_party/airbot-play-rust/Cargo.toml --bin airbot-p
 cargo run -p rollio -- collect --config config/config.hardware.example.toml
 ```
 
-If `cargo build --workspace` or `make` fails while compiling `turbojpeg-sys`
+If `cargo build --workspace`, `make build`, or `make` fails while compiling `turbojpeg-sys`
 with `No CMAKE_ASM_NASM_COMPILER could be found`, install `nasm` and retry.
 
 If an `iceoryx2` or `airbot-play-rust` build fails during bindgen with errors
@@ -117,6 +118,24 @@ make smoke-pseudo
 entrypoint using `config/config.example.toml`. The expected checkpoint is that
 the pseudo camera previews and robot status appear in the TUI, and the stack
 shuts down cleanly when you press `Ctrl+C`.
+
+## Packaging (Ubuntu 24.04)
+
+Rust and Node on `PATH` (rustup, nvm), `dpkg-dev` for `dpkg-deb` + `dpkg-shlibdeps`, and `uv` (e.g. `pipx install uv`) for the wheel. Optional convenience: `make package-deps` for the apt side.
+
+```bash
+make build                  # rust + C++ + UI
+make package                # ./build.sh all
+# or one shot:
+make package-all
+```
+
+Produces in `dist/`:
+
+- `rollio_*.deb` — all Rust binaries (including `rollio-encoder`) + UI bundles
+- `rollio_device_nero-*.whl` — Nero hardware driver wheel (operators install into a venv)
+
+See [`packaging/README.md`](packaging/README.md) for the operator install snippet, env vars, and `./build.sh` subcommands.
 
 ## Sprint 4 Encoder Validation
 

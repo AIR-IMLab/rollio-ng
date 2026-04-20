@@ -19,9 +19,12 @@ fn reserve_loopback_port() -> Result<u16, Box<dyn Error>> {
 pub(crate) fn build_collect_specs(
     config: &ProjectConfig,
     workspace_root: &Path,
+    share_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<Vec<ChildSpec>, Box<dyn Error>> {
-    let mut specs = build_preview_specs(config, workspace_root, current_exe_dir)?;
+    let mut specs =
+        build_preview_specs(config, workspace_root, child_working_dir, current_exe_dir)?;
 
     // The control server hosts the long-lived control plane WebSocket and
     // forwards episode commands / status / backpressure via iceoryx2. The
@@ -31,6 +34,7 @@ pub(crate) fn build_collect_specs(
         ControlServerRole::Collect,
         control_port,
         workspace_root,
+        child_working_dir,
         current_exe_dir,
     )?);
 
@@ -38,6 +42,7 @@ pub(crate) fn build_collect_specs(
         specs.push(build_encoder_spec(
             &encoder_config,
             workspace_root,
+            child_working_dir,
             current_exe_dir,
         )?);
     }
@@ -47,6 +52,7 @@ pub(crate) fn build_collect_specs(
     specs.push(build_assembler_spec(
         &assembler_config,
         workspace_root,
+        child_working_dir,
         current_exe_dir,
     )?);
 
@@ -54,6 +60,7 @@ pub(crate) fn build_collect_specs(
     specs.push(build_storage_spec(
         &storage_config,
         workspace_root,
+        child_working_dir,
         current_exe_dir,
     )?);
 
@@ -61,11 +68,12 @@ pub(crate) fn build_collect_specs(
     if ui_runtime_config.control_websocket_url.is_none() {
         ui_runtime_config.control_websocket_url = Some(format!("ws://127.0.0.1:{control_port}"));
     }
-    let web_bundle_dir = workspace_root.join("ui/web/dist");
+    let web_bundle_dir = share_root.join("ui/web/dist");
     let web_index = web_bundle_dir.join("index.html");
     if !web_index.exists() {
         return Err(format!(
-            "Web UI bundle not found at {}. Run `cd ui/web && npm run build` first.",
+            "Web UI bundle not found at {}. Run `cd ui/web && npm run build` first, \
+             or set ROLLIO_SHARE_DIR.",
             web_index.display()
         )
         .into());
@@ -94,7 +102,7 @@ pub(crate) fn build_collect_specs(
                 web_bundle_dir.into_os_string(),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     });
 
@@ -104,6 +112,7 @@ pub(crate) fn build_collect_specs(
 pub(crate) fn build_preview_specs(
     config: &ProjectConfig,
     workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<Vec<ChildSpec>, Box<dyn Error>> {
     let mut specs = Vec::new();
@@ -111,11 +120,17 @@ pub(crate) fn build_preview_specs(
     specs.push(build_visualizer_spec(
         config,
         workspace_root,
+        child_working_dir,
         current_exe_dir,
     )?);
 
     for device in &config.devices {
-        specs.push(build_device_spec(device, workspace_root, current_exe_dir)?);
+        specs.push(build_device_spec(
+            device,
+            workspace_root,
+            child_working_dir,
+            current_exe_dir,
+        )?);
     }
 
     if config.mode == CollectionMode::Teleop {
@@ -123,6 +138,7 @@ pub(crate) fn build_preview_specs(
             specs.push(build_teleop_spec(
                 &teleop_config,
                 workspace_root,
+                child_working_dir,
                 current_exe_dir,
             )?);
         }
@@ -133,7 +149,8 @@ pub(crate) fn build_preview_specs(
 
 pub(crate) fn build_visualizer_spec(
     config: &ProjectConfig,
-    workspace_root: &Path,
+    _workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let visualizer_config = toml::to_string(&config.visualizer_runtime_config_v2())?;
@@ -149,7 +166,7 @@ pub(crate) fn build_visualizer_spec(
                 OsString::from(visualizer_config),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     })
 }
@@ -177,7 +194,8 @@ impl ControlServerRole {
 pub(crate) fn build_control_server_spec(
     role: ControlServerRole,
     port: u16,
-    workspace_root: &Path,
+    _workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let inline_config = format!("port = {port}\nrole = \"{}\"\n", role.as_toml_value());
@@ -193,7 +211,7 @@ pub(crate) fn build_control_server_spec(
                 OsString::from(inline_config),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     })
 }
@@ -201,6 +219,7 @@ pub(crate) fn build_control_server_spec(
 pub(crate) fn build_device_spec(
     device: &BinaryDeviceConfig,
     workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let inline_config = toml::to_string(device)?;
@@ -221,14 +240,15 @@ pub(crate) fn build_device_spec(
             program,
             args: common_args,
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     })
 }
 
 pub(crate) fn build_teleop_spec(
     config: &TeleopRuntimeConfigV2,
-    workspace_root: &Path,
+    _workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let inline_config = toml::to_string(config)?;
@@ -246,14 +266,15 @@ pub(crate) fn build_teleop_spec(
                 OsString::from(inline_config),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     })
 }
 
 pub(crate) fn build_encoder_spec(
     config: &EncoderRuntimeConfigV2,
-    workspace_root: &Path,
+    _workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let inline_config = toml::to_string(config)?;
@@ -267,14 +288,15 @@ pub(crate) fn build_encoder_spec(
                 OsString::from(inline_config),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     })
 }
 
 pub(crate) fn build_assembler_spec(
     config: &AssemblerRuntimeConfigV2,
-    workspace_root: &Path,
+    _workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let inline_config = toml::to_string(config)?;
@@ -291,14 +313,15 @@ pub(crate) fn build_assembler_spec(
                 OsString::from(inline_config),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     })
 }
 
 pub(crate) fn build_storage_spec(
     config: &StorageRuntimeConfig,
-    workspace_root: &Path,
+    _workspace_root: &Path,
+    child_working_dir: &Path,
     current_exe_dir: &Path,
 ) -> Result<ChildSpec, Box<dyn Error>> {
     let inline_config = toml::to_string(config)?;
@@ -312,7 +335,7 @@ pub(crate) fn build_storage_spec(
                 OsString::from(inline_config),
             ],
         },
-        working_directory: workspace_root.to_path_buf(),
+        working_directory: child_working_dir.to_path_buf(),
         inherit_stdio: false,
     })
 }

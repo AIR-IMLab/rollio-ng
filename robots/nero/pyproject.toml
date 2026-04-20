@@ -10,8 +10,8 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
     "pin>=3.0",
-    "iceoryx2",
-    "pyAgxArm",
+    "iceoryx2==0.8.1",
+    "pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git@20621b94ff15ae1b32cf81cce127cb49f1bfcaf4",
     "tomli>=2.0.1; python_version < '3.11'",
 ]
 
@@ -34,8 +34,5 @@ rollio_device_nero = [
     "assets/*.urdf",
 ]
 
-# Submodule versions must stay aligned with the rollio-ng workspace
-# (see third_party/iceoryx2 and third_party/pyAgxArm).
-[tool.uv.sources]
-iceoryx2 = { path = "../../third_party/iceoryx2/iceoryx2-ffi/python", editable = true }
-pyAgxArm = { path = "../../third_party/pyAgxArm", editable = true }
+# Released installs use PyPI (iceoryx2) and upstream GitHub (pyAgxArm). For
+# repo development you can `pip install -e` third_party copies to override.

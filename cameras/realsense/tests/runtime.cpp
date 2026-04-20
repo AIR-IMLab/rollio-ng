@@ -1,22 +1,22 @@
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <array>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <csignal>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
-
-#include <sys/wait.h>
-#include <unistd.h>
 
 namespace {
 
 using SteadyClock = std::chrono::steady_clock;
 
 auto capture_command_output(const std::string& command) -> std::string {
-    std::array<char, 256> buffer {};
+    std::array<char, 256> buffer{};
     std::string output;
 
     auto* pipe = popen(command.c_str(), "r");
@@ -97,9 +97,8 @@ auto wait_for_success(const pid_t pid, const std::chrono::seconds timeout) -> vo
             if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
                 return;
             }
-            throw std::runtime_error(
-                "realsense run command exited with non-zero status: " + std::to_string(status)
-            );
+            throw std::runtime_error("realsense run command exited with non-zero status: " +
+                                     std::to_string(status));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -117,7 +116,8 @@ auto run_probe_test() -> void {
 }
 
 auto run_invalid_capabilities_test() -> void {
-    const auto command = std::string("\"") + ROLLIO_DEVICE_REALSENSE_BIN + "\" capabilities invalid_serial >/dev/null 2>&1";
+    const auto command = std::string("\"") + ROLLIO_DEVICE_REALSENSE_BIN +
+                         "\" capabilities invalid_serial >/dev/null 2>&1";
     const auto status = std::system(command.c_str());
     if (status == 0) {
         throw std::runtime_error("capabilities unexpectedly succeeded for an invalid serial");
@@ -179,7 +179,7 @@ auto run_serialized_runtime_dry_run_test() -> void {
     wait_for_success(pid, std::chrono::seconds(2));
 }
 
-} // namespace
+}  // namespace
 
 auto main() -> int {
     try {

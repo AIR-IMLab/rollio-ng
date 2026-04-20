@@ -27,3 +27,9 @@ external/reference
 logs/
 output/
 **/*.egg-info/
+
+# make package / ./build.sh (dpkg-deb staging + .deb + .whl output)
+.deb-staging/
+dist/*.deb
+dist/*.whl
+robots/nero/build

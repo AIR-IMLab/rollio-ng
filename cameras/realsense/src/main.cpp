@@ -189,12 +189,12 @@ auto channel_type_supported(std::string_view t) -> bool {
 }
 
 auto validate_channel_types(const std::vector<std::string>& requested) -> bool {
-    return std::all_of(requested.begin(), requested.end(), [](const std::string& t) {
-        return channel_type_supported(t);
-    });
+    return std::all_of(requested.begin(), requested.end(),
+                       [](const std::string& t) { return channel_type_supported(t); });
 }
 
-auto expected_pixel_format_for_channel_type(const std::string& channel_type) -> rollio::PixelFormat {
+auto expected_pixel_format_for_channel_type(const std::string& channel_type)
+    -> rollio::PixelFormat {
     if (channel_type == "color") {
         return rollio::PixelFormat::Rgb24;
     }
@@ -213,7 +213,8 @@ struct ResolvedRealsenseCamera {
     std::optional<uint32_t> stream_index;
 };
 
-auto resolve_realsense_camera_channels(const rollio::BinaryDeviceConfig& config) -> std::vector<ResolvedRealsenseCamera> {
+auto resolve_realsense_camera_channels(const rollio::BinaryDeviceConfig& config)
+    -> std::vector<ResolvedRealsenseCamera> {
     if (config.driver != "realsense") {
         throw std::runtime_error("realsense driver requires driver = \"realsense\"");
     }
@@ -230,7 +231,8 @@ auto resolve_realsense_camera_channels(const rollio::BinaryDeviceConfig& config)
             throw std::runtime_error("realsense binary device may only enable camera channels");
         }
         if (!ch.profile.has_value()) {
-            throw std::runtime_error("enabled camera channel \"" + ch.channel_type + "\" requires a profile");
+            throw std::runtime_error("enabled camera channel \"" + ch.channel_type +
+                                     "\" requires a profile");
         }
         if (!channel_type_supported(ch.channel_type)) {
             throw std::runtime_error("unsupported realsense channel_type: " + ch.channel_type);
@@ -243,16 +245,16 @@ auto resolve_realsense_camera_channels(const rollio::BinaryDeviceConfig& config)
                 ? ch.channel_type + "-" + std::to_string(ch.stream_index.value_or(1U))
                 : ch.channel_type;
         if (!seen_streams.insert(stream_key).second) {
-            throw std::runtime_error("duplicate realsense stream selection for channel \"" + ch.channel_type + "\"");
+            throw std::runtime_error("duplicate realsense stream selection for channel \"" +
+                                     ch.channel_type + "\"");
         }
         const auto expected = expected_pixel_format_for_channel_type(ch.channel_type);
         if (ch.profile->pixel_format != expected) {
-            throw std::runtime_error(
-                "realsense channel \"" + ch.channel_type + "\" requires pixel_format \"" +
-                std::string(rollio::pixel_format_to_string(expected)) + "\""
-            );
+            throw std::runtime_error("realsense channel \"" + ch.channel_type +
+                                     "\" requires pixel_format \"" +
+                                     std::string(rollio::pixel_format_to_string(expected)) + "\"");
         }
-        out.push_back(ResolvedRealsenseCamera {ch.channel_type, *ch.profile, ch.stream_index});
+        out.push_back(ResolvedRealsenseCamera{ch.channel_type, *ch.profile, ch.stream_index});
     }
 
     if (out.empty()) {
@@ -279,7 +281,8 @@ auto serialize_device(const rs2::device& device) -> std::string {
     return output.str();
 }
 
-auto find_device_by_serial(const rs2::context& context, const std::string& serial) -> std::optional<rs2::device> {
+auto find_device_by_serial(const rs2::context& context,
+                           const std::string& serial) -> std::optional<rs2::device> {
     for (const auto& device : context.query_devices()) {
         if (device.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER) == serial) {
             return device;
@@ -300,19 +303,17 @@ auto device_bus_string(const rs2::device& device) -> std::string {
     return "unknown";
 }
 
-auto rs_stream_spec_for_channel(
-    const std::string& channel_type,
-    std::optional<uint32_t> stream_index
-) -> RsStreamSpec {
+auto rs_stream_spec_for_channel(const std::string& channel_type,
+                                std::optional<uint32_t> stream_index) -> RsStreamSpec {
     if (channel_type == "color") {
-        return RsStreamSpec {RS2_STREAM_COLOR, 0, RS2_FORMAT_RGB8};
+        return RsStreamSpec{RS2_STREAM_COLOR, 0, RS2_FORMAT_RGB8};
     }
     if (channel_type == "depth") {
-        return RsStreamSpec {RS2_STREAM_DEPTH, 0, RS2_FORMAT_Z16};
+        return RsStreamSpec{RS2_STREAM_DEPTH, 0, RS2_FORMAT_Z16};
     }
     if (channel_type == "infrared") {
         const auto idx = static_cast<int>(stream_index.value_or(1U));
-        return RsStreamSpec {RS2_STREAM_INFRARED, idx, RS2_FORMAT_Y8};
+        return RsStreamSpec{RS2_STREAM_INFRARED, idx, RS2_FORMAT_Y8};
     }
     throw std::runtime_error("unsupported realsense channel_type: " + channel_type);
 }
@@ -341,14 +342,13 @@ auto print_validate_output(const ValidateCli& args) -> int {
     const bool types_ok = args.channel_types.empty() || validate_channel_types(args.channel_types);
     const bool valid = present && types_ok;
 
-    const std::string name =
-        present ? device->get_info(RS2_CAMERA_INFO_NAME) : std::string();
+    const std::string name = present ? device->get_info(RS2_CAMERA_INFO_NAME) : std::string();
     const std::string bus = present ? device_bus_string(*device) : std::string();
 
     if (args.json) {
-        std::cout << "{\"valid\":" << (valid ? "true" : "false") << ",\"id\":\"" << json_escape(args.id)
-                  << "\",\"name\":\"" << json_escape(name) << "\",\"driver\":\"realsense\",\"bus\":\""
-                  << json_escape(bus) << "\"}\n";
+        std::cout << "{\"valid\":" << (valid ? "true" : "false") << ",\"id\":\""
+                  << json_escape(args.id) << "\",\"name\":\"" << json_escape(name)
+                  << "\",\"driver\":\"realsense\",\"bus\":\"" << json_escape(bus) << "\"}\n";
     } else if (valid) {
         std::cout << args.id << " is valid\n";
     } else {
@@ -397,39 +397,37 @@ auto print_capabilities_output(const std::string& serial) -> int {
             }
 
             const auto stream_type = profile.stream_type();
-            if (!profile_matches_run_command(
-                    stream_type, video_profile.format(), profile.stream_index())) {
+            if (!profile_matches_run_command(stream_type, video_profile.format(),
+                                             profile.stream_index())) {
                 continue;
             }
 
-            const auto stream_name = stream_type == RS2_STREAM_COLOR
-                ? "color"
-                : stream_type == RS2_STREAM_DEPTH ? "depth" : "infrared";
+            const auto stream_name = stream_type == RS2_STREAM_COLOR   ? "color"
+                                     : stream_type == RS2_STREAM_DEPTH ? "depth"
+                                                                       : "infrared";
             if (!first) {
                 std::cout << ",";
             }
             first = false;
-            std::cout << "{"
-                      << "\"stream\":\"" << stream_name << "\","
+            std::cout << "{" << "\"stream\":\"" << stream_name << "\","
                       << "\"index\":" << profile.stream_index() << ","
                       << "\"width\":" << video_profile.width() << ","
                       << "\"height\":" << video_profile.height() << ","
-                      << "\"fps\":" << profile.fps()
-                      << "}";
+                      << "\"fps\":" << profile.fps() << "}";
         }
     }
     std::cout << "]}\n";
     return 0;
 }
 
-auto append_profile_json(std::ostringstream& out, uint32_t width, uint32_t height, uint32_t fps, rollio::PixelFormat pf)
-    -> void {
-    out << "{\"width\":" << width << ",\"height\":" << height << ",\"fps\":" << fps << ",\"pixel_format\":\""
-        << pixel_format_json_name(pf) << "\"}";
+auto append_profile_json(std::ostringstream& out, uint32_t width, uint32_t height, uint32_t fps,
+                         rollio::PixelFormat pf) -> void {
+    out << "{\"width\":" << width << ",\"height\":" << height << ",\"fps\":" << fps
+        << ",\"pixel_format\":\"" << pixel_format_json_name(pf) << "\"}";
 }
 
 auto print_query_human(const std::string& label, const std::string& serial,
-                         const std::vector<std::string>& channel_types) -> void {
+                       const std::vector<std::string>& channel_types) -> void {
     std::cout << label << " (" << serial << ")\n";
     for (const auto& ch : channel_types) {
         std::cout << "  - " << ch << " [camera]\n";
@@ -469,8 +467,8 @@ auto print_query_output(const QueryCli& args) -> int {
                 continue;
             }
             const auto stream_type = profile.stream_type();
-            if (!profile_matches_run_command(
-                    stream_type, video_profile.format(), profile.stream_index())) {
+            if (!profile_matches_run_command(stream_type, video_profile.format(),
+                                             profile.stream_index())) {
                 continue;
             }
             const auto w = static_cast<uint32_t>(video_profile.width());
@@ -508,25 +506,27 @@ auto print_query_output(const QueryCli& args) -> int {
               << "{\"channel_type\":\"color\",\"kind\":\"camera\",\"available\":true,"
               << "\"channel_label\":\"Intel RealSense RGB\",\"default_name\":\"realsense_rgb\","
               << "\"modes\":[\"enabled\",\"disabled\"],\"profiles\":" << profiles_color.str()
-              << ",\"supported_states\":[],\"supported_commands\":[],\"supports_fk\":false,\"supports_ik\":false,"
+              << ",\"supported_states\":[],\"supported_commands\":[],\"supports_fk\":false,"
+                 "\"supports_ik\":false,"
               << "\"dof\":null,\"default_control_frequency_hz\":null,"
               << "\"direct_joint_compatibility\":{\"can_lead\":[],\"can_follow\":[]},"
               << "\"defaults\":{},\"optional_info\":{}},"
               << "{\"channel_type\":\"depth\",\"kind\":\"camera\",\"available\":true,"
               << "\"channel_label\":\"Intel RealSense Depth\",\"default_name\":\"realsense_depth\","
               << "\"modes\":[\"enabled\",\"disabled\"],\"profiles\":" << profiles_depth.str()
-              << ",\"supported_states\":[],\"supported_commands\":[],\"supports_fk\":false,\"supports_ik\":false,"
+              << ",\"supported_states\":[],\"supported_commands\":[],\"supports_fk\":false,"
+                 "\"supports_ik\":false,"
               << "\"dof\":null,\"default_control_frequency_hz\":null,"
               << "\"direct_joint_compatibility\":{\"can_lead\":[],\"can_follow\":[]},"
               << "\"defaults\":{},\"optional_info\":{}},"
               << "{\"channel_type\":\"infrared\",\"kind\":\"camera\",\"available\":true,"
               << "\"channel_label\":\"Intel RealSense Infrared\",\"default_name\":\"realsense_ir\","
               << "\"modes\":[\"enabled\",\"disabled\"],\"profiles\":" << profiles_ir.str()
-              << ",\"supported_states\":[],\"supported_commands\":[],\"supports_fk\":false,\"supports_ik\":false,"
+              << ",\"supported_states\":[],\"supported_commands\":[],\"supports_fk\":false,"
+                 "\"supports_ik\":false,"
               << "\"dof\":null,\"default_control_frequency_hz\":null,"
               << "\"direct_joint_compatibility\":{\"can_lead\":[],\"can_follow\":[]},"
-              << "\"defaults\":{},\"optional_info\":{}}"
-              << "]}]}\n";
+              << "\"defaults\":{},\"optional_info\":{}}" << "]}]}\n";
     return 0;
 }
 
@@ -536,10 +536,11 @@ struct EnabledCameraChannel {
     RsStreamSpec rs;
 };
 
-auto build_enabled_camera_channels(const rollio::BinaryDeviceConfig& config) -> std::vector<EnabledCameraChannel> {
+auto build_enabled_camera_channels(const rollio::BinaryDeviceConfig& config)
+    -> std::vector<EnabledCameraChannel> {
     std::vector<EnabledCameraChannel> out;
     for (const auto& resolved : resolve_realsense_camera_channels(config)) {
-        out.push_back(EnabledCameraChannel {
+        out.push_back(EnabledCameraChannel{
             resolved.channel_type,
             resolved.profile,
             rs_stream_spec_for_channel(resolved.channel_type, resolved.stream_index),
@@ -549,11 +550,10 @@ auto build_enabled_camera_channels(const rollio::BinaryDeviceConfig& config) -> 
 }
 
 class RealsenseFrameSink {
-  public:
-    RealsenseFrameSink(std::string channel_type, rollio::PixelFormat pixel_format, RsStreamSpec spec)
-        : channel_type_(std::move(channel_type))
-        , pixel_format_(pixel_format)
-        , spec_(spec) {}
+public:
+    RealsenseFrameSink(std::string channel_type, rollio::PixelFormat pixel_format,
+                       RsStreamSpec spec)
+        : channel_type_(std::move(channel_type)), pixel_format_(pixel_format), spec_(spec) {}
 
     virtual ~RealsenseFrameSink() = default;
 
@@ -563,7 +563,7 @@ class RealsenseFrameSink {
 
     virtual void try_publish(const rs2::frameset& frames) = 0;
 
-  protected:
+protected:
     auto pixel_format() const -> rollio::PixelFormat {
         return pixel_format_;
     }
@@ -572,23 +572,19 @@ class RealsenseFrameSink {
         return spec_;
     }
 
-  private:
+private:
     std::string channel_type_;
     rollio::PixelFormat pixel_format_;
     RsStreamSpec spec_;
 };
 
-template<typename Publisher>
+template <typename Publisher>
 class RealsenseFrameSinkImpl final : public RealsenseFrameSink {
-  public:
-    RealsenseFrameSinkImpl(
-        std::string channel_type,
-        rollio::PixelFormat pixel_format,
-        RsStreamSpec spec,
-        Publisher publisher
-    )
-        : RealsenseFrameSink(std::move(channel_type), pixel_format, spec)
-        , publisher_(std::move(publisher)) {}
+public:
+    RealsenseFrameSinkImpl(std::string channel_type, rollio::PixelFormat pixel_format,
+                           RsStreamSpec spec, Publisher publisher)
+        : RealsenseFrameSink(std::move(channel_type), pixel_format, spec),
+          publisher_(std::move(publisher)) {}
 
     void try_publish(const rs2::frameset& frames) override {
         rs2::frame frame;
@@ -616,21 +612,21 @@ class RealsenseFrameSinkImpl final : public RealsenseFrameSink {
         header.frame_index = local_frame_index_;
 
         const auto latest_timestamp_ns = header.timestamp_ns;
-        auto initialized_sample = sample.write_from_fn(
-            [&](const uint64_t byte_idx) -> uint8_t { return frame_data[static_cast<std::size_t>(byte_idx)]; }
-        );
+        auto initialized_sample = sample.write_from_fn([&](const uint64_t byte_idx) -> uint8_t {
+            return frame_data[static_cast<std::size_t>(byte_idx)];
+        });
         send(std::move(initialized_sample)).value();
         local_frame_index_ += 1U;
 
         if (SteadyClock::now() - last_status_ >= std::chrono::seconds(1)) {
             std::cerr << "rollio-device-realsense: bus_root channel=" << channel_type()
-                      << " frame_index=" << local_frame_index_ << " latest_timestamp_ns=" << latest_timestamp_ns
-                      << " active=true\n";
+                      << " frame_index=" << local_frame_index_
+                      << " latest_timestamp_ns=" << latest_timestamp_ns << " active=true\n";
             last_status_ = SteadyClock::now();
         }
     }
 
-  private:
+private:
     Publisher publisher_;
     uint64_t local_frame_index_{0};
     SteadyClock::time_point last_status_{SteadyClock::now()};
@@ -642,14 +638,13 @@ auto run_realsense(const rollio::BinaryDeviceConfig& config, bool dry_run) -> in
     const auto channels = build_enabled_camera_channels(config);
 
     if (dry_run) {
-        std::cerr << "rollio-device-realsense: dry-run ok device=" << config.id << " bus_root=" << config.bus_root
-                  << " channels=" << channels.size() << '\n';
+        std::cerr << "rollio-device-realsense: dry-run ok device=" << config.id
+                  << " bus_root=" << config.bus_root << " channels=" << channels.size() << '\n';
         for (const auto& ch : channels) {
-            std::cerr << "  - " << ch.channel_type << " service=" << rollio::channel_frames_service_name(
-                                                                                          config.bus_root, ch.channel_type
-                                                                                      )
-                      << " size=" << ch.profile.width << "x" << ch.profile.height << " fps=" << ch.profile.fps
-                      << '\n';
+            std::cerr << "  - " << ch.channel_type << " service="
+                      << rollio::channel_frames_service_name(config.bus_root, ch.channel_type)
+                      << " size=" << ch.profile.width << "x" << ch.profile.height
+                      << " fps=" << ch.profile.fps << '\n';
         }
         return 0;
     }
@@ -666,15 +661,17 @@ auto run_realsense(const rollio::BinaryDeviceConfig& config, bool dry_run) -> in
     sinks.reserve(channels.size());
 
     for (const auto& ch : channels) {
-        const auto service_name_str = rollio::channel_frames_service_name(config.bus_root, ch.channel_type);
+        const auto service_name_str =
+            rollio::channel_frames_service_name(config.bus_root, ch.channel_type);
         const auto service_name = ServiceName::create(service_name_str.c_str()).value();
         auto frame_service = node.service_builder(service_name)
                                  .publish_subscribe<bb::Slice<uint8_t>>()
                                  .user_header<rollio::CameraFrameHeader>()
                                  .open_or_create()
                                  .value();
-        const auto initial_payload_size = static_cast<uint64_t>(ch.profile.width) * ch.profile.height *
-            pixel_format_byte_size(ch.profile.pixel_format);
+        const auto initial_payload_size = static_cast<uint64_t>(ch.profile.width) *
+                                          ch.profile.height *
+                                          pixel_format_byte_size(ch.profile.pixel_format);
         auto publisher = frame_service.publisher_builder()
                              .initial_max_slice_len(initial_payload_size)
                              .allocation_strategy(AllocationStrategy::PowerOfTwo)
@@ -682,11 +679,7 @@ auto run_realsense(const rollio::BinaryDeviceConfig& config, bool dry_run) -> in
                              .value();
 
         sinks.push_back(std::make_unique<RealsenseFrameSinkImpl<decltype(publisher)>>(
-            ch.channel_type,
-            ch.profile.pixel_format,
-            ch.rs,
-            std::move(publisher)
-        ));
+            ch.channel_type, ch.profile.pixel_format, ch.rs, std::move(publisher)));
     }
 
     const auto control_service_name = ServiceName::create(rollio::CONTROL_EVENTS_SERVICE).value();
@@ -699,14 +692,9 @@ auto run_realsense(const rollio::BinaryDeviceConfig& config, bool dry_run) -> in
     rs2::config rs_config;
     rs_config.enable_device(config.id);
     for (const auto& ch : channels) {
-        rs_config.enable_stream(
-            ch.rs.stream,
-            ch.rs.index,
-            static_cast<int>(ch.profile.width),
-            static_cast<int>(ch.profile.height),
-            ch.rs.format,
-            static_cast<int>(ch.profile.fps)
-        );
+        rs_config.enable_stream(ch.rs.stream, ch.rs.index, static_cast<int>(ch.profile.width),
+                                static_cast<int>(ch.profile.height), ch.rs.format,
+                                static_cast<int>(ch.profile.fps));
     }
 
     rs2::pipeline pipeline;
@@ -721,7 +709,8 @@ auto run_realsense(const rollio::BinaryDeviceConfig& config, bool dry_run) -> in
         while (control_sample.has_value()) {
             if (control_sample->payload().tag == rollio::ControlEventTag::Shutdown) {
                 pipeline.stop();
-                std::cerr << "rollio-device-realsense: shutdown received for " << config.bus_root << '\n';
+                std::cerr << "rollio-device-realsense: shutdown received for " << config.bus_root
+                          << '\n';
                 return 0;
             }
             control_sample = control_subscriber.receive().value();
