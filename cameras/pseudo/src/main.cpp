@@ -288,9 +288,12 @@ auto run_camera(const rollio::CameraDeviceConfig& config) -> int {
         header.frame_index = frame_index;
 
         const auto latest_timestamp_ns = header.timestamp_ns;
-        auto initialized_sample = sample.write_from_fn([&](const uint64_t byte_idx) -> uint8_t {
-            return frame_buffer[static_cast<std::size_t>(byte_idx)];
-        });
+        // Use the slice memcpy fast path. `write_from_fn` routes every byte
+        // through a type-erased `bb::StaticFunction` call plus a bounds-checked
+        // slice subscript and a placement-new, which dominates CPU usage on
+        // realistic frame sizes (mirrors the realsense driver fix).
+        auto frame_slice = iox2::bb::ImmutableSlice<uint8_t>(frame_buffer.data(), payload_size);
+        auto initialized_sample = sample.write_from_slice(frame_slice);
         send(std::move(initialized_sample)).value();
 
         frame_index += 1U;

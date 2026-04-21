@@ -612,9 +612,12 @@ public:
         header.frame_index = local_frame_index_;
 
         const auto latest_timestamp_ns = header.timestamp_ns;
-        auto initialized_sample = sample.write_from_fn([&](const uint64_t byte_idx) -> uint8_t {
-            return frame_data[static_cast<std::size_t>(byte_idx)];
-        });
+        // Use the slice memcpy fast path. The per-byte `write_from_fn` path
+        // routes every byte through a type-erased `bb::StaticFunction` call
+        // plus a bounds-checked slice subscript and a placement-new, which
+        // burns a full CPU core when streaming 640x480@60 color+depth.
+        auto frame_slice = iox2::bb::ImmutableSlice<uint8_t>(frame_data, payload_size);
+        auto initialized_sample = sample.write_from_slice(frame_slice);
         send(std::move(initialized_sample)).value();
         local_frame_index_ += 1U;
 
